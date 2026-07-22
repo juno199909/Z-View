@@ -1,0 +1,27 @@
+{
+  "preferred_install_method": "auto",
+  "hardware_ids": [
+    "ROOT\\CMDBVIRTUALDISPLAY"
+  ],
+  "friendly_name_keywords": [
+    "CMDB Virtual Display",
+    "Indirect Display"
+  ],
+  "instance_id_keywords": [
+    "CMDBVIRTUALDISPLAY",
+    "IDD"
+  ],
+  "attach_keywords": [
+    "attached",
+    "active"
+  ],
+  "remote_adapter_keywords": [
+    "Remote Display Adapter",
+    "RDPIDD",
+    "RemoteDisplayEnum"
+  ],
+  "inf_relative_path": "cmdb-virtual-display.inf",
+  "catalog_relative_path": "cmdb-virtual-display.cat",
+  "binary_relative_path": "cmdb-virtual-display.sys",
+  "devcon_relative_path": "devcon.exe"
+}

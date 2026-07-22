@@ -1,0 +1,7 @@
+{
+  "username": "admin",
+  "password_hash": "pbkdf2_sha256$120000$4d76e100bd089944eb1ea1979f86cc6d$gScWsXY5fY12jXzhGtZinwDxntIqlhwGEZUMd8QqN1Y",
+  "token_version": 4,
+  "password_updated_at": 1782280233,
+  "credential_source": "file"
+}

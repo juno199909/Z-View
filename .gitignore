@@ -1,0 +1,40 @@
+# 中文注释：Python 运行缓存会占用 C 盘，也会污染发布差异。
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 中文注释：前端依赖和构建产物应由 package-lock 与构建命令生成，不应手工维护。
+node_modules/
+dist/
+.vite/
+
+# 中文注释：日志、临时目录和本地工具状态不属于可交付源码。
+*.log
+*.err.log
+*.tmp
+*.temp
+.trae/
+.claude/
+
+# 中文注释：本项目构建输出统一放到 D:\IT2026-temp 或 GPO 部署包内受控产物。
+build/
+*.spec.bak
+
+# Runtime secrets and local machine configuration
+IT2026/IT2026/.env
+IT2026/IT2026/.env.local
+IT2026/IT2026/config.json
+IT2026/IT2026/config.local.json
+IT2026/IT2026/auth_secret.txt
+IT2026/IT2026/auth_state.json
+IT2026/IT2026/agent_secret.txt
+
+# Generated frontend artifacts under the current source tree
+IT2026/IT2026/frontend/node_modules/
+IT2026/IT2026/frontend/dist/
+
+# Python runtime caches and logs under the current source tree
+IT2026/IT2026/**/__pycache__/
+IT2026/IT2026/**/*.py[cod]
+IT2026/IT2026/**/*.log
+IT2026/IT2026/**/*.err.log

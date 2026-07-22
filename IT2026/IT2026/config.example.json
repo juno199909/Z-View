@@ -1,0 +1,17 @@
+{
+  "server_url": "http://127.0.0.1:8080",
+  "token": "replace-with-agent-token",
+  "control_port": 9001,
+  "intervals": {
+    "heartbeat": 30,
+    "system_status": 30,
+    "software": 30,
+    "hardware": 30
+  },
+  "remote_desktop": {
+    "require_consent": true,
+    "consent_timeout_seconds": 30,
+    "allow_if_no_user": false
+  },
+  "log_level": "INFO"
+}
