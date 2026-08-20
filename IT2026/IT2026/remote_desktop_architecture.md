@@ -266,7 +266,7 @@ Drivers/
   - GPU加速
 
 ### 2. 编码压缩模块 (Encoder)
-- **视频编码**: H.264 (主流) / MJPEG (兼容)
+- **视频编码**: 当前 JPEG over WebSocket；目标 H.264（硬件加速）
 - **压缩**: zlib/lz4
 - **差分帧**: 只传输变化区域
 
@@ -282,7 +282,7 @@ Drivers/
 
 ### 5. 双通道通信 (Communication)
 - **控制通道**: WebSocket (信令、鼠标、键盘)
-- **视频通道**: WebSocket Binary (H.264帧)
+- **视频通道**: WebSocket Binary (当前 JPEG 帧，目标 H.264)
 - **心跳**: Ping/Pong 机制
 
 ### 6. 会话管理 (SessionManager)

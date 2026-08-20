@@ -26,9 +26,9 @@ Z-View 提供自动化资产采集、实时终端监控、健康度评估、软�
 - **config.json** - 系统配置文件
 - **requirements.txt** - Python依赖
 
-### Agent程序
-- **cmdb_agent_unified.py** - 信息采集Agent
-- **GPO部署包/** - 打包好的EXE和部署脚本
+### Agent 程序
+- **cmdb_agent_unified_v2.py** - 信息采集 Agent
+- **GPO部署包/** - 打包好的 EXE 和部署脚本
 
 ### 前端应用
 - **frontend/** - Vue 3 + Element Plus前端
