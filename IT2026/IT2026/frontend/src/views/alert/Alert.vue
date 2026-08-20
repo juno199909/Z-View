@@ -1,769 +1,333 @@
 <template>
-  <div class="app-container">
-    <el-row :gutter="20" class="stats-row">
-      <el-col :span="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="7天内告警" :value="stats.total_7days">
-            <template #prefix>
-              <el-icon style="color: #409eff;"><Bell /></el-icon>
-            </template>
-          </el-statistic>
-        </el-card>
-      </el-col>
-      <el-col :span="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="活跃告警" :value="stats.active">
-            <template #prefix>
-              <el-icon style="color: #f56c6c;"><Warning /></el-icon>
-            </template>
-          </el-statistic>
-        </el-card>
-      </el-col>
-      <el-col :span="6">
-        <el-card shadow="hover" class="stat-card">
-          <div class="stat-content">
-            <div class="stat-title">按严重程度</div>
-            <div class="stat-tags">
-              <div>
-                <el-tag type="danger" size="small">严重</el-tag>
-                <div class="stat-number">{{ stats.by_severity.critical || 0 }}</div>
-              </div>
-              <div>
-                <el-tag type="warning" size="small">警告</el-tag>
-                <div class="stat-number">{{ stats.by_severity.warning || 0 }}</div>
-              </div>
-            </div>
-          </div>
-        </el-card>
-      </el-col>
-      <el-col :span="6">
-        <el-card shadow="hover" class="stat-card">
-          <div class="stat-content">
-            <div class="stat-title">按类型统计</div>
-            <div class="type-summary">
-              <div v-for="(count, type) in stats.by_type" :key="type" class="type-summary-item">
-                <el-tag size="small">{{ getTypeText(type) }}</el-tag>
-                <div class="type-summary-value">{{ count }}</div>
-              </div>
-            </div>
-          </div>
-        </el-card>
-      </el-col>
-    </el-row>
+  <div class="zv-page">
+    <div class="zv-page-header">
+      <div>
+        <h2 class="zv-page-title">终端日志</h2>
+        <div class="zv-page-subtitle">共 {{ pagination.total }} 条告警 · 待处理 {{ stats.unresolved || 0 }} 条</div>
+      </div>
+      <div class="zv-page-actions">
+        <el-button :icon="Refresh" @click="loadData">刷新</el-button>
+        <el-button type="primary" :icon="Check" :disabled="!selectedIds.length" @click="handleBatchResolve">批量解决</el-button>
+      </div>
+    </div>
 
-    <el-card>
-      <div class="toolbar">
-        <div class="toolbar-main">
-          <div class="toolbar-filters">
-            <el-radio-group v-model="statusFilter" @change="handleFilterChange">
-              <el-radio-button value="">全部</el-radio-button>
-              <el-radio-button value="active">活跃</el-radio-button>
-              <el-radio-button value="resolved">已解决</el-radio-button>
-            </el-radio-group>
-            <el-select
-              v-model="severityFilter"
-              placeholder="严重程度"
-              clearable
-              style="width: 130px"
-              @change="handleFilterChange"
-            >
+    <!-- 告警统计 -->
+    <div class="zv-alert-stats">
+      <div class="zv-stat-mini zv-stat-danger">
+        <div class="zv-stat-num">{{ stats.by_severity?.critical || 0 }}</div>
+        <div class="zv-stat-lbl">严重</div>
+      </div>
+      <div class="zv-stat-mini zv-stat-warning">
+        <div class="zv-stat-num">{{ (stats.by_severity?.high || 0) + (stats.by_severity?.medium || 0) }}</div>
+        <div class="zv-stat-lbl">高危/中等</div>
+      </div>
+      <div class="zv-stat-mini zv-stat-info">
+        <div class="zv-stat-num">{{ stats.active || 0 }}</div>
+        <div class="zv-stat-lbl">未解决</div>
+      </div>
+      <div class="zv-stat-mini zv-stat-success">
+        <div class="zv-stat-num">{{ stats.resolved || 0 }}</div>
+        <div class="zv-stat-lbl">已解决</div>
+      </div>
+    </div>
+
+    <div class="zv-card">
+      <div class="zv-filter-bar">
+        <el-form :inline="true" :model="searchForm">
+          <el-form-item label="级别">
+            <el-select v-model="searchForm.severity" placeholder="全部" clearable style="width: 110px">
               <el-option label="严重" value="critical" />
-              <el-option label="警告" value="warning" />
-              <el-option label="信息" value="info" />
+              <el-option label="高危" value="high" />
+              <el-option label="中等" value="medium" />
+              <el-option label="低危" value="low" />
+              <el-option label="提示" value="info" />
             </el-select>
-            <el-select
-              v-model="typeFilter"
-              placeholder="告警类型"
-              clearable
-              style="width: 150px"
-              @change="handleFilterChange"
-            >
-              <el-option
-                v-for="option in alertTypeOptions"
-                :key="option.value"
-                :label="option.label"
-                :value="option.value"
-              />
+          </el-form-item>
+          <el-form-item label="状态">
+            <el-select v-model="searchForm.status" placeholder="全部" clearable style="width: 110px">
+              <el-option label="未解决" value="active" />
+              <el-option label="已解决" value="resolved" />
             </el-select>
+          </el-form-item>
+          <el-form-item label="类型">
+            <el-select v-model="searchForm.alert_type" placeholder="全部" clearable style="width: 110px">
+              <el-option label="离线" value="offline" />
+              <el-option label="CPU" value="cpu" />
+              <el-option label="内存" value="memory" />
+              <el-option label="磁盘" value="disk" />
+              <el-option label="进程" value="process" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="来源主机">
+            <el-input v-model="searchForm.hostname" placeholder="主机名 / IP" clearable style="width: 150px" @keyup.enter="handleSearch" />
+          </el-form-item>
+          <el-form-item label="关键字">
+            <el-input v-model="searchForm.keyword" placeholder="搜索告警内容" clearable style="width: 180px" @keyup.enter="handleSearch" />
+          </el-form-item>
+          <el-form-item label="时间">
             <el-date-picker
               v-model="timeRange"
               type="datetimerange"
               range-separator="至"
-              start-placeholder="开始时间"
-              end-placeholder="结束时间"
+              start-placeholder="开始"
+              end-placeholder="结束"
               value-format="YYYY-MM-DD HH:mm:ss"
-              format="YYYY-MM-DD HH:mm:ss"
-              clearable
-              style="width: 360px"
-              @change="handleTimeRangeChange"
+              style="width: 340px"
+              @change="handleSearch"
             />
-            <el-input
-              v-model="keyword"
-              placeholder="主机/IP/告警信息"
-              clearable
-              style="width: 240px"
-              @clear="handleFilterChange"
-              @keyup.enter="handleFilterChange"
-            />
-          </div>
-          <div class="toolbar-actions">
-            <el-button @click="handleFilterChange">查询</el-button>
-            <el-button @click="handleReset">重置</el-button>
-            <el-button
-              type="warning"
-              :loading="resolving"
-              :disabled="selectedIds.length === 0"
-              @click="handleBatchResolve"
-            >
-              批量解决
-            </el-button>
-            <el-button :icon="Download" :loading="exporting" @click="handleExport">导出</el-button>
-            <el-button :icon="Refresh" @click="refreshAll" :loading="loading">刷新</el-button>
-          </div>
-        </div>
-        <div class="quick-range-row">
-          <span class="quick-range-label">快捷筛选</span>
-          <el-check-tag
-            v-for="option in quickRangeOptions"
-            :key="option.value"
-            :checked="activeQuickRange === option.value"
-            @change="applyQuickRange(option.value)"
-          >
-            {{ option.label }}
-          </el-check-tag>
-        </div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :icon="Search" @click="handleSearch">查询</el-button>
+            <el-button :icon="RefreshLeft" @click="handleReset">重置</el-button>
+          </el-form-item>
+        </el-form>
       </div>
 
-      <el-table
-        v-loading="loading"
-        :data="alerts"
-        row-key="id"
-        empty-text="当前筛选条件下暂无告警"
-        style="margin-top: 20px;"
-        @selection-change="handleSelectionChange"
-      >
-        <el-table-column type="selection" width="55" />
-        <el-table-column label="严重程度" width="100">
+      <el-table v-loading="loading" :data="tableData" @selection-change="handleSelectionChange">
+        <el-table-column type="selection" width="48" />
+        <el-table-column label="级别" width="80">
           <template #default="{ row }">
-            <el-tag :type="getSeverityType(row.severity)" size="small">
-              {{ getSeverityText(row.severity) }}
-            </el-tag>
+            <el-tag size="small" :type="getLevelType(row.severity)" effect="dark">{{ getLevelText(row.severity) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="类型" width="120">
+        <el-table-column prop="message" label="告警内容" min-width="260" show-overflow-tooltip />
+        <el-table-column label="来源" width="160">
           <template #default="{ row }">
-            <el-tag size="small">{{ getTypeText(row.alert_type) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="主机" width="150">
-          <template #default="{ row }">
-            <div>{{ row.hostname }}</div>
-            <div class="sub-text">{{ row.ip_address }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="告警信息" min-width="300" show-overflow-tooltip>
-          <template #default="{ row }">
-            {{ row.message }}
-          </template>
-        </el-table-column>
-        <el-table-column label="当前值" width="110" align="center">
-          <template #default="{ row }">
-            <span v-if="row.current_value !== null && row.current_value !== undefined">
-              {{ formatMetricValue(row) }}
-            </span>
-            <span v-else>-</span>
+            <span class="zv-source">{{ row.hostname || row.source || '-' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <el-tag :type="row.status === 'active' ? 'danger' : 'success'" size="small">
-              {{ row.status === 'active' ? '活跃' : '已解决' }}
-            </el-tag>
+            <span v-if="row.status === 'resolved'" class="zv-alert-resolved">已解决</span>
+            <span v-else class="zv-alert-unresolved">未解决</span>
           </template>
         </el-table-column>
-        <el-table-column label="告警时间" width="160">
+        <el-table-column label="触发时间" width="170">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="140" fixed="right" align="right">
           <template #default="{ row }">
-            {{ row.created_at }}
+            <el-button v-if="row.status !== 'resolved'" text type="primary" size="small" @click="handleResolve(row.id)">解决</el-button>
+            <el-button v-else text type="info" size="small" disabled>已处理</el-button>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="210" fixed="right">
-          <template #default="{ row }">
-            <el-button type="primary" link size="small" @click="openDetail(row)">
-              详情
-            </el-button>
-            <el-button
-              v-if="row.status === 'active'"
-              type="warning"
-              link
-              size="small"
-              :disabled="resolving"
-              @click="resolveSingleAlert(row)"
-            >
-              标记已解决
-            </el-button>
-            <el-button type="primary" link size="small" @click="goToTerminal(row.asset_id)">
-              查看终端
-            </el-button>
-          </template>
-        </el-table-column>
+        <template #empty>
+          <el-empty description="暂无告警数据" :image-size="80" />
+        </template>
       </el-table>
 
-      <el-pagination
-        v-model:current-page="currentPage"
-        v-model:page-size="pageSize"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next, jumper"
-        style="margin-top: 20px; justify-content: flex-end;"
-        @current-change="loadAlerts"
-        @size-change="handlePageSizeChange"
-      />
-    </el-card>
-
-    <el-drawer v-model="detailVisible" title="告警详情" size="45%">
-      <el-skeleton :loading="detailLoading" animated :rows="8">
-        <template #default>
-          <el-descriptions
-            v-if="detailRecord"
-            :column="1"
-            border
-            size="small"
-            class="detail-descriptions"
-          >
-            <el-descriptions-item label="告警ID">{{ detailRecord.id }}</el-descriptions-item>
-            <el-descriptions-item label="主机">{{ detailRecord.hostname }}</el-descriptions-item>
-            <el-descriptions-item label="IP地址">{{ detailRecord.ip_address }}</el-descriptions-item>
-            <el-descriptions-item label="类型">{{ getTypeText(detailRecord.alert_type) }}</el-descriptions-item>
-            <el-descriptions-item label="严重程度">
-              {{ getSeverityText(detailRecord.severity) }}
-            </el-descriptions-item>
-            <el-descriptions-item label="状态">
-              {{ detailRecord.status === 'active' ? '活跃' : '已解决' }}
-            </el-descriptions-item>
-            <el-descriptions-item label="告警信息">{{ detailRecord.message }}</el-descriptions-item>
-            <el-descriptions-item label="当前值">
-              {{ detailRecord.current_value !== null && detailRecord.current_value !== undefined ? formatMetricValue(detailRecord) : '-' }}
-            </el-descriptions-item>
-            <el-descriptions-item label="阈值">
-              {{ detailRecord.threshold_value ?? '-' }}
-            </el-descriptions-item>
-            <el-descriptions-item label="首次触发时间">{{ detailRecord.created_at || '-' }}</el-descriptions-item>
-            <el-descriptions-item label="最近出现时间">{{ detailRecord.last_seen_at || '-' }}</el-descriptions-item>
-            <el-descriptions-item label="解决时间">{{ detailRecord.resolved_at || '-' }}</el-descriptions-item>
-            <el-descriptions-item label="解决人">{{ detailRecord.resolved_by || '-' }}</el-descriptions-item>
-          </el-descriptions>
-
-          <el-card v-if="detailRecord?.details" shadow="never" class="details-card">
-            <template #header>附加详情</template>
-            <pre>{{ stringifyDetails(detailRecord.details) }}</pre>
-          </el-card>
-        </template>
-      </el-skeleton>
-      <template #footer>
-        <div class="drawer-footer">
-          <el-button @click="detailVisible = false">关闭</el-button>
-          <el-button
-            v-if="detailRecord?.status === 'active'"
-            type="warning"
-            :loading="resolving"
-            @click="resolveSingleAlert(detailRecord)"
-          >
-            标记已解决
-          </el-button>
-        </div>
-      </template>
-    </el-drawer>
+      <div class="zv-pagination">
+        <el-pagination
+          v-model:current-page="pagination.page"
+          v-model:page-size="pagination.page_size"
+          :total="pagination.total"
+          :page-sizes="[10, 20, 50]"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
+          @size-change="loadData"
+          @current-change="loadData"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { useRouter } from 'vue-router'
+import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Bell, Warning, Refresh, Download } from '@element-plus/icons-vue'
+import { Search, RefreshLeft, Refresh, Check } from '@element-plus/icons-vue'
+import { getAlertList, getAlertStats, resolveAlertById, batchResolveAlerts } from '@/api/alert'
 import dayjs from 'dayjs'
-import {
-  batchResolveAlerts,
-  exportAlerts,
-  getAlertDetail,
-  getAlertList,
-  getAlertStats,
-  resolveAlertById
-} from '@/api/alert'
 
-const router = useRouter()
 const loading = ref(false)
-const detailLoading = ref(false)
-const resolving = ref(false)
-const exporting = ref(false)
-const detailVisible = ref(false)
-const detailRecord = ref(null)
+const tableData = ref([])
 const selectedIds = ref([])
-const statusFilter = ref('')
-const severityFilter = ref('')
-const typeFilter = ref('')
-const keyword = ref('')
+const stats = ref({ critical: 0, warning: 0, info: 0, resolved: 0, unresolved: 0 })
+
+const searchForm = reactive({ severity: '', status: '', alert_type: '', hostname: '', keyword: '' })
 const timeRange = ref([])
-const activeQuickRange = ref('')
-const currentPage = ref(1)
-const pageSize = ref(50)
-const total = ref(0)
-const alerts = ref([])
-const refreshTimer = ref(null)
-const stats = ref({
-  total_7days: 0,
-  active: 0,
-  resolved: 0,
-  by_severity: {},
-  by_type: {}
-})
-const alertTypeOptions = [
-  { label: 'CPU', value: 'cpu' },
-  { label: '内存', value: 'memory' },
-  { label: '磁盘', value: 'disk' },
-  { label: '离线', value: 'offline' },
-  { label: '健康度', value: 'health' },
-  { label: '保修', value: 'warranty' }
-]
-const quickRangeOptions = [
-  { label: '今天', value: 'today' },
-  { label: '近24小时', value: '24h' },
-  { label: '近3天', value: '3d' },
-  { label: '近7天', value: '7d' },
-  { label: '近30天', value: '30d' }
-]
+const pagination = reactive({ page: 1, page_size: 20, total: 0 })
 
-const isCancelError = (error) => error === 'cancel' || error === 'close'
-
-const buildQueryParams = () => {
-  const params = {
-    page: currentPage.value,
-    page_size: pageSize.value
-  }
-
-  if (statusFilter.value) params.status = statusFilter.value
-  if (severityFilter.value) params.severity = severityFilter.value
-  if (typeFilter.value) params.alert_type = typeFilter.value
-  if (keyword.value.trim()) params.keyword = keyword.value.trim()
-  if (Array.isArray(timeRange.value) && timeRange.value.length === 2) {
-    params.start_time = timeRange.value[0]
-    params.end_time = timeRange.value[1]
-  }
-
-  return params
-}
-
-const setTimeRange = (start, end, quickValue = '') => {
-  timeRange.value = [
-    start.format('YYYY-MM-DD HH:mm:ss'),
-    end.format('YYYY-MM-DD HH:mm:ss')
-  ]
-  activeQuickRange.value = quickValue
-}
-
-const applyQuickRange = (rangeKey) => {
-  if (activeQuickRange.value === rangeKey) {
-    activeQuickRange.value = ''
-    timeRange.value = []
-    handleFilterChange()
-    return
-  }
-
-  const now = dayjs()
-  switch (rangeKey) {
-    case 'today':
-      setTimeRange(now.startOf('day'), now.endOf('day'), rangeKey)
-      break
-    case '24h':
-      setTimeRange(now.subtract(24, 'hour'), now, rangeKey)
-      break
-    case '3d':
-      setTimeRange(now.subtract(3, 'day'), now, rangeKey)
-      break
-    case '7d':
-      setTimeRange(now.subtract(7, 'day'), now, rangeKey)
-      break
-    case '30d':
-      setTimeRange(now.subtract(30, 'day'), now, rangeKey)
-      break
-    default:
-      activeQuickRange.value = ''
-      timeRange.value = []
-      break
-  }
-
-  handleFilterChange()
-}
-
-const handleTimeRangeChange = (value) => {
-  timeRange.value = Array.isArray(value) ? value : []
-  activeQuickRange.value = ''
-  handleFilterChange()
-}
-
-const syncAlertRow = (alertId, patch) => {
-  alerts.value = alerts.value.map(item => (
-    item.id === alertId ? { ...item, ...patch } : item
-  ))
-}
-
-const syncResolvedAlert = (alertId) => {
-  const resolvedAt = dayjs().format('YYYY-MM-DD HH:mm:ss')
-  const patch = {
-    status: 'resolved',
-    resolved_at: resolvedAt,
-    resolved_by: 'console'
-  }
-
-  syncAlertRow(alertId, patch)
-
-  if (detailRecord.value?.id === alertId) {
-    detailRecord.value = {
-      ...detailRecord.value,
-      ...patch
-    }
-  }
-}
-
-const reloadDetail = async (alertId) => {
-  detailLoading.value = true
+const loadStats = async () => {
   try {
-    detailRecord.value = await getAlertDetail(alertId)
-  } catch (error) {
-    console.error('加载告警详情失败:', error)
-    ElMessage.error('加载告警详情失败，请稍后重试')
-  } finally {
-    detailLoading.value = false
-  }
+    const data = await getAlertStats()
+    stats.value = data || stats.value
+  } catch {}
 }
 
-const loadStats = async ({ silent = false } = {}) => {
+const loadData = async () => {
+  loading.value = true
   try {
-    stats.value = await getAlertStats()
-  } catch (error) {
-    console.error('加载统计失败:', error)
-    if (!silent) {
-      ElMessage.error('加载告警统计失败，请稍后重试')
-    }
-  }
-}
-
-const loadAlerts = async ({ silent = false } = {}) => {
-  try {
-    loading.value = true
-    const response = await getAlertList(buildQueryParams())
-    alerts.value = response.data || []
-    total.value = response.total || 0
-    selectedIds.value = []
+    const res = await getAlertList({
+      page: pagination.page,
+      page_size: pagination.page_size,
+      severity: searchForm.severity || undefined,
+      status: searchForm.status || undefined,
+      alert_type: searchForm.alert_type || undefined,
+      hostname: searchForm.hostname || undefined,
+      keyword: searchForm.keyword || undefined,
+      start_time: timeRange.value?.[0] || undefined,
+      end_time: timeRange.value?.[1] || undefined
+    })
+    tableData.value = res.data || []
+    pagination.total = res.total || 0
   } catch (error) {
     console.error('加载告警失败:', error)
-    if (!silent) {
-      ElMessage.error('加载告警列表失败，请稍后重试')
-    }
   } finally {
     loading.value = false
   }
 }
 
-const refreshAll = async ({ silent = false } = {}) => {
-  await Promise.all([
-    loadStats({ silent }),
-    loadAlerts({ silent })
-  ])
-}
-
-const handleFilterChange = () => {
-  currentPage.value = 1
-  loadAlerts()
-}
-
+const handleSelectionChange = (rows) => { selectedIds.value = rows.map(r => r.id) }
+const handleSearch = () => { pagination.page = 1; loadData() }
 const handleReset = () => {
-  statusFilter.value = ''
-  severityFilter.value = ''
-  typeFilter.value = ''
-  keyword.value = ''
+  Object.assign(searchForm, { severity: '', status: '', alert_type: '', hostname: '', keyword: '' })
   timeRange.value = []
-  activeQuickRange.value = ''
-  currentPage.value = 1
-  loadAlerts()
+  handleSearch()
 }
 
-const handlePageSizeChange = () => {
-  currentPage.value = 1
-  loadAlerts()
-}
-
-const handleSelectionChange = (selection) => {
-  selectedIds.value = selection.map(item => item.id)
-}
-
-const confirmResolve = async (ids) => {
-  await ElMessageBox.confirm('确认标记选中的告警为已解决？', '提示', {
-    confirmButtonText: '确定',
-    cancelButtonText: '取消',
-    type: 'warning'
-  })
-
-  if (ids.length === 1) {
-    return resolveAlertById(ids[0])
-  } else {
-    return batchResolveAlerts({ ids })
-  }
-}
-
-const resolveSingleAlert = async (row) => {
+const handleResolve = async (id) => {
   try {
-    resolving.value = true
-    const response = await confirmResolve([row.id])
-    const message = response?.message === 'Alert already resolved'
-      ? '该告警已是已解决状态'
-      : '告警已标记为已解决'
-
-    syncResolvedAlert(row.id)
-    await refreshAll()
-
-    if (detailVisible.value && detailRecord.value?.id === row.id) {
-      await reloadDetail(row.id)
-    }
-
-    ElMessage.success(message)
+    await resolveAlertById(id)
+    ElMessage.success('告警已解决')
+    loadData()
   } catch (error) {
-    if (!isCancelError(error)) {
-      console.error('操作失败:', error)
-      ElMessage.error('标记告警失败，请稍后重试')
-    }
-  } finally {
-    resolving.value = false
+    ElMessage.error('解决失败')
   }
 }
 
 const handleBatchResolve = async () => {
   if (!selectedIds.value.length) return
-
   try {
-    resolving.value = true
-    const ids = [...selectedIds.value]
-    const response = await confirmResolve(ids)
-
-    const resolvedCount = response?.resolved_count ?? response?.resolved ?? 0
-    const alreadyResolved = response?.already_resolved ?? 0
-    const missingCount = Array.isArray(response?.missing_ids) ? response.missing_ids.length : 0
-
-    ids.forEach(syncResolvedAlert)
-    await refreshAll()
-
-    if (detailVisible.value && ids.includes(detailRecord.value?.id)) {
-      await reloadDetail(detailRecord.value.id)
-    }
-
-    const parts = []
-    if (resolvedCount > 0) parts.push(`新解决 ${resolvedCount} 条`)
-    if (alreadyResolved > 0) parts.push(`已是已解决 ${alreadyResolved} 条`)
-    if (missingCount > 0) parts.push(`未找到 ${missingCount} 条`)
-
-    ElMessage.success(parts.length ? parts.join('，') : '批量处理完成')
+    await ElMessageBox.confirm(`确定解决选中的 ${selectedIds.value.length} 条告警吗？`, '提示', { type: 'warning' })
+    await batchResolveAlerts(selectedIds.value)
+    selectedIds.value = []
+    ElMessage.success('批量解决成功')
+    loadData()
   } catch (error) {
-    if (!isCancelError(error)) {
-      console.error('批量处理失败:', error)
-      ElMessage.error('批量处理失败，请稍后重试')
-    }
-  } finally {
-    resolving.value = false
+    if (error !== 'cancel') ElMessage.error('批量解决失败')
   }
 }
 
-const handleExport = async () => {
-  try {
-    exporting.value = true
-    const { page, page_size, ...params } = buildQueryParams()
-    const blob = await exportAlerts(params)
-    const downloadUrl = window.URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = downloadUrl
-    link.download = `alerts-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    window.URL.revokeObjectURL(downloadUrl)
-    ElMessage.success('告警导出成功')
-  } catch (error) {
-    console.error('导出失败:', error)
-    ElMessage.error('告警导出失败，请稍后重试')
-  } finally {
-    exporting.value = false
-  }
-}
+const getLevelType = (l) => ({ critical: 'danger', high: 'danger', medium: 'warning', low: 'info', info: 'info' }[l] || 'info')
+const getLevelText = (l) => ({ critical: '严重', high: '高危', medium: '中等', low: '低危', info: '提示' }[l] || (l || '-'))
+const formatTime = (v) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '-'
 
-const openDetail = async (row) => {
-  detailVisible.value = true
-  detailRecord.value = row
-  await reloadDetail(row.id)
-}
-
-const goToTerminal = (assetId) => {
-  if (!assetId) {
-    ElMessage.warning('该告警未关联终端')
-    return
-  }
-  router.push({ name: 'TerminalDetail', params: { id: assetId } })
-}
-
-const formatMetricValue = (row) => {
-  const value = Number(row.current_value)
-  if (row.alert_type === 'cpu' || row.alert_type === 'memory' || row.alert_type === 'disk') {
-    return `${value.toFixed(1)}%`
-  }
-  if (row.alert_type === 'offline') {
-    return `${value.toFixed(1)}s`
-  }
-  return value.toFixed(1)
-}
-
-const stringifyDetails = (details) => {
-  return typeof details === 'string' ? details : JSON.stringify(details, null, 2)
-}
-
-const getSeverityType = (severity) => {
-  const map = { critical: 'danger', error: 'danger', warning: 'warning', info: 'info' }
-  return map[severity] || ''
-}
-
-const getSeverityText = (severity) => {
-  const map = { critical: '严重', error: '错误', warning: '警告', info: '信息' }
-  return map[severity] || severity
-}
-
-const getTypeText = (type) => {
-  const map = {
-    cpu: 'CPU',
-    memory: '内存',
-    disk: '磁盘',
-    offline: '离线',
-    health: '健康度',
-    warranty: '保修'
-  }
-  return map[type] || type
-}
-
-onMounted(() => {
-  refreshAll()
-  refreshTimer.value = window.setInterval(() => {
-    refreshAll({ silent: true })
-  }, 30000)
-})
-
-onBeforeUnmount(() => {
-  if (refreshTimer.value) {
-    window.clearInterval(refreshTimer.value)
-    refreshTimer.value = null
-  }
-})
+onMounted(() => { loadStats(); loadData() })
 </script>
 
-<style scoped>
-.stats-row {
-  margin-bottom: 20px;
-}
+<style lang="scss" scoped>
+@use '@/assets/styles/variables.scss' as *;
 
-.stat-card {
-  height: 100%;
-  min-height: 140px;
-}
+.zv-page { padding: $content-padding; max-width: 1600px; margin: 0 auto; }
+.zv-page-actions { display: flex; gap: 10px; }
 
-.stat-content {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  min-height: 100px;
-  text-align: center;
-}
-
-.stat-title {
-  color: #909399;
-  font-size: 14px;
-  margin-bottom: 10px;
-}
-
-.stat-tags {
-  display: flex;
-  justify-content: space-around;
-}
-
-.stat-number {
-  font-size: 20px;
-  font-weight: bold;
-  margin-top: 5px;
-}
-
-.type-summary {
-  display: flex;
-  justify-content: space-around;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.type-summary-item {
-  min-width: 60px;
-}
-
-.type-summary-value {
-  font-size: 16px;
-  font-weight: bold;
-  margin-top: 4px;
-}
-
-.toolbar {
-  display: flex;
-  flex-direction: column;
+.zv-alert-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
-}
-
-.toolbar-main {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
-.toolbar-filters,
-.toolbar-actions {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.quick-range-row {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.quick-range-label {
-  color: #606266;
-  font-size: 13px;
-}
-
-.sub-text {
-  font-size: 12px;
-  color: #909399;
-}
-
-.detail-descriptions {
   margin-bottom: 16px;
 }
 
-.details-card pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: Consolas, Monaco, monospace;
+.zv-stat-mini {
+  background: $bg-card;
+  border: 1px solid $border-color-light;
+  border-left: 3px solid;
+  border-radius: $border-radius;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: $shadow-xs;
+
+  &.zv-stat-danger  { border-left-color: $danger-color; }
+  &.zv-stat-warning { border-left-color: $warning-color; }
+  &.zv-stat-info    { border-left-color: $info-color; }
+  &.zv-stat-success { border-left-color: $success-color; }
 }
 
-.drawer-footer {
+.zv-stat-num {
+  font-size: 24px;
+  font-weight: 700;
+  color: $text-primary;
+  font-family: $font-mono;
+  line-height: 1;
+}
+
+.zv-stat-lbl {
+  font-size: 13px;
+  color: $text-secondary;
+}
+
+.zv-card { padding: 0; }
+
+.zv-filter-bar {
+  padding: 18px 24px;
+  border-bottom: 1px solid $border-color-light;
+  background: $slate-50;
+}
+
+:deep(.el-form-item) { margin-bottom: 0; margin-right: 12px; }
+:deep(.el-input__wrapper),
+:deep(.el-select__wrapper) {
+  background: $bg-card;
+  box-shadow: none;
+  border-radius: $border-radius;
+  transition: all $transition-base;
+  &:hover { box-shadow: 0 0 0 1px $brand-primary-100; }
+  &.is-focus { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10); }
+}
+
+.zv-source {
+  font-family: $font-mono;
+  font-size: 12px;
+  color: $text-secondary;
+}
+
+.zv-alert-resolved {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: $success-color;
+  font-weight: 500;
+  &::before { content: '✓'; font-weight: 700; }
+}
+
+.zv-alert-unresolved {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: $warning-color;
+  font-weight: 500;
+  &::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: $warning-color;
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18);
+  }
+}
+
+.zv-pagination {
+  padding: 16px 22px;
   display: flex;
   justify-content: flex-end;
-  gap: 12px;
+  border-top: 1px solid $border-color-light;
+}
+
+:deep(.el-table) {
+  --el-table-header-bg-color: #fafbfc;
+  th.el-table__cell {
+    background: #fafbfc;
+    color: $text-secondary;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  tr:hover > td.el-table__cell { background: rgba(37, 99, 235, 0.03) !important; }
+  td.el-table__cell { border-bottom: 1px solid $slate-100 !important; }
+  .el-table__inner-wrapper::before { height: 0; }
 }
 </style>

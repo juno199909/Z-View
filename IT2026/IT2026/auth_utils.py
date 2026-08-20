@@ -31,9 +31,24 @@ AUTH_STATE_FILE = get_env(
 PASSWORD_HASH_ITERATIONS = int(get_env("ZVIEW_PASSWORD_HASH_ITERATIONS", "120000") or "120000")
 AUTH_STATE_LOCK = threading.Lock()
 AGENT_TOKEN_ENV_NAME = "ZVIEW_AGENT_TOKEN"
+AGENT_TOKEN_PREVIOUS_ENV_NAME = "ZVIEW_AGENT_TOKEN_PREVIOUS"
 AGENT_TOKEN_FILE_ENV_NAME = "ZVIEW_AGENT_TOKEN_FILE"
 AGENT_TOKEN_FILE_NAME = "agent_secret.txt"
 LEGACY_AGENT_TOKEN = "cmdb-agent-secret-2024"
+LEGACY_AGENT_TOKEN_DISABLED_ENV_NAME = "ZVIEW_AGENT_LEGACY_TOKEN_DISABLED"
+AGENT_DEVICE_TOKEN_PREFIX = "zv1:"
+# 设备凭据校验器由宿主应用（assets_api）注入，避免本模块依赖 DB
+_AGENT_DEVICE_CREDENTIAL_VERIFIER = None
+
+
+def set_agent_device_credential_verifier(verifier) -> None:
+    """注册设备凭据校验函数：verifier(agent_id: int, secret: str) -> bool"""
+    global _AGENT_DEVICE_CREDENTIAL_VERIFIER
+    _AGENT_DEVICE_CREDENTIAL_VERIFIER = verifier
+
+
+def _legacy_token_disabled() -> bool:
+    return str(get_env(LEGACY_AGENT_TOKEN_DISABLED_ENV_NAME, "") or "").strip().lower() in ("1", "true", "yes", "on")
 WEAK_PASSWORD_PATTERNS = (
     "123456",
     "123123",
@@ -61,6 +76,10 @@ ROLE_PERMISSIONS = {
         "remote_desktop:control",
         "policies:read",
         "policies:write",
+        "security:read",
+        "security:write",
+        "firewall:manage",
+        "usb:manage",
     ),
     "viewer": (
         "auth:self",
@@ -70,6 +89,7 @@ ROLE_PERMISSIONS = {
         "alerts:read",
         "logs:read",
         "policies:read",
+        "security:read",
     ),
 }
 
@@ -133,6 +153,11 @@ def resolve_required_permission(path: str, method: str) -> str:
     normalized_method = str(method or "GET").upper()
     is_write = normalized_method in WRITE_METHODS
 
+    if normalized_path.startswith("/api/v1/auth/users"):
+        # 用户管理仅 admin（operator/viewer 无 auth:manage 权限）
+        return "auth:manage"
+    if normalized_path.startswith("/api/v1/console/agent-credentials"):
+        return "policies:write"
     if normalized_path.startswith("/api/v1/auth/"):
         return "auth:self"
     if normalized_path.startswith("/api/v1/assets/") and normalized_path.endswith("/remote-control"):
@@ -157,6 +182,18 @@ def resolve_required_permission(path: str, method: str) -> str:
         return "alerts:write" if is_write else "alerts:read"
     if normalized_path.startswith("/api/v1/logs"):
         return "logs:write" if is_write else "logs:read"
+    if normalized_path.startswith("/api/v1/security/firewall"):
+        return "firewall:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/usb"):
+        return "usb:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/policies"):
+        return "security:write" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/remote"):
+        return "security:write"
+    if normalized_path.startswith("/api/v1/security"):
+        return "security:write" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/remote"):
+        return "remote_desktop:control" if is_write else "security:read"
     return "auth:self"
 
 
@@ -202,12 +239,16 @@ def _default_auth_state(password: Optional[str] = None) -> Dict[str, Any]:
     password = password or CONFIGURED_ADMIN_PASSWORD or secrets.token_urlsafe(18)
     credential_source = "env" if CONFIGURED_ADMIN_PASSWORD else "bootstrap"
     return {
-        "username": DEFAULT_ADMIN_USERNAME,
-        "role": normalize_role(DEFAULT_ADMIN_ROLE),
-        "password_hash": _hash_password(password),
-        "token_version": 1,
-        "password_updated_at": None,
-        "credential_source": credential_source,
+        "users": [{
+            "username": DEFAULT_ADMIN_USERNAME,
+            "role": normalize_role(DEFAULT_ADMIN_ROLE),
+            "password_hash": _hash_password(password),
+            "token_version": 1,
+            "password_updated_at": None,
+            "credential_source": credential_source,
+            "enabled": True,
+            "created_at": int(time.time()),
+        }]
     }
 
 
@@ -216,13 +257,34 @@ def _bootstrap_auth_state() -> Dict[str, Any]:
     state = _default_auth_state(password=bootstrap_password)
     if not CONFIGURED_ADMIN_PASSWORD:
         print(
-            f"[auth] Generated bootstrap admin password for '{state['username']}': "
+            f"[auth] Generated bootstrap admin password for '{state['users'][0]['username']}': "
             f"{bootstrap_password}. Please change it after first login."
         )
     try:
         return _save_auth_state(state)
     except OSError:
         return state
+
+
+def _normalize_user_entry(raw: Any, fallback_username: str, fallback_role: str) -> Dict[str, Any]:
+    raw = raw or {}
+    return {
+        "username": str(raw.get("username") or fallback_username).strip() or fallback_username,
+        "role": normalize_role(raw.get("role") or fallback_role),
+        "password_hash": str(raw.get("password_hash") or ""),
+        "token_version": max(1, int(raw.get("token_version") or 1)),
+        "password_updated_at": raw.get("password_updated_at"),
+        "credential_source": str(raw.get("credential_source") or "file"),
+        "enabled": bool(raw.get("enabled", True)),
+        "created_at": raw.get("created_at"),
+    }
+
+
+def _legacy_state_to_users(state: Dict[str, Any]) -> Dict[str, Any]:
+    """旧版单用户格式迁移为 users 列表。"""
+    return {
+        "users": [_normalize_user_entry(state, DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_ROLE)]
+    }
 
 
 def _load_auth_state() -> Dict[str, Any]:
@@ -235,36 +297,42 @@ def _load_auth_state() -> Dict[str, Any]:
     except (OSError, ValueError, json.JSONDecodeError):
         return _bootstrap_auth_state()
 
-    default_state = {
-        "username": DEFAULT_ADMIN_USERNAME,
-        "role": normalize_role(DEFAULT_ADMIN_ROLE),
-        "password_hash": _hash_password(CONFIGURED_ADMIN_PASSWORD) if CONFIGURED_ADMIN_PASSWORD else "",
-        "token_version": 1,
-        "password_updated_at": None,
-        "credential_source": "file",
-    }
-    merged = {
-        "username": str(state.get("username") or default_state["username"]).strip() or default_state["username"],
-        "role": normalize_role(state.get("role") or default_state["role"]),
-        "password_hash": str(state.get("password_hash") or default_state["password_hash"]),
-        "token_version": max(1, int(state.get("token_version") or default_state["token_version"])),
-        "password_updated_at": state.get("password_updated_at"),
-        "credential_source": str(state.get("credential_source") or "file"),
-    }
-    if not merged["password_hash"]:
+    if not isinstance(state, dict):
         return _bootstrap_auth_state()
-    return merged
+
+    if not isinstance(state.get("users"), list) or not state["users"]:
+        # 旧版单用户格式自动迁移
+        state = _legacy_state_to_users(state)
+
+    users = []
+    seen = set()
+    for raw in state["users"]:
+        entry = _normalize_user_entry(raw, DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_ROLE)
+        if entry["username"] in seen:
+            continue
+        if not entry["password_hash"]:
+            continue
+        seen.add(entry["username"])
+        users.append(entry)
+
+    if not users:
+        return _bootstrap_auth_state()
+    return {"users": users}
 
 
 def _save_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = {
-        "username": str(state.get("username") or DEFAULT_ADMIN_USERNAME).strip() or DEFAULT_ADMIN_USERNAME,
-        "role": normalize_role(state.get("role") or DEFAULT_ADMIN_ROLE),
-        "password_hash": str(state.get("password_hash") or ""),
-        "token_version": max(1, int(state.get("token_version") or 1)),
-        "password_updated_at": state.get("password_updated_at"),
-        "credential_source": str(state.get("credential_source") or "file"),
-    }
+    users = []
+    seen = set()
+    for raw in state.get("users") or []:
+        entry = _normalize_user_entry(raw, DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_ROLE)
+        if entry["username"] in seen:
+            continue
+        seen.add(entry["username"])
+        users.append(entry)
+    if not users:
+        users = _default_auth_state()["users"]
+
+    normalized = {"users": users}
 
     os.makedirs(os.path.dirname(AUTH_STATE_FILE) or ".", exist_ok=True)
     temp_path = f"{AUTH_STATE_FILE}.tmp"
@@ -274,31 +342,188 @@ def _save_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def get_auth_profile(username: Optional[str] = None) -> Dict[str, Any]:
-    with AUTH_STATE_LOCK:
-        state = _load_auth_state()
+def _find_user(state: Dict[str, Any], username: str) -> Optional[Dict[str, Any]]:
+    normalized_username = str(username or "").strip()
+    for user in state.get("users") or []:
+        if user.get("username") == normalized_username:
+            return user
+    return None
 
-    requested_username = str(username or state["username"]).strip() or state["username"]
-    if requested_username != state["username"]:
-        return {}
 
+def _user_profile(user: Dict[str, Any]) -> Dict[str, Any]:
     profile = {
-        "username": state["username"],
-        "role": normalize_role(state.get("role")),
-        "token_version": state["token_version"],
-        "password_updated_at": state.get("password_updated_at"),
-        "credential_source": state.get("credential_source") or "file",
+        "username": user["username"],
+        "role": normalize_role(user.get("role")),
+        "token_version": int(user.get("token_version") or 1),
+        "password_updated_at": user.get("password_updated_at"),
+        "credential_source": user.get("credential_source") or "file",
+        "enabled": bool(user.get("enabled", True)),
+        "created_at": user.get("created_at"),
     }
     profile["permissions"] = get_role_permissions(profile["role"])
     profile["must_change_password"] = compute_must_change_password(profile)
     return profile
 
 
+def _count_enabled_admins(state: Dict[str, Any]) -> int:
+    return sum(
+        1 for user in state.get("users") or []
+        if normalize_role(user.get("role")) == "admin" and user.get("enabled", True)
+    )
+
+
+def get_auth_profile(username: Optional[str] = None) -> Dict[str, Any]:
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+
+    requested_username = str(username or "").strip()
+    user = _find_user(state, requested_username) if requested_username else None
+    if not user:
+        return {}
+    return _user_profile(user)
+
+
 def compute_must_change_password(profile: Optional[Dict[str, Any]]) -> bool:
     profile = profile or {}
     credential_source = str(profile.get("credential_source") or "file").strip().lower()
     password_updated_at = profile.get("password_updated_at")
-    return credential_source in {"default", "env", "bootstrap"} and not password_updated_at
+    return (
+        credential_source in {"default", "env", "bootstrap", "admin_created"}
+        and not password_updated_at
+    )
+
+
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]{2,32}$")
+
+
+def list_users() -> Dict[str, Any]:
+    """列出全部用户（不含口令哈希），供管理端使用。"""
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+    users = []
+    for user in state.get("users") or []:
+        profile = _user_profile(user)
+        profile.pop("permissions", None)
+        users.append(profile)
+    return {"users": users, "total": len(users)}
+
+
+def create_user(username: str, password: str, role: str, operator: str = "system") -> Dict[str, Any]:
+    normalized_username = str(username or "").strip()
+    normalized_role = normalize_role(role)
+    if not USERNAME_PATTERN.match(normalized_username):
+        raise ValueError("用户名只能包含字母、数字、点、下划线、连字符，长度 2-32 位")
+    validate_password_strength(normalized_username, str(password or ""))
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        if _find_user(state, normalized_username):
+            raise ValueError("用户名已存在")
+        state.setdefault("users", []).append({
+            "username": normalized_username,
+            "role": normalized_role,
+            "password_hash": _hash_password(str(password)),
+            "token_version": 1,
+            "password_updated_at": None,
+            "credential_source": "admin_created",
+            "enabled": True,
+            "created_at": int(time.time()),
+        })
+        saved_state = _save_auth_state(state)
+
+    safe_print = None
+    try:
+        from console_utils import safe_console_print as safe_print
+    except Exception:
+        pass
+    if safe_print:
+        safe_print(f"[auth] user '{normalized_username}' created by '{operator}' with role '{normalized_role}'")
+
+    user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(user)
+
+
+def update_user_role(username: str, role: str, operator: str = "system") -> Dict[str, Any]:
+    normalized_role = normalize_role(role)
+    normalized_username = str(username or "").strip()
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        user = _find_user(state, normalized_username)
+        if not user:
+            raise ValueError("用户不存在")
+        if normalized_role != "admin" and user.get("enabled", True) \
+                and normalize_role(user.get("role")) == "admin" and _count_enabled_admins(state) <= 1:
+            raise ValueError("不能降级最后一个可用的管理员账号")
+        user["role"] = normalized_role
+        user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
+        saved_state = _save_auth_state(state)
+
+    saved_user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(saved_user)
+
+
+def set_user_enabled(username: str, enabled: bool, operator: str = "system") -> Dict[str, Any]:
+    normalized_username = str(username or "").strip()
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        user = _find_user(state, normalized_username)
+        if not user:
+            raise ValueError("用户不存在")
+        if not enabled and normalize_role(user.get("role")) == "admin" \
+                and user.get("enabled", True) and _count_enabled_admins(state) <= 1:
+            raise ValueError("不能停用最后一个可用的管理员账号")
+        user["enabled"] = bool(enabled)
+        # 停用即吊销已发令牌
+        user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
+        saved_state = _save_auth_state(state)
+
+    saved_user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(saved_user)
+
+
+def admin_reset_password(username: str, new_password: str, operator: str = "system") -> Dict[str, Any]:
+    normalized_username = str(username or "").strip()
+    validate_password_strength(normalized_username, str(new_password or ""))
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        user = _find_user(state, normalized_username)
+        if not user:
+            raise ValueError("用户不存在")
+        if _verify_password(str(new_password or ""), user.get("password_hash") or ""):
+            raise ValueError("新密码不能与当前密码相同")
+        user["password_hash"] = _hash_password(str(new_password))
+        user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
+        user["password_updated_at"] = int(time.time())
+        user["credential_source"] = "file"
+        saved_state = _save_auth_state(state)
+
+    saved_user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(saved_user)
+
+
+def delete_user(username: str, operator: str = "system") -> Dict[str, Any]:
+    normalized_username = str(username or "").strip()
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        user = _find_user(state, normalized_username)
+        if not user:
+            raise ValueError("用户不存在")
+        if normalized_username == str(operator or "").strip():
+            raise ValueError("不能删除当前登录的账号")
+        if normalize_role(user.get("role")) == "admin" and user.get("enabled", True) \
+                and _count_enabled_admins(state) <= 1:
+            raise ValueError("不能删除最后一个可用的管理员账号")
+        state["users"] = [
+            u for u in state.get("users") or []
+            if u.get("username") != normalized_username
+        ]
+        _save_auth_state(state)
+
+    return {"username": normalized_username, "deleted": True}
 
 
 def validate_password_strength(username: str, password: str) -> None:
@@ -336,21 +561,15 @@ def authenticate_username_password(username: str, password: str) -> Optional[Dic
     with AUTH_STATE_LOCK:
         state = _load_auth_state()
 
-    username_ok = hmac.compare_digest(normalized_username, state["username"])
-    password_ok = _verify_password(normalized_password, state["password_hash"])
-
-    if not username_ok or not password_ok:
+    user = _find_user(state, normalized_username)
+    if not user or not user.get("enabled", True):
+        return None
+    if not _verify_password(normalized_password, user.get("password_hash") or ""):
         return None
 
-    return {
-        "username": state["username"],
-        "role": normalize_role(state.get("role")),
-        "permissions": get_role_permissions(state.get("role")),
-        "token_version": state["token_version"],
-        "password_updated_at": state.get("password_updated_at"),
-        "credential_source": state.get("credential_source") or "file",
-        "must_change_password": compute_must_change_password(state),
-    }
+    profile = _user_profile(user)
+    profile["must_change_password"] = compute_must_change_password(user)
+    return profile
 
 
 def change_password(username: str, current_password: str, new_password: str) -> Dict[str, Any]:
@@ -360,28 +579,22 @@ def change_password(username: str, current_password: str, new_password: str) -> 
 
     with AUTH_STATE_LOCK:
         state = _load_auth_state()
-        if not hmac.compare_digest(normalized_username, state["username"]):
+        user = _find_user(state, normalized_username)
+        if not user:
             raise ValueError("用户不存在")
-        if not _verify_password(current_password, state["password_hash"]):
+        if not _verify_password(current_password, user.get("password_hash") or ""):
             raise ValueError("当前密码不正确")
-        if _verify_password(normalized_new_password, state["password_hash"]):
+        if _verify_password(normalized_new_password, user.get("password_hash") or ""):
             raise ValueError("新密码不能与当前密码相同")
 
-        state["password_hash"] = _hash_password(normalized_new_password)
-        state["token_version"] = max(1, int(state.get("token_version") or 1)) + 1
-        state["password_updated_at"] = int(time.time())
-        state["credential_source"] = "file"
+        user["password_hash"] = _hash_password(normalized_new_password)
+        user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
+        user["password_updated_at"] = int(time.time())
+        user["credential_source"] = "file"
         saved_state = _save_auth_state(state)
 
-    return {
-        "username": saved_state["username"],
-        "role": normalize_role(saved_state.get("role")),
-        "permissions": get_role_permissions(saved_state.get("role")),
-        "token_version": saved_state["token_version"],
-        "password_updated_at": saved_state["password_updated_at"],
-        "credential_source": saved_state.get("credential_source") or "file",
-        "must_change_password": compute_must_change_password(saved_state),
-    }
+    saved_user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(saved_user)
 
 
 def issue_access_token(username: str, expires_in_seconds: Optional[int] = None) -> Dict[str, Any]:
@@ -506,7 +719,49 @@ def get_expected_agent_token() -> str:
             AGENT_TOKEN_FILE_ENV_NAME,
             AGENT_TOKEN_FILE_NAME,
         )
+    if _legacy_token_disabled():
+        # 未配置 managed token 且禁用 legacy：返回不可能匹配的值，等效全部拒绝
+        return "\x00disabled"
     return LEGACY_AGENT_TOKEN
+
+
+def _global_token_matches(normalized_token: str) -> Optional[str]:
+    """全局 token 比对：当前 token + 轮换窗口内的上一个 token。命中返回来源标识。"""
+    expected_token = get_expected_agent_token()
+    if hmac.compare_digest(normalized_token, expected_token):
+        if expected_token == LEGACY_AGENT_TOKEN and not _uses_managed_agent_token():
+            return "legacy_default"
+        return "configured"
+    previous_token = str(get_env(AGENT_TOKEN_PREVIOUS_ENV_NAME, "") or "").strip()
+    if previous_token and hmac.compare_digest(normalized_token, previous_token):
+        return "previous"
+    return None
+
+
+def _verify_device_token(normalized_token: str) -> Optional[Dict[str, Any]]:
+    """zv1:{agent_id}:{secret} 设备凭据校验"""
+    if not normalized_token.startswith(AGENT_DEVICE_TOKEN_PREFIX):
+        return None
+    if _AGENT_DEVICE_CREDENTIAL_VERIFIER is None:
+        return None
+    remainder = normalized_token[len(AGENT_DEVICE_TOKEN_PREFIX):]
+    agent_id_text, _, secret = remainder.partition(":")
+    agent_id_text = agent_id_text.strip()
+    if not agent_id_text.isdigit() or not secret:
+        return None
+    agent_id = int(agent_id_text)
+    try:
+        if not _AGENT_DEVICE_CREDENTIAL_VERIFIER(agent_id, secret):
+            return None
+    except Exception:
+        return None
+    return {
+        "auth_type": "agent",
+        "agent_auth_type": "device",
+        "agent_id": agent_id,
+        "token_source": "device_credential",
+        "legacy_compat": False,
+    }
 
 
 def verify_agent_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -514,15 +769,24 @@ def verify_agent_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
     if not normalized_token:
         return None
 
-    expected_token = get_expected_agent_token()
-    if not hmac.compare_digest(normalized_token, expected_token):
-        return None
+    # 设备凭据（一机一密）优先
+    device_auth = _verify_device_token(normalized_token)
+    if device_auth:
+        return device_auth
 
-    using_legacy_token = expected_token == LEGACY_AGENT_TOKEN and not _uses_managed_agent_token()
+    # 全局 token（当前 + 轮换窗口内的 previous）；legacy 兼容受开关控制
+    if normalized_token.startswith(AGENT_DEVICE_TOKEN_PREFIX):
+        return None
+    token_source = _global_token_matches(normalized_token)
+    if not token_source:
+        return None
+    if token_source == "legacy_default" and _legacy_token_disabled():
+        return None
     return {
         "auth_type": "agent",
-        "token_source": "legacy_default" if using_legacy_token else "configured",
-        "legacy_compat": using_legacy_token,
+        "agent_auth_type": "global",
+        "token_source": token_source,
+        "legacy_compat": token_source == "legacy_default",
     }
 
 

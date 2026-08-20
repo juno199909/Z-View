@@ -31,6 +31,26 @@ $PackageDir = Get-ChildItem -LiteralPath $ProjectRoot -Directory |
     Select-Object -ExpandProperty FullName -First 1
 $DriverSourceDir = Join-Path $ProjectRoot "Drivers"
 
+function Resolve-BuildPython {
+    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyCommand) {
+        try {
+            & $pyCommand.Source -3.12 --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return @($pyCommand.Source, "-3.12")
+            }
+        } catch {
+        }
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        return @($pythonCommand.Source)
+    }
+
+    throw "No usable Python runtime found for packaging."
+}
+
 if (-not $PackageDir) {
     throw "Deployment package directory not found."
 }
@@ -53,10 +73,40 @@ if (Test-Path $BuildDir) {
 
 Write-Host "==> Run PyInstaller"
 Set-Location $ProjectRoot
-& pyinstaller --noconfirm --clean --distpath $DistDir --workpath $BuildDir $SpecPath
+$BuildPython = Resolve-BuildPython
+Write-Host ("==> Packaging with: {0}" -f ($BuildPython -join " "))
+$BuildPythonExe = $BuildPython[0]
+$BuildPythonArgs = @()
+if ($BuildPython.Count -gt 1) {
+    $BuildPythonArgs += $BuildPython[1..($BuildPython.Count - 1)]
+}
+$BuildPythonArgs += @("-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", $DistDir, "--workpath", $BuildDir, $SpecPath)
+& $BuildPythonExe $BuildPythonArgs
 
 if (-not (Test-Path $ExePath)) {
     throw "Build output not found: $ExePath"
+}
+
+# 中文注释：Authenticode 代码签名（P0-05）。企业自建代码签名证书，
+# 需配合 GPO 把证书分发到终端的 Root + TrustedPublisher 存储。
+# 证书缺失时告警但不阻断构建（开发环境允许未签名）。
+$SignCertThumbprint = [Environment]::GetEnvironmentVariable("ZVIEW_CODESIGN_THUMBPRINT")
+if ([string]::IsNullOrWhiteSpace($SignCertThumbprint)) {
+    $SignCertThumbprint = "93C05132E7AD481010C68B37BAF25A1DA71CEADD"
+}
+$SignCert = Get-ChildItem "Cert:\CurrentUser\My\$SignCertThumbprint" -ErrorAction SilentlyContinue
+if (-not $SignCert) {
+    $SignCert = Get-ChildItem "Cert:\LocalMachine\My\$SignCertThumbprint" -ErrorAction SilentlyContinue
+}
+if ($SignCert) {
+    Write-Host "==> Authenticode signing (P0-05)"
+    $Signature = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $SignCert -HashAlgorithm SHA256
+    if ($Signature.Status -ne "Valid") {
+        throw "Authenticode signing failed: $($Signature.Status) $($Signature.StatusMessage)"
+    }
+    Write-Host ("    Signed by: {0}" -f $Signature.SignerCertificate.Subject)
+} else {
+    Write-Host "==> WARNING: code signing certificate not found (thumbprint $SignCertThumbprint); exe left UNSIGNED"
 }
 if (-not (Test-Path $VerifyScript)) {
     throw "Release verification script not found: $VerifyScript"
@@ -76,6 +126,13 @@ Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $ReleasePackag
 if (Test-Path $DriverSourceDir) {
     Copy-Item -LiteralPath $DriverSourceDir -Destination $DistDir -Recurse -Force
     Copy-Item -LiteralPath $DriverSourceDir -Destination $ReleasePackageDir -Recurse -Force
+}
+
+# 中文注释：P0-05 签名证书公钥随部署包分发，GPO 可用它填充终端受信任存储。
+$SignCertPublicPath = Join-Path $ProjectRoot "signing\zview-codesign.cer"
+if (Test-Path $SignCertPublicPath) {
+    Copy-Item -LiteralPath $SignCertPublicPath -Destination $DistDir -Force
+    Copy-Item -LiteralPath $SignCertPublicPath -Destination $ReleasePackageDir -Force
 }
 
 # 中文注释：复制完成后立即做静态验收，避免把不完整或损坏的部署包交付给 GPO。

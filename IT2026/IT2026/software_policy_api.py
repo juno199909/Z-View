@@ -77,6 +77,9 @@ def get_db_connection():
     """获取数据库连接"""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("SET time_zone = '+8:00'")
+        cursor.close()
         return conn
     except Error as e:
         print(f"数据库连接错误: {e}")
@@ -772,6 +775,152 @@ def enqueue_force_install_policy_tasks(cursor, policy_id: int) -> Dict[str, int]
         queued_tasks += 1
 
     return {"queued_tasks": queued_tasks, "skipped_rules": skipped_rules}
+
+
+def enforce_force_install_convergence(cursor, asset_id: int) -> int:
+    """强制安装策略持续收敛：Agent 领任务时检查启用的策略，终端缺包则补建单终端安装任务。
+
+    与 enqueue_force_install_policy_tasks（创建时一次性下发）互补，保证
+    "策略启用期间新接入/重装系统的终端最终也会装上策略要求的软件"。
+
+    跳过条件（任一满足即不建）：
+    1. 策略目标范围不包含此终端
+    2. 该策略规则下此终端已有成功完成的安装结果（视为已安装）
+    3. 该策略规则下此终端已有在途结果（任务在途）
+    4. 规则指定的软件包不可用
+
+    返回新建任务数。
+    """
+    cursor.execute(
+        """
+        SELECT id, policy_name, priority, target_type, target_ids
+        FROM software_policies
+        WHERE policy_type = 'force_install' AND enabled = 1
+        """
+    )
+    policies = cursor.fetchall()
+    if not policies:
+        return 0
+
+    cursor.execute(
+        "SELECT id, group_id FROM assets WHERE id = %s AND deleted_at IS NULL",
+        (asset_id,),
+    )
+    asset = cursor.fetchone()
+    if not asset:
+        return 0
+
+    created = 0
+    for policy in policies:
+        policy_id = int(policy["id"])
+        target_type = policy.get("target_type") or "all"
+        if target_type == "group":
+            group_ids = [int(i) for i in parse_target_ids(policy.get("target_ids"))]
+            if int(asset.get("group_id") or 0) not in group_ids:
+                continue
+        elif target_type == "asset":
+            target_ids = [int(i) for i in parse_target_ids(policy.get("target_ids"))]
+            if asset_id not in target_ids:
+                continue
+
+        cursor.execute(
+            "SELECT id, rule_value FROM software_policy_rules WHERE policy_id = %s ORDER BY id ASC",
+            (policy_id,),
+        )
+        rules = cursor.fetchall()
+        for rule in rules:
+            try:
+                package_id = int(str(rule.get("rule_value") or "").strip())
+            except (TypeError, ValueError):
+                continue
+
+            cursor.execute(
+                """
+                SELECT id, display_name, version, status
+                FROM software_packages
+                WHERE id = %s AND deleted_at IS NULL
+                """,
+                (package_id,),
+            )
+            package = cursor.fetchone()
+            if not package or package.get("status") != "available":
+                continue
+
+            # 取该终端在此策略下对此包的最新一条结果，判定是否需要收敛
+            cursor.execute(
+                """
+                SELECT r.status, r.updated_at
+                FROM software_task_results r
+                JOIN software_tasks t ON t.id = r.task_id
+                WHERE r.asset_id = %s
+                  AND t.package_id = %s
+                  AND t.created_by = %s
+                  AND JSON_UNQUOTE(JSON_EXTRACT(t.options, '$.policy_id')) = %s
+                ORDER BY r.id DESC
+                LIMIT 1
+                """,
+                (asset_id, package_id, POLICY_TASK_CREATOR, str(policy_id)),
+            )
+            latest = cursor.fetchone()
+            if latest:
+                status = latest.get("status")
+                if status in ("success", "pending", "downloading", "installing"):
+                    # 已安装 / 在途 → 跳过
+                    continue
+                # failed / cancelled：失败退避，24 小时内不重试，避免坏安装包被无限重建
+                updated_at = latest.get("updated_at")
+                if status in ("failed", "cancelled") and updated_at is not None:
+                    cursor.execute(
+                        "SELECT %s > NOW() - INTERVAL 24 HOUR AS recent",
+                        (updated_at,),
+                    )
+                    if cursor.fetchone()["recent"]:
+                        continue
+
+            task_name = (
+                f"[策略强装·收敛] {policy.get('policy_name')} - "
+                f"{package.get('display_name')} {package.get('version') or ''}"
+            ).strip()
+            task_options = {
+                "source": "force_install_policy",
+                "policy_id": policy_id,
+                "policy_rule_id": int(rule["id"]),
+                "package_id": package_id,
+            }
+            cursor.execute(
+                """
+                INSERT INTO software_tasks (
+                    task_name, task_type, package_id, software_name,
+                    schedule_type, target_type, target_ids, target_count,
+                    priority, options, status, created_by
+                ) VALUES (%s, 'install', %s, %s, 'immediate', 'asset', %s, 1, %s, %s, 'pending', %s)
+                """,
+                (
+                    task_name,
+                    package_id,
+                    package.get("display_name"),
+                    json.dumps([asset_id]),
+                    priority_to_task_priority(policy.get("priority") or 0),
+                    json.dumps(task_options, ensure_ascii=False),
+                    POLICY_TASK_CREATOR,
+                ),
+            )
+            task_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO software_task_results (task_id, asset_id, status) VALUES (%s, %s, 'pending')",
+                (task_id, asset_id),
+            )
+            create_policy_log_entry(
+                cursor,
+                policy_id,
+                package.get("display_name"),
+                "convergence_install_task",
+                "success",
+                f"持续收敛为终端 #{asset_id} 补建安装任务 #{task_id}",
+            )
+            created += 1
+
+    return created
 
 # ============================================================
 # API 端点

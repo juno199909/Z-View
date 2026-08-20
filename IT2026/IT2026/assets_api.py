@@ -4,31 +4,32 @@ Assets API - 资产管理接口
 """
 
 import asyncio
-import base64
 import csv
+import hashlib
+import hmac
 import http.client
 import io
 import ipaddress
+import secrets
+import datetime
+import contextlib
 import json
-import os
 import socket
 import subprocess
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import date, datetime, timedelta
-from urllib.parse import urlencode, urlparse
+from datetime import datetime
+from urllib.parse import urlencode
 
-import requests
 import websockets
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 from typing import List, Optional, Dict, Any, Tuple
-import mysql.connector
 from mysql.connector import Error
 from websockets.exceptions import ConnectionClosed
 
@@ -43,50 +44,23 @@ from auth_utils import (
     is_exempt_path,
     normalize_actor_name,
     require_request_permission,
+    set_agent_device_credential_verifier,
+    TOKEN_SECRET,
     user_has_permission,
     issue_access_token,
-    verify_agent_token,
     verify_access_token,
+    list_users,
+    create_user,
+    update_user_role,
+    set_user_enabled,
+    admin_reset_password,
+    delete_user,
 )
 from console_utils import enable_utf8_stdio, safe_console_print
 from config_utils import get_cors_middleware_options, get_db_config, get_env
 
 SNMP_API_MODE = None
 
-try:
-    from pysnmp.hlapi import (
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        getCmd,
-    )
-    SNMP_API_MODE = "legacy"
-    SNMP_IMPORT_ERROR = None
-except Exception:
-    try:
-        from pysnmp.hlapi.asyncio import (
-            CommunityData,
-            ContextData,
-            ObjectIdentity,
-            ObjectType,
-            SnmpEngine,
-            UdpTransportTarget,
-            get_cmd as getCmd,
-        )
-        SNMP_API_MODE = "asyncio"
-        SNMP_IMPORT_ERROR = None
-    except Exception as exc:  # pragma: no cover - runtime environment dependent
-        CommunityData = None
-        ContextData = None
-        ObjectIdentity = None
-        ObjectType = None
-        SnmpEngine = None
-        UdpTransportTarget = None
-        getCmd = None
-        SNMP_IMPORT_ERROR = str(exc)
 
 
 enable_utf8_stdio()
@@ -94,6 +68,26 @@ enable_utf8_stdio()
 app = FastAPI(title="Z-View Assets API", version="1.0.0")
 
 # 配置CORS
+# P4-03：Request ID 中间件（生成/透传 X-Request-ID，响应头返回）
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or new_request_id()
+    request_id_var.set(rid)
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    # P4-04：HTTP 指标（方法/状态/耗时）
+    try:
+        route = request.scope.get("route")
+        endpoint = getattr(route, "path", request.url.path)
+        labels = {"method": request.method, "endpoint": endpoint, "status": str(response.status_code)}
+        inc_counter("zview_http_requests_total", labels)
+        observe_histogram("zview_http_request_duration_seconds", time.perf_counter() - start_time, labels)
+    except Exception:
+        pass
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     **get_cors_middleware_options(),
@@ -101,31 +95,80 @@ app.add_middleware(
 
 AUTH_EXEMPTIONS = (
     {"path": "/api/v1/auth/login", "methods": ["POST"]},
+    {"path": "/api/health", "methods": ["GET"]},  # P4-01/P1-08：运维健康探针（内网）
+    {"path": "/metrics", "methods": ["GET"]},  # P4-04：Prometheus 抓取端点（内网）
     {"path": "/api/v1/agent/heartbeat", "methods": ["POST"]},
+    {"path": "/api/v1/agent/policies", "methods": ["GET"]},
+    {"path": "/api/v1/agent/security-policies", "methods": ["GET"]},
+    {"path": "/api/v1/agent/security-policy-result", "methods": ["POST"]},
+    {"path": "/api/v1/agent/upgrade/download", "methods": ["GET"]},
     {"path": "/api/v1/logs", "methods": ["POST"]},
 )
 
 # 数据库配置
 DB_CONFIG = get_db_config()
 
-ALERT_ONLINE_SECONDS = 90
-ALERT_OFFLINE_SECONDS = 180
-STATUS_RECONCILE_INTERVAL_SECONDS = 30
-AGENT_CONTROL_PORT = int(get_env("ZVIEW_AGENT_CONTROL_PORT", "9001") or "9001")
+# P1-01/P1-06：平台分层架构（常量/工具/告警服务/路由迁至 platform 包，原名保持兼容）
+from zvplatform.settings import get_settings as _get_app_settings  # noqa: E402
+_alert_settings = _get_app_settings().alerts
+ALERT_OFFLINE_SECONDS = _alert_settings.offline_seconds
+ALERT_ONLINE_SECONDS = _alert_settings.online_seconds
 ALERT_THRESHOLDS = {
-    'cpu': {'warning': 80.0, 'critical': 90.0},
-    'memory': {'warning': 90.0, 'critical': 95.0},
-    'disk': {'warning': 90.0, 'critical': 95.0},
-    'health': {'warning': 60.0, 'critical': 40.0}
+    "cpu": {"warning": _alert_settings.cpu_warning, "critical": _alert_settings.cpu_critical},
+    "memory": {"warning": _alert_settings.memory_warning, "critical": _alert_settings.memory_critical},
+    "disk": {"warning": _alert_settings.disk_warning, "critical": _alert_settings.disk_critical},
+    "health": {"warning": 60.0, "critical": 40.0},
 }
-ALERT_TYPE_LABELS = {
-    'cpu': 'CPU使用率',
-    'memory': '内存使用率',
-    'disk': '磁盘使用率',
-    'offline': '终端离线',
-    'health': '健康度'
-}
-DISCOVERY_TASK_RETENTION_SECONDS = 24 * 60 * 60
+from zvplatform.common import (  # noqa: E402
+    compute_health_score,
+    get_request_client_ip,
+    parse_json_field,
+    safe_float,
+)
+from zvplatform.db import format_datetime  # noqa: E402
+from zvplatform.repositories.alert_repository import build_alert_filters  # noqa: E402
+from zvplatform.db import create_connection  # noqa: E402
+STATUS_RECONCILE_INTERVAL_SECONDS = 30  # P1-01：原常量区迁出后保留（对账线程间隔）
+from zvplatform.models import SystemActivityLogCreate  # noqa: E402
+from zvplatform.db import table_exists  # noqa: E402
+from zvplatform.repositories.log_repository import (  # noqa: E402
+    ensure_system_activity_logs_table,  # noqa: E402
+    insert_system_activity_log,  # noqa: E402
+    normalize_log_row,  # noqa: F401  (logs 路由内部使用)
+    )
+from zvplatform.agent_client import AGENT_CONTROL_PORT, build_agent_auth_headers  # noqa: E402
+from zvplatform.common import truncate_text  # noqa: E402
+from zvplatform.services.batch_service import (  # noqa: E402
+    build_batch_command,  # noqa: F401
+    build_batch_output,  # noqa: F401
+    build_batch_parameters_text,  # noqa: F401
+    build_batch_zview_cmd,  # noqa: F401
+    build_restart_command,  # noqa: F401
+    build_script_command,  # noqa: F401
+    build_shutdown_command,  # noqa: F401
+    build_software_command,  # noqa: F401
+    escape_powershell_single_quoted,  # noqa: F401
+    execute_batch_command_on_agent,  # noqa: F401
+    get_batch_operation_timeout,  # noqa: F401
+    normalize_batch_result_row,  # noqa: F401
+)
+from zvplatform.routers.batch import router as batch_platform_router
+from zvplatform.obs import format_log_line, get_request_id, new_request_id, request_id_var  # noqa: E402
+from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus, set_gauge  # noqa: E402
+from zvplatform.routers.discovery import router as discovery_platform_router
+from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
+from zvplatform.routers.groups import router as groups_platform_router
+from zvplatform.routers.agent_policy import router as agent_policy_router
+from zvplatform.routers.logs import (  # noqa: E402
+    build_trusted_agent_operator_name,  # noqa: F401  (logs 路由内部使用)
+    router as logs_platform_router,
+)
+from zvplatform.routers.alerts import router as alerts_platform_router  # noqa: E402
+from zvplatform.services.alert_service import sync_alerts  # noqa: E402
+from zvplatform import worker_health
+
+
+AGENT_CONTROL_PORT = int(get_env("ZVIEW_AGENT_CONTROL_PORT", "9001") or "9001")
 DISCOVERY_MAX_TASKS = 100
 DISCOVERY_MAX_TARGETS = 4096
 DISCOVERY_TASKS: Dict[str, Dict[str, Any]] = {}
@@ -138,26 +181,6 @@ AGENT_INSTALL_STATUS_INSTALLED = "installed"
 AGENT_INSTALL_STATUS_NOT_INSTALLED = "not_installed"
 
 
-class SystemActivityLogCreate(BaseModel):
-    source_type: str = "agent"
-    module: str
-    category: Optional[str] = None
-    action: str
-    level: str = "info"
-    result: Optional[str] = None
-    asset_id: Optional[int] = None
-    hostname: Optional[str] = None
-    ip_address: Optional[str] = None
-    operator_name: Optional[str] = None
-    session_id: Optional[str] = None
-    title: Optional[str] = None
-    message: str
-    event_time: Optional[datetime] = None
-    details: Optional[Any] = None
-    stdout_log: Optional[str] = None
-    stderr_log: Optional[str] = None
-
-
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -168,10 +191,6 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6)
 
 
-class BatchExecuteRequest(BaseModel):
-    operation_type: str
-    terminal_ids: List[int]
-    parameters: Dict[str, Any] = Field(default_factory=dict)
     operator_name: Optional[str] = "console"
 
 
@@ -179,6 +198,14 @@ class DiscoveryPingRequest(BaseModel):
     ip_ranges: List[str] = Field(default_factory=list)
     concurrency: int = Field(default=100, ge=1, le=1000)
     timeout: int = Field(default=3000, ge=500, le=10000)
+
+
+class DiscoveryImportRequest(BaseModel):
+    ip_address: str
+    hostname: Optional[str] = None
+    mac_address: Optional[str] = None
+    vendor: Optional[str] = None
+    device_type: Optional[str] = None
 
 
 class DiscoverySNMPTarget(BaseModel):
@@ -192,9 +219,6 @@ class DiscoverySNMPRequest(BaseModel):
     timeout: int = Field(default=5, ge=1, le=30)
 
 
-class AlertBatchResolveRequest(BaseModel):
-    ids: List[int] = Field(default_factory=list)
-    resolved_by: Optional[str] = "console"
 
 
 class AssetCommandRequest(BaseModel):
@@ -233,45 +257,14 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def fmt_dt(value):
+    """格式化时间字段为字符串（P1-01 迁移补齐，供设备凭据等接口使用）。"""
+    return format_datetime(value)
+
+
 def get_db_connection():
-    """获取数据库连接"""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        # 设置会话时区为北京时间
-        cursor = conn.cursor()
-        cursor.execute("SET time_zone = '+8:00'")
-        cursor.close()
-        return conn
-    except Error as e:
-        safe_console_print(f"[DB] Connection failed: {e}")
-        return None
-
-
-def format_datetime(value):
-    """统一格式化时间"""
-    if not value:
-        return None
-    if isinstance(value, datetime):
-        return value.strftime('%Y-%m-%d %H:%M:%S')
-    if isinstance(value, date):
-        return value.strftime('%Y-%m-%d')
-    return str(value)
-
-
-def parse_json_field(value):
-    """尽量将 JSON 字段恢复为结构化对象，失败时保留原值。"""
-    if value in (None, "", b""):
-        return None
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="ignore")
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return value
+    """数据库连接（P1-06：实现迁至 platform.db，保留原函数名兼容）。"""
+    return create_connection()
 
 
 def resolve_asset_online_status(asset: Dict[str, Any]) -> str:
@@ -341,6 +334,84 @@ def ensure_asset_changes_table(conn):
                 INDEX idx_asset_changes_field_name (field_name),
                 INDEX idx_asset_changes_created_at (created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='资产变更历史表'
+            """
+        )
+
+        cursor.execute(
+            """
+            SELECT column_name, column_type
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = 'asset_changes'
+            """,
+            (DB_CONFIG["database"],),
+        )
+        existing_columns = {
+            row[0]: (row[1] or "").lower()
+            for row in cursor.fetchall()
+        }
+
+        # Older deployments used changed_by/changed_at and enum values that do
+        # not support the current agent and platform history records.
+        compatible_columns = {
+            "operator_name": "ALTER TABLE asset_changes ADD COLUMN operator_name VARCHAR(120) NULL AFTER source_type",
+            "details_json": "ALTER TABLE asset_changes ADD COLUMN details_json LONGTEXT NULL AFTER operator_name",
+            "created_at": "ALTER TABLE asset_changes ADD COLUMN created_at DATETIME NULL AFTER details_json",
+        }
+        for column_name, statement in compatible_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(statement)
+
+        if existing_columns.get("change_type", "").startswith("enum("):
+            cursor.execute("ALTER TABLE asset_changes MODIFY COLUMN change_type VARCHAR(50) NOT NULL")
+
+        if existing_columns.get("source_type", "").startswith("enum("):
+            cursor.execute(
+                """
+                UPDATE asset_changes
+                SET source_type = 'agent'
+                WHERE source_type IS NULL OR source_type = ''
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE asset_changes
+                MODIFY COLUMN source_type VARCHAR(50) NOT NULL DEFAULT 'platform'
+                """
+            )
+
+        if "changed_by" in existing_columns:
+            cursor.execute(
+                """
+                UPDATE asset_changes
+                SET operator_name = changed_by
+                WHERE (operator_name IS NULL OR operator_name = '')
+                  AND changed_by IS NOT NULL
+                  AND changed_by <> ''
+                """
+            )
+
+        if "changed_at" in existing_columns:
+            cursor.execute(
+                """
+                UPDATE asset_changes
+                SET created_at = changed_at
+                WHERE created_at IS NULL
+                  AND changed_at IS NOT NULL
+                """
+            )
+
+        cursor.execute(
+            """
+            UPDATE asset_changes
+            SET created_at = NOW()
+            WHERE created_at IS NULL
+            """
+        )
+        cursor.execute(
+            """
+            ALTER TABLE asset_changes
+            MODIFY COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             """
         )
         conn.commit()
@@ -806,60 +877,6 @@ def normalize_browser_websocket_close_code(code, default: int = 1011) -> int:
     return default
 
 
-def safe_float(value):
-    """安全转换浮点数"""
-    if value is None:
-        return None
-    try:
-        return round(float(value), 2)
-    except (TypeError, ValueError):
-        return None
-
-
-def compute_health_score(status: Optional[str], cpu_usage, memory_usage, disk_usage):
-    """按终端概览一致的规则计算健康度"""
-    if status != 'online':
-        return 0
-
-    metrics = [cpu_usage, memory_usage, disk_usage]
-    if all(metric is None for metric in metrics):
-        return None
-
-    score = 40
-
-    if cpu_usage is not None:
-        if cpu_usage < 70:
-            score += 20
-        elif cpu_usage < 80:
-            score += 10
-        elif cpu_usage < 90:
-            score += 5
-    else:
-        score += 20
-
-    if memory_usage is not None:
-        if memory_usage < 80:
-            score += 20
-        elif memory_usage < 90:
-            score += 10
-        elif memory_usage < 95:
-            score += 5
-    else:
-        score += 20
-
-    if disk_usage is not None:
-        if disk_usage < 85:
-            score += 20
-        elif disk_usage < 90:
-            score += 10
-        elif disk_usage < 95:
-            score += 5
-    else:
-        score += 20
-
-    return score
-
-
 def reconcile_asset_statuses() -> Dict[str, int]:
     """按 last_seen 实时回写资产状态，避免 status 列长期滞后。"""
     conn = get_db_connection()
@@ -901,8 +918,41 @@ def reconcile_asset_statuses() -> Dict[str, int]:
         conn.close()
 
 
+def reconcile_expired_remote_sessions() -> int:
+    """P0-07：把超过 TTL 的远控会话标记为 expired 断开。"""
+    conn = get_db_connection()
+    if not conn:
+        return 0
+    cursor = None
+    try:
+        from remote_desktop_api import ensure_remote_sessions_table
+        cursor = conn.cursor()
+        ensure_remote_sessions_table(conn)
+        cursor.execute("""
+            UPDATE remote_sessions
+            SET status='disconnected', disconnected_at=NOW(), disconnect_reason='expired'
+            WHERE status IN ('created','connecting','connected')
+              AND created_at < DATE_SUB(NOW(), INTERVAL COALESCE(max_duration_sec,7200) SECOND)
+        """)
+        expired = cursor.rowcount
+        conn.commit()
+        return expired
+    except Exception as exc:
+        safe_console_print(f"[StatusReconcile] expire remote sessions error: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
 def status_reconcile_loop():
     """后台状态对账线程。"""
+    worker_health.register("status-reconcile", "资产状态对账 + 远控会话 TTL（30s）")
     safe_console_print(
         f"[StatusReconcile] Worker started; interval={STATUS_RECONCILE_INTERVAL_SECONDS}s "
         f"online_threshold={ALERT_ONLINE_SECONDS}s"
@@ -917,8 +967,12 @@ def status_reconcile_loop():
                     f"online_updated={result['online_updated']} "
                     f"offline_updated={result['offline_updated']}"
                 )
+            expired = reconcile_expired_remote_sessions()
+            if expired:
+                safe_console_print(f"[StatusReconcile] Remote sessions expired: {expired}")
+            worker_health.mark_run("status-reconcile", ok=True)
         except Exception as exc:
-            safe_console_print(f"[StatusReconcile] Worker error: {exc}")
+            worker_health.mark_run("status-reconcile", ok=False, error=exc)
         time.sleep(STATUS_RECONCILE_INTERVAL_SECONDS)
 
 
@@ -941,259 +995,210 @@ def ensure_status_reconcile_worker_started():
         STATUS_RECONCILE_STARTED = True
 
 
-def build_asset_filters(
-    asset_type: Optional[str] = None,
-    status: Optional[str] = None,
-    group_id: Optional[int] = None,
-    keyword: Optional[str] = None,
-    alias: str = "a"
-) -> Tuple[List[str], List[Any]]:
-    """构建资产列表/统计通用筛选条件，确保在线口径一致。"""
-    where_clauses = [f"{alias}.deleted_at IS NULL"]
-    params: List[Any] = []
+# ============================================================
+# 告警后台评估线程（P1-02）：不再依赖告警中心页面访问触发
+# ============================================================
 
-    if asset_type:
-        where_clauses.append(f"{alias}.asset_type = %s")
-        params.append(asset_type)
+ALERT_SYNC_INTERVAL_SECONDS = 60
+ALERT_SYNC_LOCK = threading.Lock()
+ALERT_SYNC_THREAD = None
+ALERT_SYNC_STARTED = False
 
-    if status:
-        if status == "online":
-            where_clauses.append(
-                f"{alias}.last_seen IS NOT NULL "
-                f"AND TIMESTAMPDIFF(SECOND, {alias}.last_seen, NOW()) <= %s"
-            )
-            params.append(ALERT_ONLINE_SECONDS)
-        elif status == "offline":
-            where_clauses.append(
-                f"({alias}.last_seen IS NULL "
-                f"OR TIMESTAMPDIFF(SECOND, {alias}.last_seen, NOW()) > %s)"
-            )
-            params.append(ALERT_ONLINE_SECONDS)
-        else:
-            where_clauses.append(f"{alias}.status = %s")
-            params.append(status)
 
-    if group_id is not None:
-        where_clauses.append(f"{alias}.group_id = %s")
-        params.append(group_id)
+def alert_sync_loop():
+    """后台告警评估线程：周期执行 sync_alerts（指纹比对 + 自动恢复）。"""
+    worker_health.register("alert-sync", "告警规则评估同步（60s）")
+    safe_console_print(f"[AlertSync] Worker started; interval={ALERT_SYNC_INTERVAL_SECONDS}s")
 
-    if keyword:
-        keyword_like = f"%{keyword}%"
-        where_clauses.append(
-            f"({alias}.hostname LIKE %s OR {alias}.ip_address LIKE %s OR {alias}.mac_address LIKE %s)"
+    while True:
+        try:
+            conn = create_connection()
+            if conn:
+                try:
+                    new_alerts = sync_alerts(conn)
+                    # V1.7.1 通知层：新触发告警分发（webhook/邮件，配置见 alert_notify_config）
+                    try:
+                        from zvplatform.services.alert_notify import dispatch_alert_notifications
+                        notify_result = dispatch_alert_notifications(conn, new_alerts or [])
+                        if notify_result.get("notified"):
+                            safe_console_print(f"[AlertSync] notify dispatched: {notify_result}")
+                    except Exception as notify_exc:
+                        safe_console_print(f"[AlertSync] notify dispatch failed: {notify_exc}")
+                    worker_health.mark_run("alert-sync", ok=True)
+                finally:
+                    conn.close()
+            else:
+                worker_health.mark_run("alert-sync", ok=False, error="db_unavailable")
+        except Exception as exc:
+            worker_health.mark_run("alert-sync", ok=False, error=exc)
+        time.sleep(ALERT_SYNC_INTERVAL_SECONDS)
+
+
+def ensure_alert_sync_worker_started():
+    """确保告警同步线程只启动一次。"""
+    global ALERT_SYNC_THREAD, ALERT_SYNC_STARTED
+    with ALERT_SYNC_LOCK:
+        if ALERT_SYNC_STARTED and ALERT_SYNC_THREAD and ALERT_SYNC_THREAD.is_alive():
+            return
+        ALERT_SYNC_THREAD = threading.Thread(
+            target=alert_sync_loop,
+            daemon=True,
+            name="alert-sync",
         )
-        params.extend([keyword_like, keyword_like, keyword_like])
+        ALERT_SYNC_THREAD.start()
+        ALERT_SYNC_STARTED = True
 
-    return where_clauses, params
+
+# ============================================================
+# 磁盘水位守护线程（2026-09-09 C 盘 0 字节事故）：60s 检查，
+# 低于阈值立即触发紧急缓存清理，不等 6h data-retention 周期
+# ============================================================
+
+DISK_GUARD_INTERVAL_SECONDS = 60
+DISK_GUARD_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
+DISK_GUARD_LOCK = threading.Lock()
+DISK_GUARD_THREAD = None
+DISK_GUARD_STARTED = False
 
 
-def ensure_alerts_table(conn):
-    """确保告警表存在"""
-    cursor = conn.cursor()
+def disk_guard_loop():
+    worker_health.register("disk-guard", "磁盘水位守护（60s，<5GB 触发紧急清理）")
+    import shutil as _shutil
+
+    while True:
+        try:
+            free = _shutil.disk_usage("C:\\").free
+            if free < DISK_GUARD_MIN_FREE_BYTES:
+                from zvplatform.disk_cleanup import run_disk_cache_cleanup
+                results = run_disk_cache_cleanup(emergency=True)
+                freed = results.pop("freed_bytes", 0) or 0
+                safe_console_print(
+                    f"[DiskGuard] low disk C: free={free / (1024 ** 3):.2f}GB, "
+                    f"emergency cleanup freed={freed / (1024 ** 2):.1f}MB detail={results}"
+                )
+            worker_health.mark_run("disk-guard", ok=True)
+        except Exception as exc:
+            worker_health.mark_run("disk-guard", ok=False, error=exc)
+        time.sleep(DISK_GUARD_INTERVAL_SECONDS)
+
+
+def ensure_disk_guard_worker_started():
+    """确保磁盘守护线程只启动一次。"""
+    global DISK_GUARD_THREAD, DISK_GUARD_STARTED
+    with DISK_GUARD_LOCK:
+        if DISK_GUARD_STARTED and DISK_GUARD_THREAD and DISK_GUARD_THREAD.is_alive():
+            return
+        DISK_GUARD_THREAD = threading.Thread(
+            target=disk_guard_loop,
+            daemon=True,
+            name="disk-guard",
+        )
+        DISK_GUARD_THREAD.start()
+        DISK_GUARD_STARTED = True
+
+
+# ============================================================
+# 数据保留策略（审计 R11）：每日清理过期日志/事件/会话/心跳
+# ============================================================
+
+DATA_RETENTION_DAYS = {
+    "system_activity_logs": 180,
+    "security_policy_exec_results": 180,
+    "remote_sessions": 90,
+    "usb_events": 180,
+}
+RETENTION_CHECK_INTERVAL_SECONDS = 6 * 3600  # 每 6 小时检查一次
+DATA_RETENTION_THREAD = None
+DATA_RETENTION_STARTED = False
+DATA_RETENTION_LOCK = threading.Lock()
+
+
+def run_data_retention_cleanup() -> dict:
+    """按保留天数清理过期数据，返回各表删除行数。"""
+    conn = get_db_connection()
+    if not conn:
+        return {"error": "db_unavailable"}
+    cursor = None
+    deleted = {}
     try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                asset_id BIGINT NOT NULL,
-                alert_type VARCHAR(50) NOT NULL,
-                severity VARCHAR(20) NOT NULL DEFAULT 'warning',
-                status VARCHAR(20) NOT NULL DEFAULT 'active',
-                message VARCHAR(500) NOT NULL,
-                current_value DECIMAL(10,2) NULL,
-                threshold_value DECIMAL(10,2) NULL,
-                details_json JSON NULL,
-                active_fingerprint VARCHAR(255) NULL,
-                first_triggered_at DATETIME NOT NULL,
-                last_seen_at DATETIME NOT NULL,
-                resolved_at DATETIME NULL,
-                resolved_by VARCHAR(100) NULL,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL,
-                INDEX idx_alert_status (status),
-                INDEX idx_alert_asset (asset_id),
-                INDEX idx_alert_type (alert_type),
-                INDEX idx_alert_last_seen (last_seen_at),
-                UNIQUE KEY uk_alert_active_fingerprint (active_fingerprint)
-            )
-        """)
+        cursor = conn.cursor()
+        for table, days in DATA_RETENTION_DAYS.items():
+            if table in ("usb_events",):
+                time_col = "occurred_at"
+            elif table == "security_policy_exec_results":
+                time_col = "executed_at"
+            elif table == "remote_sessions":
+                time_col = "disconnected_at"
+            else:
+                time_col = "created_at"
+            try:
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE {time_col} < DATE_SUB(NOW(), INTERVAL %s DAY)",
+                    (days,),
+                )
+                deleted[table] = cursor.rowcount
+            except Exception as exc:
+                deleted[table] = f"error: {exc}"
         conn.commit()
+        if any(isinstance(v, int) and v > 0 for v in deleted.values()):
+            safe_console_print(f"[DataRetention] cleaned: {deleted}")
+        return deleted
+    except Exception as exc:
+        safe_console_print(f"[DataRetention] error: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"error": str(exc)}
     finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
+        conn.close()
 
 
-def ensure_system_activity_logs_table(conn):
-    """确保统一运行时日志表存在。"""
-    cursor = conn.cursor()
+def data_retention_loop():
+    """数据保留清理循环（启动先执行一次，之后每 6 小时）+ 磁盘缓存清理。"""
+    worker_health.register("data-retention", "数据保留清理 + 磁盘缓存清理（6h）")
+    safe_console_print(
+        f"[DataRetention] Worker started; interval={RETENTION_CHECK_INTERVAL_SECONDS}s; "
+        f"policy={DATA_RETENTION_DAYS}"
+    )
+
+    def _run_all():
+        run_data_retention_cleanup()
+        try:
+            from zvplatform.disk_cleanup import log_disk_cache_cleanup
+            log_disk_cache_cleanup()
+        except Exception as exc:
+            safe_console_print(f"[DataRetention] disk cleanup skipped: {exc}")
+
     try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS system_activity_logs (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                source_type VARCHAR(50) NOT NULL DEFAULT 'agent',
-                module VARCHAR(100) NOT NULL,
-                category VARCHAR(100) NULL,
-                action VARCHAR(100) NOT NULL,
-                level VARCHAR(20) NOT NULL DEFAULT 'info',
-                result VARCHAR(50) NULL,
-                asset_id BIGINT NULL,
-                hostname VARCHAR(255) NULL,
-                ip_address VARCHAR(64) NULL,
-                operator_name VARCHAR(100) NULL,
-                session_id VARCHAR(100) NULL,
-                title VARCHAR(255) NULL,
-                message TEXT NOT NULL,
-                details_json JSON NULL,
-                stdout_log MEDIUMTEXT NULL,
-                stderr_log MEDIUMTEXT NULL,
-                event_time DATETIME NOT NULL,
-                created_at DATETIME NOT NULL,
-                INDEX idx_system_activity_event_time (event_time),
-                INDEX idx_system_activity_module (module),
-                INDEX idx_system_activity_asset (asset_id),
-                INDEX idx_system_activity_source_type (source_type)
-            )
-        """)
-        conn.commit()
-    finally:
-        cursor.close()
+        _run_all()
+        worker_health.mark_run("data-retention", ok=True)
+    except Exception as exc:
+        worker_health.mark_run("data-retention", ok=False, error=exc)
+    while True:
+        time.sleep(RETENTION_CHECK_INTERVAL_SECONDS)
+        try:
+            _run_all()
+            worker_health.mark_run("data-retention", ok=True)
+        except Exception as exc:
+            worker_health.mark_run("data-retention", ok=False, error=exc)
 
 
-def ensure_batch_tables(conn):
-    """确保批量操作主表和结果表存在。"""
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS batch_operations (
-                id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-                operation_type VARCHAR(50) NOT NULL,
-                operator_name VARCHAR(100) NULL,
-                parameters_json JSON NULL,
-                parameters_text TEXT NULL,
-                target_count INT NOT NULL DEFAULT 0,
-                success_count INT NOT NULL DEFAULT 0,
-                failed_count INT NOT NULL DEFAULT 0,
-                created_at DATETIME NOT NULL,
-                completed_at DATETIME NULL,
-                INDEX idx_batch_operations_created_at (created_at)
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS batch_operation_results (
-                id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-                operation_id BIGINT UNSIGNED NOT NULL,
-                asset_id BIGINT UNSIGNED NULL,
-                hostname VARCHAR(255) NULL,
-                ip_address VARCHAR(64) NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                command_text TEXT NULL,
-                stdout_log MEDIUMTEXT NULL,
-                stderr_log MEDIUMTEXT NULL,
-                output_text MEDIUMTEXT NULL,
-                returncode INT NULL,
-                error_message TEXT NULL,
-                executed_at DATETIME NULL,
-                created_at DATETIME NOT NULL,
-                INDEX idx_batch_operation_results_operation (operation_id),
-                INDEX idx_batch_operation_results_asset (asset_id),
-                CONSTRAINT fk_batch_operation_results_operation
-                    FOREIGN KEY (operation_id) REFERENCES batch_operations(id)
-                    ON DELETE CASCADE
-            )
-        """)
-        cursor.execute("""
-            SELECT
-                table_name,
-                column_name,
-                column_type,
-                is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = %s
-              AND table_name IN ('batch_operations', 'batch_operation_results')
-        """, (DB_CONFIG["database"],))
-        existing_columns = {
-            (row[0], row[1]): {
-                "column_type": (row[2] or "").lower(),
-                "is_nullable": row[3],
-            }
-            for row in cursor.fetchall()
-        }
-
-        operation_column_sql = {
-            "operator_name": "ALTER TABLE batch_operations ADD COLUMN operator_name VARCHAR(100) NULL AFTER operation_type",
-            "parameters_json": "ALTER TABLE batch_operations ADD COLUMN parameters_json JSON NULL AFTER operator_name",
-            "parameters_text": "ALTER TABLE batch_operations ADD COLUMN parameters_text TEXT NULL AFTER parameters_json",
-            "target_count": "ALTER TABLE batch_operations ADD COLUMN target_count INT NOT NULL DEFAULT 0 AFTER parameters_text",
-            "success_count": "ALTER TABLE batch_operations MODIFY COLUMN success_count INT NOT NULL DEFAULT 0",
-            "failed_count": "ALTER TABLE batch_operations MODIFY COLUMN failed_count INT NOT NULL DEFAULT 0",
-            "completed_at": "ALTER TABLE batch_operations ADD COLUMN completed_at DATETIME NULL AFTER created_at",
-        }
-        for column_name, sql in operation_column_sql.items():
-            if ("batch_operations", column_name) not in existing_columns:
-                cursor.execute(sql)
-
-        if ("batch_operations", "success_count") in existing_columns:
-            success_meta = existing_columns[("batch_operations", "success_count")]
-            if success_meta["is_nullable"] == "YES":
-                cursor.execute("""
-                    UPDATE batch_operations
-                    SET success_count = 0
-                    WHERE success_count IS NULL
-                """)
-                cursor.execute("ALTER TABLE batch_operations MODIFY COLUMN success_count INT NOT NULL DEFAULT 0")
-
-        if ("batch_operations", "failed_count") in existing_columns:
-            failed_meta = existing_columns[("batch_operations", "failed_count")]
-            if failed_meta["is_nullable"] == "YES":
-                cursor.execute("""
-                    UPDATE batch_operations
-                    SET failed_count = 0
-                    WHERE failed_count IS NULL
-                """)
-                cursor.execute("ALTER TABLE batch_operations MODIFY COLUMN failed_count INT NOT NULL DEFAULT 0")
-
-        if ("batch_operations", "parameters") in existing_columns:
-            cursor.execute("""
-                UPDATE batch_operations
-                SET parameters_text = COALESCE(parameters_text, parameters)
-                WHERE parameters IS NOT NULL
-                  AND (parameters_text IS NULL OR parameters_text = '')
-            """)
-
-        result_column_sql = {
-            "hostname": "ALTER TABLE batch_operation_results ADD COLUMN hostname VARCHAR(255) NULL AFTER asset_id",
-            "ip_address": "ALTER TABLE batch_operation_results ADD COLUMN ip_address VARCHAR(64) NULL AFTER hostname",
-            "command_text": "ALTER TABLE batch_operation_results ADD COLUMN command_text TEXT NULL AFTER status",
-            "stdout_log": "ALTER TABLE batch_operation_results ADD COLUMN stdout_log MEDIUMTEXT NULL AFTER command_text",
-            "stderr_log": "ALTER TABLE batch_operation_results ADD COLUMN stderr_log MEDIUMTEXT NULL AFTER stdout_log",
-            "output_text": "ALTER TABLE batch_operation_results ADD COLUMN output_text MEDIUMTEXT NULL AFTER stderr_log",
-            "returncode": "ALTER TABLE batch_operation_results ADD COLUMN returncode INT NULL AFTER output_text",
-            "error_message": "ALTER TABLE batch_operation_results ADD COLUMN error_message TEXT NULL AFTER returncode",
-            "created_at": "ALTER TABLE batch_operation_results ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER executed_at",
-        }
-        for column_name, sql in result_column_sql.items():
-            if ("batch_operation_results", column_name) not in existing_columns:
-                cursor.execute(sql)
-
-        asset_meta = existing_columns.get(("batch_operation_results", "asset_id"))
-        if asset_meta and asset_meta["is_nullable"] == "NO":
-            cursor.execute("ALTER TABLE batch_operation_results MODIFY COLUMN asset_id BIGINT UNSIGNED NULL")
-
-        if ("batch_operation_results", "output") in existing_columns:
-            cursor.execute("""
-                UPDATE batch_operation_results
-                SET output_text = COALESCE(output_text, output)
-                WHERE output IS NOT NULL
-                  AND (output_text IS NULL OR output_text = '')
-            """)
-
-        if ("batch_operation_results", "created_at") in existing_columns:
-            cursor.execute("""
-                UPDATE batch_operation_results
-                SET created_at = COALESCE(created_at, executed_at, NOW())
-                WHERE created_at IS NULL
-            """)
-        conn.commit()
-    finally:
-        cursor.close()
+def ensure_data_retention_worker_started():
+    """确保数据保留线程只启动一次。"""
+    global DATA_RETENTION_THREAD, DATA_RETENTION_STARTED
+    with DATA_RETENTION_LOCK:
+        if DATA_RETENTION_STARTED and DATA_RETENTION_THREAD and DATA_RETENTION_THREAD.is_alive():
+            return
+        DATA_RETENTION_THREAD = threading.Thread(
+            target=data_retention_loop,
+            daemon=True,
+            name="data-retention",
+        )
+        DATA_RETENTION_THREAD.start()
+        DATA_RETENTION_STARTED = True
 
 
 def ensure_assets_agent_schema(conn):
@@ -1212,6 +1217,7 @@ def ensure_assets_agent_schema(conn):
         existing_columns = {row[0] for row in cursor.fetchall()}
 
         asset_column_sql = {
+            "agent_version": "ALTER TABLE assets ADD COLUMN agent_version VARCHAR(32) NULL AFTER agent_install_status",
             "agent_install_status": f"""
                 ALTER TABLE assets
                 ADD COLUMN agent_install_status VARCHAR(20) NOT NULL
@@ -1292,400 +1298,10 @@ def ensure_assets_agent_schema(conn):
         cursor.close()
 
 
-def table_exists(conn, table_name: str) -> bool:
-    """检查指定表是否存在，避免跨模块聚合时因缺表报错。"""
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = %s
-        """, (DB_CONFIG["database"], table_name))
-        row = cursor.fetchone()
-        return bool(row and row[0])
-    finally:
-        cursor.close()
 
 
-UNIFIED_LOG_TEXT_COLLATION = "utf8mb4_unicode_ci"
 
 
-def unified_log_text_sql(expr: str, alias: str) -> str:
-    """统一聚合日志文本字段的字符集与排序规则，避免 UNION 时出现 collation 冲突。"""
-    return (
-        f"CAST({expr} AS CHAR CHARACTER SET utf8mb4) "
-        f"COLLATE {UNIFIED_LOG_TEXT_COLLATION} AS {alias}"
-    )
-
-
-def build_empty_unified_logs_select() -> str:
-    return f"""
-        SELECT
-            NULL AS source_id,
-            {unified_log_text_sql("NULL", "source_type")},
-            {unified_log_text_sql("NULL", "module")},
-            {unified_log_text_sql("NULL", "category")},
-            {unified_log_text_sql("NULL", "action")},
-            {unified_log_text_sql("NULL", "level")},
-            {unified_log_text_sql("NULL", "result")},
-            NULL AS asset_id,
-            {unified_log_text_sql("NULL", "hostname")},
-            {unified_log_text_sql("NULL", "ip_address")},
-            {unified_log_text_sql("NULL", "operator_name")},
-            {unified_log_text_sql("NULL", "session_id")},
-            {unified_log_text_sql("NULL", "title")},
-            {unified_log_text_sql("NULL", "message")},
-            NULL AS event_time,
-            {unified_log_text_sql("NULL", "details_json")},
-            {unified_log_text_sql("NULL", "stdout_log")},
-            {unified_log_text_sql("NULL", "stderr_log")}
-        WHERE 1 = 0
-    """
-
-
-def build_unified_logs_union(conn) -> str:
-    """拼装统一日志查询，按当前可用表动态聚合。"""
-    selects = []
-
-    if table_exists(conn, "system_activity_logs"):
-        selects.append(f"""
-            SELECT
-                l.id AS source_id,
-                {unified_log_text_sql("COALESCE(l.source_type, 'agent')", "source_type")},
-                {unified_log_text_sql("l.module", "module")},
-                {unified_log_text_sql("l.category", "category")},
-                {unified_log_text_sql("l.action", "action")},
-                {unified_log_text_sql("l.level", "level")},
-                {unified_log_text_sql("l.result", "result")},
-                l.asset_id AS asset_id,
-                {unified_log_text_sql("l.hostname", "hostname")},
-                {unified_log_text_sql("l.ip_address", "ip_address")},
-                {unified_log_text_sql("l.operator_name", "operator_name")},
-                {unified_log_text_sql("l.session_id", "session_id")},
-                {unified_log_text_sql("l.title", "title")},
-                {unified_log_text_sql("l.message", "message")},
-                l.event_time AS event_time,
-                {unified_log_text_sql("l.details_json", "details_json")},
-                {unified_log_text_sql("l.stdout_log", "stdout_log")},
-                {unified_log_text_sql("l.stderr_log", "stderr_log")}
-            FROM system_activity_logs l
-        """)
-
-    if table_exists(conn, "alerts"):
-        selects.append(f"""
-            SELECT
-                al.id AS source_id,
-                {unified_log_text_sql("'alert'", "source_type")},
-                {unified_log_text_sql("'alert_center'", "module")},
-                {unified_log_text_sql("al.alert_type", "category")},
-                {unified_log_text_sql("CASE WHEN al.status = 'resolved' THEN 'resolve' ELSE 'trigger' END", "action")},
-                {unified_log_text_sql("al.severity", "level")},
-                {unified_log_text_sql("al.status", "result")},
-                al.asset_id AS asset_id,
-                {unified_log_text_sql("a.hostname", "hostname")},
-                {unified_log_text_sql("a.ip_address", "ip_address")},
-                {unified_log_text_sql("al.resolved_by", "operator_name")},
-                {unified_log_text_sql("NULL", "session_id")},
-                {unified_log_text_sql("CONCAT(COALESCE(a.hostname, CONCAT('资产 ', al.asset_id)), ' 告警')", "title")},
-                {unified_log_text_sql("al.message", "message")},
-                COALESCE(al.last_seen_at, al.first_triggered_at, al.created_at) AS event_time,
-                {unified_log_text_sql("al.details_json", "details_json")},
-                {unified_log_text_sql("NULL", "stdout_log")},
-                {unified_log_text_sql("NULL", "stderr_log")}
-            FROM alerts al
-            LEFT JOIN assets a ON a.id = al.asset_id
-        """)
-
-    if table_exists(conn, "software_task_results") and table_exists(conn, "software_tasks"):
-        selects.append(f"""
-            SELECT
-                r.id AS source_id,
-                {unified_log_text_sql("'software_task'", "source_type")},
-                {unified_log_text_sql("'software_management'", "module")},
-                {unified_log_text_sql("'task_result'", "category")},
-                {unified_log_text_sql("COALESCE(t.task_type, 'task')", "action")},
-                {unified_log_text_sql('''CASE
-                    WHEN r.status = 'failed' THEN 'error'
-                    WHEN r.status IN ('timeout', 'cancelled') THEN 'warning'
-                    ELSE 'info'
-                END''', "level")},
-                {unified_log_text_sql("r.status", "result")},
-                r.asset_id AS asset_id,
-                {unified_log_text_sql("a.hostname", "hostname")},
-                {unified_log_text_sql("a.ip_address", "ip_address")},
-                {unified_log_text_sql("t.created_by", "operator_name")},
-                {unified_log_text_sql("NULL", "session_id")},
-                {unified_log_text_sql("COALESCE(t.task_name, p.display_name, t.software_name, CONCAT('任务 ', r.task_id))", "title")},
-                {unified_log_text_sql('''COALESCE(
-                    r.error_message,
-                    CONCAT(
-                        COALESCE(a.hostname, CONCAT('资产 ', r.asset_id)),
-                        ' ',
-                        COALESCE(t.task_type, 'task'),
-                        ' ',
-                        COALESCE(t.software_name, p.display_name, '软件包'),
-                        ' 状态: ',
-                        COALESCE(r.status, 'unknown')
-                    )
-                )''', "message")},
-                COALESCE(r.updated_at, r.end_time, r.start_time, r.created_at) AS event_time,
-                {unified_log_text_sql('''JSON_OBJECT(
-                    'task_id', r.task_id,
-                    'task_name', t.task_name,
-                    'task_type', t.task_type,
-                    'package_id', t.package_id,
-                    'package_name', p.display_name,
-                    'software_name', t.software_name,
-                    'progress', r.progress,
-                    'download_progress', r.download_progress,
-                    'install_progress', r.install_progress,
-                    'duration', r.duration,
-                    'error_code', r.error_code
-                )''', "details_json")},
-                {unified_log_text_sql("r.stdout_log", "stdout_log")},
-                {unified_log_text_sql("r.stderr_log", "stderr_log")}
-            FROM software_task_results r
-            LEFT JOIN software_tasks t ON t.id = r.task_id
-            LEFT JOIN software_packages p ON p.id = t.package_id
-            LEFT JOIN assets a ON a.id = r.asset_id
-        """)
-
-    if table_exists(conn, "software_policy_logs"):
-        selects.append(f"""
-            SELECT
-                pl.id AS source_id,
-                {unified_log_text_sql("'policy_log'", "source_type")},
-                {unified_log_text_sql("'software_policy'", "module")},
-                {unified_log_text_sql("'policy_execution'", "category")},
-                {unified_log_text_sql("COALESCE(pl.action, 'policy_check')", "action")},
-                {unified_log_text_sql('''CASE
-                    WHEN pl.result = 'failed' THEN 'error'
-                    WHEN pl.result = 'blocked' THEN 'warning'
-                    ELSE 'info'
-                END''', "level")},
-                {unified_log_text_sql("pl.result", "result")},
-                pl.asset_id AS asset_id,
-                {unified_log_text_sql("a.hostname", "hostname")},
-                {unified_log_text_sql("a.ip_address", "ip_address")},
-                {unified_log_text_sql("NULL", "operator_name")},
-                {unified_log_text_sql("NULL", "session_id")},
-                {unified_log_text_sql("COALESCE(pl.software_name, CONCAT('策略 ', pl.policy_id))", "title")},
-                {unified_log_text_sql("COALESCE(pl.message, CONCAT('策略执行: ', COALESCE(pl.action, 'policy_check')))", "message")},
-                pl.created_at AS event_time,
-                {unified_log_text_sql('''JSON_OBJECT(
-                    'policy_id', pl.policy_id,
-                    'software_name', pl.software_name
-                )''', "details_json")},
-                {unified_log_text_sql("NULL", "stdout_log")},
-                {unified_log_text_sql("NULL", "stderr_log")}
-            FROM software_policy_logs pl
-            LEFT JOIN assets a ON a.id = pl.asset_id
-        """)
-
-    if table_exists(conn, "software_audit_logs"):
-        selects.append(f"""
-            SELECT
-                sal.id AS source_id,
-                {unified_log_text_sql("'software_audit'", "source_type")},
-                {unified_log_text_sql("'software_management'", "module")},
-                {unified_log_text_sql("COALESCE(sal.target_type, 'audit')", "category")},
-                {unified_log_text_sql("sal.operation_type", "action")},
-                {unified_log_text_sql('''CASE
-                    WHEN sal.result = 'failed' THEN 'error'
-                    ELSE 'info'
-                END''', "level")},
-                {unified_log_text_sql("sal.result", "result")},
-                NULL AS asset_id,
-                {unified_log_text_sql("NULL", "hostname")},
-                {unified_log_text_sql("sal.operator_ip", "ip_address")},
-                {unified_log_text_sql("sal.operator", "operator_name")},
-                {unified_log_text_sql("NULL", "session_id")},
-                {unified_log_text_sql("COALESCE(sal.target_name, sal.operation_type)", "title")},
-                {unified_log_text_sql("COALESCE(sal.error_message, sal.operation_type)", "message")},
-                sal.created_at AS event_time,
-                {unified_log_text_sql("sal.operation_details", "details_json")},
-                {unified_log_text_sql("NULL", "stdout_log")},
-                {unified_log_text_sql("NULL", "stderr_log")}
-            FROM software_audit_logs sal
-        """)
-
-    if not selects:
-        return build_empty_unified_logs_select()
-
-    return "\nUNION ALL\n".join(selects)
-
-
-def build_unified_logs_where(
-    source_type: Optional[str] = None,
-    module: Optional[str] = None,
-    category: Optional[str] = None,
-    asset_id: Optional[int] = None,
-    keyword: Optional[str] = None,
-    level: Optional[str] = None,
-    result: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None
-) -> Tuple[str, List[Any]]:
-    clauses = ["1 = 1"]
-    params: List[Any] = []
-
-    if source_type:
-        clauses.append("logs.source_type = %s")
-        params.append(source_type)
-
-    if module:
-        clauses.append("logs.module = %s")
-        params.append(module)
-
-    if category:
-        clauses.append("logs.category = %s")
-        params.append(category)
-
-    if asset_id is not None:
-        clauses.append("logs.asset_id = %s")
-        params.append(asset_id)
-
-    if level:
-        clauses.append("logs.level = %s")
-        params.append(level)
-
-    if result:
-        clauses.append("logs.result = %s")
-        params.append(result)
-
-    if keyword:
-        keyword_like = f"%{keyword}%"
-        clauses.append("""
-            (
-                logs.message LIKE %s
-                OR logs.title LIKE %s
-                OR logs.hostname LIKE %s
-                OR logs.ip_address LIKE %s
-                OR logs.operator_name LIKE %s
-            )
-        """)
-        params.extend([keyword_like, keyword_like, keyword_like, keyword_like, keyword_like])
-
-    if start_time:
-        clauses.append("logs.event_time >= %s")
-        params.append(start_time)
-
-    if end_time:
-        clauses.append("logs.event_time <= %s")
-        params.append(end_time)
-
-    return " AND ".join(clauses), params
-
-
-def normalize_log_row(row: Dict[str, Any]):
-    details = parse_json_field(row.get("details_json"))
-    return {
-        "id": f"{row.get('source_type')}-{row.get('source_id')}",
-        "source_id": row.get("source_id"),
-        "source_type": row.get("source_type"),
-        "module": row.get("module"),
-        "category": row.get("category"),
-        "action": row.get("action"),
-        "level": row.get("level"),
-        "result": row.get("result"),
-        "asset_id": row.get("asset_id"),
-        "hostname": row.get("hostname"),
-        "ip_address": row.get("ip_address"),
-        "operator_name": row.get("operator_name"),
-        "session_id": row.get("session_id"),
-        "title": row.get("title"),
-        "message": row.get("message"),
-        "event_time": format_datetime(row.get("event_time")),
-        "details": details,
-        "stdout_log": row.get("stdout_log"),
-        "stderr_log": row.get("stderr_log")
-    }
-
-
-def serialize_log_details(details: Any):
-    """统一序列化日志详情，便于写入 JSON 列。"""
-    if details in (None, "", b""):
-        return None
-    if isinstance(details, bytes):
-        details = details.decode("utf-8", errors="ignore")
-    if isinstance(details, str):
-        details = details.strip()
-        if not details:
-            return None
-        try:
-            json.loads(details)
-            return details
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return json.dumps({"raw": details}, ensure_ascii=False)
-    try:
-        return json.dumps(details, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return json.dumps({"raw": str(details)}, ensure_ascii=False)
-
-
-def get_request_client_ip(request: Optional[Request]) -> Optional[str]:
-    """提取请求来源 IP，优先取反向代理头。"""
-    if not request:
-        return None
-
-    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip() or None
-
-    real_ip = (request.headers.get("x-real-ip") or "").strip()
-    if real_ip:
-        return real_ip or None
-
-    client = getattr(request, "client", None)
-    return getattr(client, "host", None)
-
-
-def insert_system_activity_log(cursor, payload: SystemActivityLogCreate) -> Tuple[Optional[int], datetime]:
-    """复用统一日志写入逻辑，避免各模块重复拼 SQL。"""
-    event_time = payload.event_time or datetime.now()
-    details_json = serialize_log_details(payload.details)
-    cursor.execute("""
-        INSERT INTO system_activity_logs (
-            source_type, module, category, action, level, result,
-            asset_id, hostname, ip_address, operator_name, session_id,
-            title, message, details_json, stdout_log, stderr_log,
-            event_time, created_at
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s, NOW()
-        )
-    """, (
-        payload.source_type,
-        payload.module,
-        payload.category,
-        payload.action,
-        payload.level,
-        payload.result,
-        payload.asset_id,
-        payload.hostname,
-        payload.ip_address,
-        payload.operator_name,
-        payload.session_id,
-        payload.title,
-        payload.message,
-        details_json,
-        payload.stdout_log,
-        payload.stderr_log,
-        event_time,
-    ))
-    return cursor.lastrowid, event_time
-
-
-def build_trusted_agent_operator_name(payload: SystemActivityLogCreate) -> str:
-    if payload.asset_id:
-        return normalize_actor_name(f"agent:{payload.asset_id}", fallback="agent")
-    if payload.hostname:
-        return normalize_actor_name(f"agent:{payload.hostname}", fallback="agent")
-    if payload.ip_address:
-        return normalize_actor_name(f"agent:{payload.ip_address}", fallback="agent")
-    return "agent"
 
 
 def record_system_activity_log(payload: SystemActivityLogCreate) -> Optional[int]:
@@ -1719,515 +1335,6 @@ def truncate_text(value: Optional[str], limit: int = 160) -> str:
     return f"{text[:limit - 3]}..."
 
 
-def build_batch_parameters_text(operation_type: str, parameters: Dict[str, Any]) -> str:
-    if operation_type == "command":
-        return truncate_text(str(parameters.get("command") or ""), 300)
-    if operation_type == "restart":
-        delay = parameters.get("delay", 0)
-        return f"delay={delay}s"
-    if operation_type == "shutdown":
-        delay = parameters.get("delay", 0)
-        return f"delay={delay}s"
-    if operation_type == "software":
-        url = str(parameters.get("url") or "").strip()
-        install_command = str(parameters.get("install_command") or "").strip()
-        return truncate_text(f"url={url} | install={install_command}", 300)
-    if operation_type == "script":
-        return truncate_text(str(parameters.get("script") or ""), 300)
-    return truncate_text(json.dumps(parameters, ensure_ascii=False), 300)
-
-
-def build_batch_output(stdout_log: Optional[str], stderr_log: Optional[str], error_message: Optional[str]) -> str:
-    parts = []
-    if stdout_log:
-        parts.append(str(stdout_log).strip())
-    if stderr_log:
-        parts.append(str(stderr_log).strip())
-    if error_message:
-        parts.append(str(error_message).strip())
-    return "\n".join(part for part in parts if part)
-
-
-def escape_powershell_single_quoted(value: str) -> str:
-    return value.replace("'", "''")
-
-
-def build_restart_command(parameters: Dict[str, Any]) -> str:
-    try:
-        delay = int(parameters.get("delay", 0) or 0)
-    except (TypeError, ValueError):
-        delay = 0
-    delay = max(0, delay)
-    return f"shutdown /r /t {delay} /f"
-
-
-def build_shutdown_command(parameters: Dict[str, Any]) -> str:
-    try:
-        delay = int(parameters.get("delay", 0) or 0)
-    except (TypeError, ValueError):
-        delay = 0
-    delay = max(0, delay)
-    return f"shutdown /s /t {delay} /f"
-
-
-def build_script_command(parameters: Dict[str, Any]) -> str:
-    script = str(parameters.get("script") or "").strip()
-    if not script:
-        raise HTTPException(status_code=400, detail="Script content is required")
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
-
-
-def build_software_command(parameters: Dict[str, Any]) -> str:
-    url = str(parameters.get("url") or "").strip()
-    install_command = str(parameters.get("install_command") or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="Software URL is required")
-
-    parsed = urlparse(url)
-    file_name = os.path.basename(parsed.path) or "package.exe"
-    safe_file_name = "".join(ch for ch in file_name if ch not in '<>:"/\\|?*').strip() or "package.exe"
-    file_name_literal = escape_powershell_single_quoted(safe_file_name)
-    url_literal = escape_powershell_single_quoted(url)
-
-    default_install = """
-if ($filePath.ToLower().EndsWith('.msi')) {
-    $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $filePath, '/qn', '/norestart') -Wait -PassThru
-    exit $process.ExitCode
-}
-$process = Start-Process -FilePath $filePath -ArgumentList @('/quiet', '/norestart') -Wait -PassThru
-exit $process.ExitCode
-""".strip()
-
-    custom_install = ""
-    if install_command:
-        custom_install = f"""
-$installCommand = @'
-{install_command}
-'@
-$installCommand = $installCommand.Replace('{{file}}', $filePath).Replace('{{filename}}', '{file_name_literal}').Replace('{{dir}}', $downloadDir)
-cmd.exe /c $installCommand
-exit $LASTEXITCODE
-""".strip()
-
-    ps_script = f"""
-$ErrorActionPreference = 'Stop'
-$downloadDir = Join-Path $env:TEMP 'CMDBBatch'
-New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-$filePath = Join-Path $downloadDir '{file_name_literal}'
-Invoke-WebRequest -Uri '{url_literal}' -OutFile $filePath -UseBasicParsing
-Set-Location $downloadDir
-{custom_install or default_install}
-""".strip()
-
-    encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-    return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
-
-
-def build_batch_command(operation_type: str, parameters: Dict[str, Any]) -> str:
-    if operation_type == "command":
-        command = str(parameters.get("command") or "").strip()
-        if not command:
-            raise HTTPException(status_code=400, detail="Command is required")
-        return command
-    if operation_type == "restart":
-        return build_restart_command(parameters)
-    if operation_type == "shutdown":
-        return build_shutdown_command(parameters)
-    if operation_type == "software":
-        return build_software_command(parameters)
-    if operation_type == "script":
-        return build_script_command(parameters)
-    raise HTTPException(status_code=400, detail=f"Unsupported operation type: {operation_type}")
-
-
-def get_batch_operation_timeout(operation_type: str) -> int:
-    if operation_type == "restart":
-        return 15
-    if operation_type == "shutdown":
-        return 15
-    if operation_type == "software":
-        return 180
-    if operation_type == "script":
-        return 120
-    return 45
-
-
-def execute_batch_command_on_agent(
-    asset: Dict[str, Any],
-    operation_type: str,
-    parameters: Dict[str, Any],
-    operator_name: str,
-) -> Dict[str, Any]:
-    asset_id = asset.get("id")
-    hostname = asset.get("hostname")
-    ip_address = asset.get("ip_address")
-    status = asset.get("status")
-
-    try:
-        command_text = build_batch_command(operation_type, parameters)
-    except HTTPException as exc:
-        return {
-            "asset_id": asset_id,
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": "failed",
-            "command_text": None,
-            "stdout_log": None,
-            "stderr_log": None,
-            "output_text": exc.detail,
-            "returncode": None,
-            "error_message": exc.detail,
-        }
-
-    if not ip_address:
-        error_message = "Missing agent IP address"
-        return {
-            "asset_id": asset_id,
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": "failed",
-            "command_text": command_text,
-            "stdout_log": None,
-            "stderr_log": None,
-            "output_text": error_message,
-            "returncode": None,
-            "error_message": error_message,
-        }
-
-    if status != "online":
-        error_message = "Target agent is offline"
-        return {
-            "asset_id": asset_id,
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": "failed",
-            "command_text": command_text,
-            "stdout_log": None,
-            "stderr_log": None,
-            "output_text": error_message,
-            "returncode": None,
-            "error_message": error_message,
-        }
-
-    timeout_seconds = get_batch_operation_timeout(operation_type)
-    request_payload = {
-        "command": command_text,
-        "operator": operator_name,
-        "requester": operator_name,
-    }
-
-    try:
-        response = requests.post(
-            f"http://{ip_address}:{AGENT_CONTROL_PORT}/api/v1/command",
-            json=request_payload,
-            headers=build_agent_auth_headers(),
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        body = response.json()
-    except requests.RequestException as exc:
-        error_message = f"Agent request failed: {exc}"
-        return {
-            "asset_id": asset_id,
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": "failed",
-            "command_text": command_text,
-            "stdout_log": None,
-            "stderr_log": None,
-            "output_text": error_message,
-            "returncode": None,
-            "error_message": error_message,
-        }
-    except ValueError:
-        error_message = "Agent returned invalid JSON"
-        return {
-            "asset_id": asset_id,
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": "failed",
-            "command_text": command_text,
-            "stdout_log": None,
-            "stderr_log": None,
-            "output_text": error_message,
-            "returncode": None,
-            "error_message": error_message,
-        }
-
-    success = bool(body.get("success"))
-    stdout_log = body.get("stdout")
-    stderr_log = body.get("stderr")
-    returncode = body.get("returncode")
-    error_message = body.get("error")
-
-    if not success and not error_message:
-        error_message = "Agent reported execution failure"
-
-    output_text = build_batch_output(stdout_log, stderr_log, error_message)
-
-    return {
-        "asset_id": asset_id,
-        "hostname": hostname,
-        "ip_address": ip_address,
-        "status": "success" if success else "failed",
-        "command_text": command_text,
-        "stdout_log": stdout_log,
-        "stderr_log": stderr_log,
-        "output_text": output_text or ("Completed" if success else "Execution failed"),
-        "returncode": returncode,
-        "error_message": error_message,
-    }
-
-
-def normalize_batch_result_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": row.get("id"),
-        "asset_id": row.get("asset_id"),
-        "hostname": row.get("hostname"),
-        "ip_address": row.get("ip_address"),
-        "status": row.get("status"),
-        "command_text": row.get("command_text"),
-        "stdout_log": row.get("stdout_log"),
-        "stderr_log": row.get("stderr_log"),
-        "output": row.get("output_text") or build_batch_output(
-            row.get("stdout_log"),
-            row.get("stderr_log"),
-            row.get("error_message"),
-        ),
-        "returncode": row.get("returncode"),
-        "error_message": row.get("error_message"),
-        "executed_at": format_datetime(row.get("executed_at")),
-    }
-
-
-def fetch_asset_monitor_rows(conn):
-    """获取资产与最新监控数据"""
-    cursor = conn.cursor(dictionary=True)
-    try:
-        cursor.execute("""
-            SELECT
-                a.id AS asset_id,
-                a.hostname,
-                a.ip_address,
-                a.last_seen,
-                CASE
-                    WHEN a.last_seen IS NULL THEN NULL
-                    ELSE TIMESTAMPDIFF(SECOND, a.last_seen, NOW())
-                END AS seconds_since_seen,
-                CASE
-                    WHEN a.last_seen IS NOT NULL
-                         AND TIMESTAMPDIFF(SECOND, a.last_seen, NOW()) <= %s
-                    THEN 'online'
-                    ELSE 'offline'
-                END AS real_status,
-                h.cpu_usage,
-                h.memory_usage,
-                h.disk_usage,
-                h.heartbeat_time
-            FROM assets a
-            LEFT JOIN agent_heartbeat h ON h.id = (
-                SELECT h2.id
-                FROM agent_heartbeat h2
-                WHERE h2.asset_id = a.id
-                ORDER BY h2.heartbeat_time DESC,
-                         CASE
-                             WHEN COALESCE(h2.disk_info, '') <> ''
-                               OR COALESCE(h2.logged_users, '') <> ''
-                               OR COALESCE(h2.process_count, 0) > 0
-                               OR COALESCE(h2.cpu_usage, 0) <> 0
-                               OR COALESCE(h2.memory_usage, 0) <> 0
-                               OR COALESCE(h2.disk_usage, 0) <> 0
-                             THEN 0 ELSE 1
-                         END,
-                         h2.id DESC
-                LIMIT 1
-            )
-            WHERE a.deleted_at IS NULL
-        """, (ALERT_ONLINE_SECONDS,))
-        return cursor.fetchall()
-    finally:
-        cursor.close()
-
-
-def build_current_alerts(rows: List[Dict[str, Any]]):
-    """根据当前资产和心跳生成基础告警"""
-    alerts = []
-
-    for row in rows:
-        asset_id = row['asset_id']
-        hostname = row.get('hostname') or f'资产 {asset_id}'
-        ip_address = row.get('ip_address') or '-'
-        real_status = row.get('real_status') or 'offline'
-        seconds_since_seen = row.get('seconds_since_seen')
-        cpu_usage = safe_float(row.get('cpu_usage'))
-        memory_usage = safe_float(row.get('memory_usage'))
-        disk_usage = safe_float(row.get('disk_usage'))
-
-        if seconds_since_seen is not None and seconds_since_seen > ALERT_OFFLINE_SECONDS:
-            offline_minutes = max(1, int(round(seconds_since_seen / 60)))
-            severity = 'critical' if seconds_since_seen >= 600 else 'warning'
-            alerts.append({
-                'asset_id': asset_id,
-                'alert_type': 'offline',
-                'severity': severity,
-                'message': f'{hostname} 已离线 {offline_minutes} 分钟',
-                'current_value': safe_float(seconds_since_seen),
-                'threshold_value': float(ALERT_OFFLINE_SECONDS),
-                'details_json': {
-                    'hostname': hostname,
-                    'ip_address': ip_address,
-                    'last_seen': format_datetime(row.get('last_seen'))
-                },
-                'active_fingerprint': f'{asset_id}:offline'
-            })
-
-        if real_status != 'online':
-            continue
-
-        for alert_type, metric_value in (
-            ('cpu', cpu_usage),
-            ('memory', memory_usage),
-            ('disk', disk_usage)
-        ):
-            if metric_value is None:
-                continue
-
-            thresholds = ALERT_THRESHOLDS[alert_type]
-            severity = None
-            threshold_value = None
-
-            if metric_value >= thresholds['critical']:
-                severity = 'critical'
-                threshold_value = thresholds['critical']
-            elif metric_value >= thresholds['warning']:
-                severity = 'warning'
-                threshold_value = thresholds['warning']
-
-            if not severity:
-                continue
-
-            alerts.append({
-                'asset_id': asset_id,
-                'alert_type': alert_type,
-                'severity': severity,
-                'message': f'{hostname} {ALERT_TYPE_LABELS[alert_type]}达到 {metric_value:.1f}%',
-                'current_value': metric_value,
-                'threshold_value': float(threshold_value),
-                'details_json': {
-                    'hostname': hostname,
-                    'ip_address': ip_address,
-                    'heartbeat_time': format_datetime(row.get('heartbeat_time'))
-                },
-                'active_fingerprint': f'{asset_id}:{alert_type}'
-            })
-
-        health_score = compute_health_score(real_status, cpu_usage, memory_usage, disk_usage)
-        if health_score is not None and health_score < ALERT_THRESHOLDS['health']['warning']:
-            severity = 'critical' if health_score < ALERT_THRESHOLDS['health']['critical'] else 'warning'
-            threshold_value = (
-                ALERT_THRESHOLDS['health']['critical']
-                if severity == 'critical'
-                else ALERT_THRESHOLDS['health']['warning']
-            )
-            alerts.append({
-                'asset_id': asset_id,
-                'alert_type': 'health',
-                'severity': severity,
-                'message': f'{hostname} 健康度降至 {health_score} 分',
-                'current_value': safe_float(health_score),
-                'threshold_value': float(threshold_value),
-                'details_json': {
-                    'hostname': hostname,
-                    'ip_address': ip_address,
-                    'cpu_usage': cpu_usage,
-                    'memory_usage': memory_usage,
-                    'disk_usage': disk_usage
-                },
-                'active_fingerprint': f'{asset_id}:health'
-            })
-
-    return alerts
-
-
-def sync_alerts(conn):
-    """同步当前告警状态到数据库"""
-    ensure_alerts_table(conn)
-
-    current_alerts = build_current_alerts(fetch_asset_monitor_rows(conn))
-    cursor = conn.cursor(dictionary=True)
-
-    try:
-        cursor.execute("""
-            SELECT id, active_fingerprint
-            FROM alerts
-            WHERE status = 'active' AND active_fingerprint IS NOT NULL
-        """)
-        existing_alerts = {
-            row['active_fingerprint']: row
-            for row in cursor.fetchall()
-            if row.get('active_fingerprint')
-        }
-
-        current_fingerprints = set()
-
-        for alert in current_alerts:
-            fingerprint = alert['active_fingerprint']
-            current_fingerprints.add(fingerprint)
-            details_json = json.dumps(alert['details_json'], ensure_ascii=False)
-            cursor.execute("""
-                INSERT INTO alerts (
-                    asset_id, alert_type, severity, status, message,
-                    current_value, threshold_value, details_json,
-                    active_fingerprint, first_triggered_at, last_seen_at,
-                    created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, 'active', %s,
-                    %s, %s, %s,
-                    %s, NOW(), NOW(),
-                    NOW(), NOW()
-                )
-                ON DUPLICATE KEY UPDATE
-                    asset_id = VALUES(asset_id),
-                    alert_type = VALUES(alert_type),
-                    severity = VALUES(severity),
-                    status = 'active',
-                    message = VALUES(message),
-                    current_value = VALUES(current_value),
-                    threshold_value = VALUES(threshold_value),
-                    details_json = VALUES(details_json),
-                    last_seen_at = NOW(),
-                    resolved_at = NULL,
-                    resolved_by = NULL,
-                    updated_at = NOW()
-            """, (
-                alert['asset_id'],
-                alert['alert_type'],
-                alert['severity'],
-                alert['message'],
-                alert['current_value'],
-                alert['threshold_value'],
-                details_json,
-                fingerprint
-            ))
-
-        stale_fingerprints = set(existing_alerts.keys()) - current_fingerprints
-        for fingerprint in stale_fingerprints:
-            cursor.execute("""
-                UPDATE alerts
-                SET status = 'resolved',
-                    active_fingerprint = NULL,
-                    resolved_at = NOW(),
-                    resolved_by = 'system',
-                    updated_at = NOW()
-                WHERE active_fingerprint = %s
-            """, (fingerprint,))
-
-        conn.commit()
-    finally:
-        cursor.close()
-
-
 def discovery_duration_text(started_at: Optional[datetime], completed_at: Optional[datetime] = None) -> str:
     if not started_at:
         return "-"
@@ -2237,28 +1344,6 @@ def discovery_duration_text(started_at: Optional[datetime], completed_at: Option
     hours, minutes = divmod(minutes, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-
-def cleanup_discovery_tasks_locked():
-    now_ts = time.time()
-    removable = [
-        task_id
-        for task_id, task in DISCOVERY_TASKS.items()
-        if task.get("completed_at_ts")
-        and now_ts - float(task["completed_at_ts"]) > DISCOVERY_TASK_RETENTION_SECONDS
-    ]
-    for task_id in removable:
-        DISCOVERY_TASKS.pop(task_id, None)
-
-    if len(DISCOVERY_TASKS) <= DISCOVERY_MAX_TASKS:
-        return
-
-    ordered_tasks = sorted(
-        DISCOVERY_TASKS.items(),
-        key=lambda item: item[1].get("created_at_ts", 0),
-    )
-    excess = len(DISCOVERY_TASKS) - DISCOVERY_MAX_TASKS
-    for task_id, _ in ordered_tasks[:excess]:
-        DISCOVERY_TASKS.pop(task_id, None)
 
 
 def serialize_discovery_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -2286,6 +1371,32 @@ def serialize_discovery_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "metadata": task.get("metadata") or {},
         "cancel_requested": bool(task.get("cancel_requested")),
     }
+
+
+def cleanup_discovery_tasks_locked():
+    # 恢复自 HEAD：P1-01 迁移服务版操作 discovery_service 自己的任务存储，
+    # 本地任务字典仍由 assets_api 维护，需保留本地清理实现。
+    from zvplatform.constants import DISCOVERY_TASK_RETENTION_SECONDS
+    now_ts = time.time()
+    removable = [
+        task_id
+        for task_id, task in DISCOVERY_TASKS.items()
+        if task.get("completed_at_ts")
+        and now_ts - float(task["completed_at_ts"]) > DISCOVERY_TASK_RETENTION_SECONDS
+    ]
+    for task_id in removable:
+        DISCOVERY_TASKS.pop(task_id, None)
+
+    if len(DISCOVERY_TASKS) <= DISCOVERY_MAX_TASKS:
+        return
+
+    ordered_tasks = sorted(
+        DISCOVERY_TASKS.items(),
+        key=lambda item: item[1].get("created_at_ts", 0),
+    )
+    excess = len(DISCOVERY_TASKS) - DISCOVERY_MAX_TASKS
+    for task_id, _ in ordered_tasks[:excess]:
+        DISCOVERY_TASKS.pop(task_id, None)
 
 
 def create_discovery_task(task_type: str, target: str, total: int, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2598,78 +1709,6 @@ def ping_host(ip_address_text: str, timeout_ms: int) -> Dict[str, Any]:
         return {"ip": ip_address_text, "alive": False, "error": str(exc)}
 
 
-def snmp_collect_target(ip_address_text: str, community: str, version: int, timeout_seconds: int) -> Dict[str, Any]:
-    if SNMP_IMPORT_ERROR:
-        return {
-            "ip": ip_address_text,
-            "success": False,
-            "error": f"SNMP runtime unavailable: {SNMP_IMPORT_ERROR}",
-        }
-
-    if version not in (1, 2):
-        return {"ip": ip_address_text, "success": False, "error": f"Unsupported SNMP version: {version}"}
-
-    try:
-        if SNMP_API_MODE == "asyncio":
-            async def run_async_query():
-                transport = await UdpTransportTarget.create(
-                    (ip_address_text, 161),
-                    timeout=timeout_seconds,
-                    retries=0,
-                )
-                return await getCmd(
-                    SnmpEngine(),
-                    CommunityData(community, mpModel=0 if version == 1 else 1),
-                    transport,
-                    ContextData(),
-                    ObjectType(ObjectIdentity("1.3.6.1.2.1.1.1.0")),
-                    ObjectType(ObjectIdentity("1.3.6.1.2.1.1.5.0")),
-                    ObjectType(ObjectIdentity("1.3.6.1.2.1.1.2.0")),
-                )
-
-            error_indication, error_status, _, var_binds = asyncio.run(run_async_query())
-        else:
-            iterator = getCmd(
-                SnmpEngine(),
-                CommunityData(community, mpModel=0 if version == 1 else 1),
-                UdpTransportTarget((ip_address_text, 161), timeout=timeout_seconds, retries=0),
-                ContextData(),
-                ObjectType(ObjectIdentity("1.3.6.1.2.1.1.1.0")),
-                ObjectType(ObjectIdentity("1.3.6.1.2.1.1.5.0")),
-                ObjectType(ObjectIdentity("1.3.6.1.2.1.1.2.0")),
-            )
-            error_indication, error_status, _, var_binds = next(iterator)
-        if error_indication:
-            return {"ip": ip_address_text, "success": False, "error": str(error_indication)}
-        if error_status:
-            return {"ip": ip_address_text, "success": False, "error": str(error_status)}
-
-        values = [str(binding[1]) for binding in var_binds]
-        sys_descr = values[0] if len(values) > 0 else ""
-        sys_name = values[1] if len(values) > 1 else ""
-        sys_object_id = values[2] if len(values) > 2 else ""
-        hostname = sys_name.strip() or resolve_hostname_for_ip(ip_address_text) or ip_address_text
-        manufacturer = detect_vendor_from_text(sys_descr)
-        asset_type = detect_asset_type_from_text(sys_descr)
-
-        return {
-            "ip": ip_address_text,
-            "success": True,
-            "hostname": hostname,
-            "manufacturer": manufacturer,
-            "model": sys_descr[:255] if sys_descr else None,
-            "asset_type": asset_type,
-            "snmp": {
-                "sys_descr": sys_descr,
-                "sys_name": sys_name,
-                "sys_object_id": sys_object_id,
-            },
-        }
-    except StopIteration:
-        return {"ip": ip_address_text, "success": False, "error": "No SNMP response"}
-    except Exception as exc:
-        return {"ip": ip_address_text, "success": False, "error": str(exc)}
-
 
 def run_ping_discovery_task(task_id: str, targets: List[str], concurrency: int, timeout_ms: int):
     update_discovery_task(task_id, status="running", started_at=datetime.now())
@@ -2738,91 +1777,6 @@ def run_ping_discovery_task(task_id: str, targets: List[str], concurrency: int, 
         mark_discovery_task_finished(task_id, "failed", str(exc))
 
 
-def run_snmp_discovery_task(task_id: str, targets: List[DiscoverySNMPTarget], version: int, timeout_seconds: int):
-    update_discovery_task(task_id, status="running", started_at=datetime.now())
-    futures = {}
-
-    try:
-        max_workers = max(1, min(len(targets), 64))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for target in targets:
-                futures[
-                    executor.submit(
-                        snmp_collect_target,
-                        target.ip,
-                        target.community,
-                        version,
-                        timeout_seconds,
-                    )
-                ] = target.ip
-
-            pending = set(futures.keys())
-            while pending:
-                task = get_discovery_task(task_id)
-                if not task:
-                    return
-                if task.get("cancel_requested"):
-                    mark_discovery_task_finished(task_id, "cancelled")
-                    return
-
-                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                if not done:
-                    continue
-
-                for future in done:
-                    result = future.result()
-                    task = get_discovery_task(task_id)
-                    if not task:
-                        return
-
-                    current = int(task.get("current") or 0) + 1
-                    found = int(task.get("found") or 0)
-                    found_ips = list(task.get("found_ips") or [])
-                    failed = int(task.get("failed") or 0)
-                    failed_targets = list(task.get("failed_targets") or [])
-
-                    if result.get("success"):
-                        found += 1
-                        found_ips.append(result["ip"])
-                        upsert_discovered_asset({
-                            "asset_type": result.get("asset_type") or "unknown",
-                            "hostname": result.get("hostname") or result["ip"],
-                            "ip_address": result["ip"],
-                            "manufacturer": result.get("manufacturer"),
-                            "model": result.get("model"),
-                        })
-                    else:
-                        failure_update = append_discovery_failure(
-                            task,
-                            result,
-                            "No SNMP response received",
-                        )
-                        failed = failure_update["failed"]
-                        failed_targets = failure_update["failed_targets"]
-
-                    update_discovery_task(
-                        task_id,
-                        current=current,
-                        found=found,
-                        failed=failed,
-                        found_ips=found_ips,
-                        failed_targets=failed_targets,
-                    )
-
-        task = get_discovery_task(task_id)
-        if task and task.get("found") == 0 and SNMP_IMPORT_ERROR:
-            mark_discovery_task_finished(task_id, "failed", f"SNMP runtime unavailable: {SNMP_IMPORT_ERROR}")
-            return
-        mark_discovery_task_finished(task_id, "completed")
-    except Exception as exc:
-        safe_console_print(f"[Discovery] SNMP task failed {task_id}: {exc}")
-        mark_discovery_task_finished(task_id, "failed", str(exc))
-
-
-# ============================================================
-# 数据模型
-# ============================================================
-
 class AssetStats(BaseModel):
     total: int
     online: int
@@ -2832,6 +1786,7 @@ class AssetStats(BaseModel):
 
 class Asset(BaseModel):
     id: Optional[int] = None
+    group_id: Optional[int] = None
     asset_type: Optional[str] = None
     hostname: Optional[str] = None
     ip_address: Optional[str] = None
@@ -2873,6 +1828,91 @@ class Asset(BaseModel):
 # API接口
 # ============================================================
 
+
+# P4-01/P1-08：健康探针（免认证，供运维探活与监控）
+# P4-04：Prometheus 指标端点（免认证，内网抓取）
+@app.get("/metrics")
+def prometheus_metrics():
+    # DB 健康作为指标
+    conn = create_connection()
+    db_ok = False
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchall()
+            cur.close()
+            db_ok = True
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    set_gauge("zview_db_up", 1 if db_ok else 0)
+
+    conn2 = create_connection()
+    if conn2:
+        try:
+            cur2 = conn2.cursor(dictionary=True)
+            cur2.execute("SELECT COUNT(*) AS c FROM assets WHERE deleted_at IS NULL")
+            total_assets = int((cur2.fetchone() or {}).get("c") or 0)
+            cur2.execute("SELECT COUNT(*) AS c FROM assets WHERE deleted_at IS NULL AND last_seen >= DATE_SUB(NOW(), INTERVAL 90 SECOND)")
+            online = int((cur2.fetchone() or {}).get("c") or 0)
+            set_gauge("zview_assets_total", total_assets)
+            set_gauge("zview_assets_online", online)
+            # P2-03：远控会话指标
+            cur2.execute("SELECT COUNT(*) AS c FROM remote_sessions WHERE status='connected'")
+            set_gauge("zview_remote_sessions_active", int((cur2.fetchone() or {}).get("c") or 0))
+            cur2.execute("SELECT COUNT(*) AS c FROM remote_sessions")
+            set_gauge("zview_remote_sessions_total", int((cur2.fetchone() or {}).get("c") or 0))
+            cur2.execute("SELECT COALESCE(transport_type,'unknown') AS t, COUNT(*) AS c FROM remote_sessions GROUP BY transport_type")
+            for trow in cur2.fetchall():
+                set_gauge("zview_remote_sessions_transport", int(trow.get("c") or 0), {"type": trow.get("t") or "unknown"})
+        except Exception:
+            pass
+        finally:
+            conn2.close()
+
+    from fastapi import Response
+    return Response(content=render_prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/health")
+def platform_health():
+    from zvplatform.db import create_connection as _create_connection
+
+    db_ok = False
+    db_error = None
+    conn = _create_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchall()
+            cur.close()
+            db_ok = True
+        except Exception as _db_exc:
+            import traceback as _tb
+            db_error = _tb.format_exc()
+            safe_console_print("[Health] db check failed:\n" + _tb.format_exc())
+        finally:
+            conn.close()
+    else:
+        db_error = "create_connection returned None"
+
+    health = worker_health.snapshot()
+    return {
+        "status": "ok" if (db_ok and health["status"] == "ok") else "degraded",
+        "checks": {
+            "database": "ok" if db_ok else "failed",
+            "database_error": db_error,
+            "workers": health,
+        },
+        "request_id": get_request_id(),
+        "version": "3.1.0",
+        "timestamp": format_datetime(datetime.now()),
+    }
+
+
 @app.get("/")
 def root():
     """健康检查"""
@@ -2907,6 +1947,7 @@ def login(payload: LoginRequest, request: Request):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     token_payload = issue_access_token(auth_user["username"])
+    safe_console_print(format_log_line("info", f"user {auth_user['username']} logged in"))
     record_system_activity_log(SystemActivityLogCreate(
         source_type="platform",
         module="auth",
@@ -2964,6 +2005,185 @@ def change_current_user_password(payload: ChangePasswordRequest, request: Reques
         "username": result.get("username"),
         "password_updated_at": result.get("password_updated_at"),
     }
+
+
+# ============================================================
+# 用户管理（仅 admin：/api/v1/auth/users → auth:manage 权限）
+# ============================================================
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+class UpdateUserRequest(BaseModel):
+    role: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class ResetUserPasswordRequest(BaseModel):
+    new_password: str
+
+
+def _log_user_management(action: str, result: str, level: str, message: str,
+                          target_user: str, operator: str, request: Request, details=None):
+    record_system_activity_log(SystemActivityLogCreate(
+        source_type="platform",
+        module="auth",
+        category="user_management",
+        action=action,
+        level=level,
+        result=result,
+        ip_address=get_request_client_ip(request),
+        operator_name=operator,
+        title=f"用户管理-{action}",
+        message=message,
+        details={"target_user": target_user, "operator": operator, **(details or {})},
+    ))
+
+
+@app.get("/api/v1/auth/users")
+def list_platform_users(request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return list_users()
+
+
+@app.post("/api/v1/auth/users")
+def create_platform_user(payload: CreateUserRequest, request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    operator = get_request_username(request)
+
+    try:
+        profile = create_user(payload.username, payload.password, payload.role, operator)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _log_user_management(
+        "create_user", "success", "info",
+        f"管理员 {operator} 创建用户 {profile['username']}（角色 {profile['role']}）",
+        profile["username"], operator, request, {"role": profile["role"]},
+    )
+    return {"message": "用户创建成功", "user": profile}
+
+
+@app.put("/api/v1/auth/users/{username}")
+def update_platform_user(username: str, payload: UpdateUserRequest, request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    operator = get_request_username(request)
+
+    try:
+        if payload.role is not None:
+            profile = update_user_role(username, payload.role, operator)
+            _log_user_management(
+                "update_role", "success", "info",
+                f"管理员 {operator} 将用户 {username} 角色变更为 {profile['role']}",
+                username, operator, request, {"role": profile["role"]},
+            )
+        if payload.enabled is not None:
+            profile = set_user_enabled(username, payload.enabled, operator)
+            action = "enable_user" if payload.enabled else "disable_user"
+            _log_user_management(
+                action, "success", "info",
+                f"管理员 {operator} {'启用' if payload.enabled else '停用'}用户 {username}",
+                username, operator, request, {"enabled": payload.enabled},
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {"message": "用户更新成功", "user": profile}
+
+
+@app.put("/api/v1/auth/users/{username}/reset-password")
+def reset_platform_user_password(username: str, payload: ResetUserPasswordRequest, request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    operator = get_request_username(request)
+
+    try:
+        profile = admin_reset_password(username, payload.new_password, operator)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _log_user_management(
+        "reset_password", "success", "warning",
+        f"管理员 {operator} 重置了用户 {username} 的登录密码",
+        username, operator, request,
+    )
+    return {"message": "密码已重置，该用户原登录令牌已全部失效", "user": profile}
+
+
+@app.delete("/api/v1/auth/users/{username}")
+def delete_platform_user(username: str, request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    operator = get_request_username(request)
+
+    try:
+        result = delete_user(username, operator)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _log_user_management(
+        "delete_user", "success", "warning",
+        f"管理员 {operator} 删除了用户 {username}",
+        username, operator, request,
+    )
+    return {"message": "用户已删除", **result}
+
+
+def build_asset_filters(
+    asset_type: Optional[str] = None,
+    status: Optional[str] = None,
+    group_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    alias: str = "a"
+) -> Tuple[List[str], List[Any]]:
+    """构建资产列表/统计通用筛选条件，确保在线口径一致。"""
+    where_clauses = [f"{alias}.deleted_at IS NULL"]
+    params: List[Any] = []
+
+    if asset_type:
+        where_clauses.append(f"{alias}.asset_type = %s")
+        params.append(asset_type)
+
+    if status:
+        if status == "online":
+            where_clauses.append(
+                f"{alias}.last_seen IS NOT NULL "
+                f"AND TIMESTAMPDIFF(SECOND, {alias}.last_seen, NOW()) <= %s"
+            )
+            params.append(ALERT_ONLINE_SECONDS)
+        elif status == "offline":
+            where_clauses.append(
+                f"({alias}.last_seen IS NULL "
+                f"OR TIMESTAMPDIFF(SECOND, {alias}.last_seen, NOW()) > %s)"
+            )
+            params.append(ALERT_ONLINE_SECONDS)
+        else:
+            where_clauses.append(f"{alias}.status = %s")
+            params.append(status)
+
+    if group_id is not None:
+        where_clauses.append(f"{alias}.group_id = %s")
+        params.append(group_id)
+
+    if keyword:
+        keyword_like = f"%{keyword}%"
+        where_clauses.append(
+            f"({alias}.hostname LIKE %s OR {alias}.ip_address LIKE %s OR {alias}.mac_address LIKE %s)"
+        )
+        params.extend([keyword_like, keyword_like, keyword_like])
+
+    return where_clauses, params
 
 
 @app.get("/api/v1/assets/stats")
@@ -3129,6 +2349,7 @@ def get_assets(
                    a.serial_number, a.manufacturer, a.model, a.os_type, a.os_version,
                    a.cpu_cores, a.memory_mb, a.disk_gb, a.last_seen,
                    a.agent_install_status,
+                   a.agent_version,
                    a.location, a.owner, a.group_id, a.created_at, a.updated_at,
                    g.name as group_name,
                    CASE
@@ -3215,6 +2436,29 @@ def get_assets(
 
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/assets/options")
+def list_asset_options():
+    """终端下拉选项（策略下发/绑定等场景）：全量终端 id/hostname/ip/type，不分页。
+
+    注意：必须声明在 /api/v1/assets/{asset_id} 之前，避免被参数路由拦截。
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, hostname, ip_address, asset_type FROM assets "
+            "WHERE deleted_at IS NULL ORDER BY hostname, id LIMIT 2000"
+        )
+        rows = cursor.fetchall()
+        return {"data": rows, "total": len(rows)}
     finally:
         cursor.close()
         conn.close()
@@ -3375,9 +2619,32 @@ def get_asset(asset_id: int):
         conn.close()
 
 
+ASSET_TYPE_CHOICES = ("switch", "router", "server", "pc", "unknown")
+ASSET_STATUS_CHOICES = ("online", "offline", "unknown")
+
+
 @app.post("/api/v1/assets")
 def create_asset(asset: Asset, request: Request):
     """Create asset."""
+    if asset.asset_type and asset.asset_type not in ASSET_TYPE_CHOICES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid asset_type: {asset.asset_type}. Allowed: {', '.join(ASSET_TYPE_CHOICES)}",
+        )
+    if asset.status and asset.status not in ASSET_STATUS_CHOICES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid status: {asset.status}. Allowed: {', '.join(ASSET_STATUS_CHOICES)}",
+        )
+    if asset.ip_address:
+        try:
+            ipaddress.ip_address(asset.ip_address)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid ip_address: {asset.ip_address}",
+            )
+
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -3386,25 +2653,37 @@ def create_asset(asset: Asset, request: Request):
         cursor = conn.cursor(dictionary=True)
         operator_name = get_request_username(request, fallback="console")
 
+        if asset.ip_address:
+            cursor.execute(
+                "SELECT id FROM assets WHERE ip_address = %s AND deleted_at IS NULL LIMIT 1",
+                (asset.ip_address,),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Asset with IP {asset.ip_address} already exists (id={existing['id']})",
+                )
+
         cursor.execute("""
             INSERT INTO assets (
                 asset_type, hostname, ip_address, mac_address,
                 serial_number, manufacturer, model, os_type, os_version,
                 cpu_cores, memory_mb, disk_gb, status, agent_install_status,
-                location, owner,
+                location, owner, group_id,
                 purchase_date, purchase_price, supplier, contract_no,
                 warranty_start, warranty_end, warranty_provider,
                 deployment_date, asset_status, user_name, department,
                 retire_date, retire_reason, notes,
                 created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         """, (
             asset.asset_type, asset.hostname, asset.ip_address, asset.mac_address,
             asset.serial_number, asset.manufacturer, asset.model, asset.os_type, asset.os_version,
             asset.cpu_cores, asset.memory_mb, asset.disk_gb, asset.status or 'unknown',
             asset.agent_install_status or AGENT_INSTALL_STATUS_NOT_INSTALLED,
-            asset.location, asset.owner,
+            asset.location, asset.owner, asset.group_id,
             asset.purchase_date, asset.purchase_price, asset.supplier, asset.contract_no,
             asset.warranty_start, asset.warranty_end, asset.warranty_provider,
             asset.deployment_date, asset.asset_status or 'in_stock', asset.user_name, asset.department,
@@ -3418,6 +2697,15 @@ def create_asset(asset: Asset, request: Request):
             asset_id,
             None,
             after_asset,
+            field_names=[
+                "asset_type", "hostname", "ip_address", "mac_address", "serial_number",
+                "manufacturer", "model", "os_type", "os_version", "cpu_cores",
+                "memory_mb", "disk_gb", "status", "agent_install_status", "location",
+                "owner", "group_id", "purchase_date", "purchase_price", "supplier",
+                "contract_no", "warranty_start", "warranty_end", "warranty_provider",
+                "deployment_date", "asset_status", "user_name", "department",
+                "retire_date", "retire_reason", "notes",
+            ],
             change_type="create",
             source_type="manual",
             operator_name=operator_name,
@@ -3485,6 +2773,33 @@ def update_asset(asset_id: int, data: dict, request: Request):
 
         for key, value in data.items():
             if key in allowed_fields:
+                if key == "asset_type" and value and value not in ASSET_TYPE_CHOICES:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid asset_type: {value}. Allowed: {', '.join(ASSET_TYPE_CHOICES)}",
+                    )
+                if key == "status" and value and value not in ASSET_STATUS_CHOICES:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid status: {value}. Allowed: {', '.join(ASSET_STATUS_CHOICES)}",
+                    )
+                if key == "ip_address" and value:
+                    try:
+                        ipaddress.ip_address(value)
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"Invalid ip_address: {value}",
+                        )
+                    cursor.execute(
+                        "SELECT id FROM assets WHERE ip_address = %s AND id != %s AND deleted_at IS NULL LIMIT 1",
+                        (value, asset_id),
+                    )
+                    if cursor.fetchone():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Asset with IP {value} already exists",
+                        )
                 update_fields.append(f"{allowed_fields[key]} = %s")
                 values.append(None if value == '' else value)
 
@@ -3502,6 +2817,8 @@ def update_asset(asset_id: int, data: dict, request: Request):
             asset_id,
             before_asset,
             after_asset,
+            field_names=list(allowed_fields.keys()),
+            change_type="update",
             source_type="manual",
             operator_name=operator_name,
         )
@@ -3573,6 +2890,12 @@ def batch_delete_assets(request: dict):
             f"UPDATE assets SET deleted_at = NOW() WHERE id IN ({placeholders}) AND deleted_at IS NULL",
             tuple(ids)
         )
+
+        # 删除关联的软件清单（与单个删除保持一致，避免孤儿记录）
+        cursor.execute(
+            f"DELETE FROM asset_software WHERE asset_id IN ({placeholders})",
+            tuple(ids)
+        )
         conn.commit()
         deleted_count = cursor.rowcount
 
@@ -3583,261 +2906,6 @@ def batch_delete_assets(request: dict):
 
     except Error as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.post("/api/v1/batch/execute")
-def execute_batch_operation(payload: BatchExecuteRequest, request: Request):
-    """执行批量操作，并记录历史与逐台执行结果。"""
-    terminal_ids = list(dict.fromkeys(payload.terminal_ids or []))
-    if not terminal_ids:
-        raise HTTPException(status_code=400, detail="No terminal IDs provided")
-
-    operator_name = get_request_username(request, fallback="console")
-    parameters = payload.parameters or {}
-    parameters_text = build_batch_parameters_text(payload.operation_type, parameters)
-
-    # 先做参数级校验，避免无效操作也进入历史。
-    build_batch_command(payload.operation_type, parameters)
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_batch_tables(conn)
-
-        placeholders = ",".join(["%s"] * len(terminal_ids))
-        cursor.execute(f"""
-            SELECT
-                a.id,
-                a.hostname,
-                a.ip_address,
-                CASE
-                    WHEN a.last_seen IS NULL THEN 'offline'
-                    WHEN TIMESTAMPDIFF(SECOND, a.last_seen, NOW()) <= 90 THEN 'online'
-                    ELSE 'offline'
-                END AS status
-            FROM assets a
-            WHERE a.deleted_at IS NULL
-              AND a.id IN ({placeholders})
-        """, terminal_ids)
-        asset_rows = cursor.fetchall()
-        asset_map = {row["id"]: row for row in asset_rows}
-
-        created_at = datetime.now()
-        cursor.execute("""
-            INSERT INTO batch_operations (
-                operation_type, operator_name, parameters_json, parameters_text,
-                target_count, success_count, failed_count, created_at
-            ) VALUES (
-                %s, %s, %s, %s, %s, 0, 0, %s
-            )
-        """, (
-            payload.operation_type,
-            operator_name,
-            json.dumps(parameters, ensure_ascii=False),
-            parameters_text,
-            len(terminal_ids),
-            created_at,
-        ))
-        operation_id = cursor.lastrowid
-
-        success_count = 0
-        failed_count = 0
-        ordered_results = []
-
-        for terminal_id in terminal_ids:
-            asset = asset_map.get(terminal_id)
-            if not asset:
-                result = {
-                    "asset_id": terminal_id,
-                    "hostname": f"资产 #{terminal_id}",
-                    "ip_address": None,
-                    "status": "failed",
-                    "command_text": None,
-                    "stdout_log": None,
-                    "stderr_log": None,
-                    "output_text": "Target asset not found",
-                    "returncode": None,
-                    "error_message": "Target asset not found",
-                }
-            else:
-                result = execute_batch_command_on_agent(
-                    asset=asset,
-                    operation_type=payload.operation_type,
-                    parameters=parameters,
-                    operator_name=operator_name,
-                )
-
-            if result["status"] == "success":
-                success_count += 1
-            else:
-                failed_count += 1
-
-            ordered_results.append(result)
-
-            cursor.execute("""
-                INSERT INTO batch_operation_results (
-                    operation_id, asset_id, hostname, ip_address, status,
-                    command_text, stdout_log, stderr_log, output_text,
-                    returncode, error_message, executed_at, created_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, NOW(), %s
-                )
-            """, (
-                operation_id,
-                result.get("asset_id"),
-                result.get("hostname"),
-                result.get("ip_address"),
-                result.get("status"),
-                result.get("command_text"),
-                result.get("stdout_log"),
-                result.get("stderr_log"),
-                result.get("output_text"),
-                result.get("returncode"),
-                result.get("error_message"),
-                created_at,
-            ))
-
-        cursor.execute("""
-            UPDATE batch_operations
-            SET success_count = %s,
-                failed_count = %s,
-                completed_at = NOW()
-            WHERE id = %s
-        """, (success_count, failed_count, operation_id))
-        conn.commit()
-
-        return {
-            "message": "Batch operation executed",
-            "id": operation_id,
-            "operation_type": payload.operation_type,
-            "target_count": len(terminal_ids),
-            "success_count": success_count,
-            "failed_count": failed_count,
-            "parameters": parameters_text,
-            "created_at": format_datetime(created_at),
-        }
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/v1/batch/history")
-def get_batch_history(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-):
-    """获取批量操作执行历史。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_batch_tables(conn)
-
-        cursor.execute("SELECT COUNT(*) AS total FROM batch_operations")
-        total = (cursor.fetchone() or {}).get("total", 0) or 0
-
-        offset = (page - 1) * page_size
-        cursor.execute("""
-            SELECT
-                id,
-                operation_type,
-                target_count,
-                success_count,
-                failed_count,
-                parameters_text,
-                operator_name,
-                created_at,
-                completed_at
-            FROM batch_operations
-            ORDER BY created_at DESC, id DESC
-            LIMIT %s OFFSET %s
-        """, (page_size, offset))
-        rows = cursor.fetchall()
-
-        return {
-            "data": [
-                {
-                    "id": row["id"],
-                    "operation_type": row["operation_type"],
-                    "target_count": row["target_count"],
-                    "success_count": row["success_count"],
-                    "failed_count": row["failed_count"],
-                    "parameters": row.get("parameters_text") or "",
-                    "operator_name": row.get("operator_name"),
-                    "created_at": format_datetime(row.get("created_at")),
-                    "completed_at": format_datetime(row.get("completed_at")),
-                }
-                for row in rows
-            ],
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-        }
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/v1/batch/{operation_id}/results")
-def get_batch_operation_results(operation_id: int):
-    """获取批量操作的逐台执行结果。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_batch_tables(conn)
-
-        cursor.execute("SELECT id FROM batch_operations WHERE id = %s", (operation_id,))
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Batch operation not found")
-
-        cursor.execute("""
-            SELECT
-                id,
-                asset_id,
-                hostname,
-                ip_address,
-                status,
-                command_text,
-                stdout_log,
-                stderr_log,
-                output_text,
-                returncode,
-                error_message,
-                executed_at
-            FROM batch_operation_results
-            WHERE operation_id = %s
-            ORDER BY executed_at DESC, id DESC
-        """, (operation_id,))
-        rows = cursor.fetchall()
-
-        return {
-            "data": [normalize_batch_result_row(row) for row in rows]
-        }
-    except HTTPException:
-        raise
-    except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
@@ -3938,18 +3006,190 @@ def remote_control(asset_id: int, command: dict):
     try:
         cursor = conn.cursor(dictionary=True)
         asset = get_asset_agent_target(cursor, asset_id)
+        can_connect = True
+        status_message = "ready"
+        if not str(asset.get("ip_address") or "").strip():
+            can_connect = False
+            status_message = "missing_ip_address"
+        elif asset.get("agent_install_status") != AGENT_INSTALL_STATUS_INSTALLED:
+            can_connect = False
+            status_message = "agent_not_installed"
+        elif asset.get("resolved_status") != "online":
+            can_connect = False
+            status_message = "asset_offline"
         return {
             "message": "远程桌面连接已就绪",
             "asset_id": asset_id,
             "action": action,
             "hostname": asset.get("hostname"),
             "ip_address": asset.get("ip_address"),
+            "resolved_status": asset.get("resolved_status"),
+            "agent_install_status": asset.get("agent_install_status"),
+            "can_connect": can_connect,
+            "status_message": status_message,
             "proxy_ws_path": f"/api/v1/assets/{asset_id}/remote-desktop/ws",
             "agent_ws_port": 9000,
+            "agent_control_port": AGENT_CONTROL_PORT,
         }
     finally:
         if cursor:
             cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/assets/{asset_id}/status")
+def get_asset_status(asset_id: int):
+    """Get current status overview for a single asset."""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT a.id, a.status, a.last_seen,
+                   CASE
+                       WHEN a.last_seen IS NULL THEN 'offline'
+                       WHEN TIMESTAMPDIFF(SECOND, a.last_seen, NOW()) <= 90 THEN 'online'
+                       ELSE 'offline'
+                   END as current_status,
+                   a.agent_install_status
+            FROM assets a
+            WHERE a.id = %s AND a.deleted_at IS NULL
+        """, (asset_id,))
+        status = cursor.fetchone()
+        if not status:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        cursor.execute("""
+            SELECT cpu_usage, memory_usage, disk_usage, heartbeat_time
+            FROM agent_heartbeat
+            WHERE asset_id = %s
+            ORDER BY heartbeat_time DESC
+            LIMIT 1
+        """, (asset_id,))
+        heartbeat = cursor.fetchone()
+        if heartbeat and heartbeat.get('heartbeat_time'):
+            heartbeat['heartbeat_time'] = heartbeat['heartbeat_time'].strftime('%Y-%m-%d %H:%M:%S')
+        status['heartbeat'] = heartbeat
+        return status
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/assets/{asset_id}/status/history")
+def get_asset_status_history(asset_id: int, limit: int = 20):
+    """Get recent heartbeat history for an asset."""
+    limit = max(1, min(int(limit or 20), 200))
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT cpu_usage, memory_usage, disk_usage, process_count,
+                   logged_users, heartbeat_time
+            FROM agent_heartbeat
+            WHERE asset_id = %s
+            ORDER BY heartbeat_time DESC
+            LIMIT %s
+        """, (asset_id, limit))
+        rows = cursor.fetchall()
+        for h in rows:
+            if h.get('heartbeat_time'):
+                h['heartbeat_time'] = h['heartbeat_time'].strftime('%Y-%m-%d %H:%M:%S')
+        return {"data": rows, "total": len(rows)}
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/assets/{asset_id}/changes")
+def get_asset_changes_route(asset_id: int, page: int = 1, page_size: int = 20):
+    """Get change history for an asset."""
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 20), 200))
+    offset = (page - 1) * page_size
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) AS total FROM asset_changes WHERE asset_id = %s", (asset_id,))
+        total = cursor.fetchone().get('total', 0) or 0
+        cursor.execute("""
+            SELECT id, change_type, field_name, old_value, new_value,
+                   source_type, operator_name, created_at
+            FROM asset_changes
+            WHERE asset_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, (asset_id, page_size, offset))
+        rows = cursor.fetchall()
+        for r in rows:
+            if r.get('created_at'):
+                r['created_at'] = r['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+        return {"data": rows, "total": total}
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/assets/{asset_id}/uptime")
+def get_asset_uptime_route(asset_id: int, days: int = 7):
+    """Get uptime summary for an asset over recent days."""
+    days = max(1, min(int(days or 7), 90))
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        # Get last_seen to determine if asset is online now
+        cursor.execute(
+            "SELECT last_seen FROM assets WHERE id = %s",
+            (asset_id,)
+        )
+        row = cursor.fetchone()
+        last_seen = row.get('last_seen') if row else None
+        is_online = bool(last_seen and (datetime.now() - last_seen).total_seconds() <= 90)
+        # Query recent heartbeats for the period (used as "online windows" basis)
+        cursor.execute("""
+            SELECT heartbeat_time
+            FROM agent_heartbeat
+            WHERE asset_id = %s
+              AND heartbeat_time >= (NOW() - INTERVAL %s DAY)
+            ORDER BY heartbeat_time ASC
+        """, (asset_id, days))
+        rows = cursor.fetchall()
+        total_windows = len(rows)
+        # assume all heartbeat samples mean online; fallback to "no data" when none
+        online_windows = total_windows
+        availability_percent = 100.0 if total_windows else 0.0
+        # current uptime text
+        current_uptime_text = "-"
+        if is_online and last_seen:
+            delta = datetime.now() - last_seen
+            secs = int(delta.total_seconds())
+            if secs < 86400:
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                current_uptime_text = f"{h}时 {m}分 {s}秒"
+        return {
+            "days": days,
+            "total_windows": total_windows,
+            "online_windows": online_windows,
+            "availability_percent": availability_percent,
+            "current_uptime_text": current_uptime_text
+        }
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
         conn.close()
 
 
@@ -4127,9 +3367,130 @@ async def proxy_remote_desktop_websocket(asset_id: int, websocket: WebSocket):
             )
 
 
+@app.websocket("/api/v1/remote/sessions/{session_id}/ws")
+async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
+    """基于 session_token 的远程桌面 WS（二进制帧协议）。复用旧代理鉴权+桥接。"""
+    from remote_desktop_api import ensure_remote_sessions_table
+    token = str(websocket.query_params.get("token") or "").strip()
+    if not token:
+        await close_browser_websocket(websocket, code=4401, reason="Missing session token")
+        return
+    conn = get_db_connection()
+    if not conn:
+        await send_browser_session_error(websocket, "平台数据库连接失败", code=1011)
+        return
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        ensure_remote_sessions_table(conn)
+        import hashlib as _hashlib
+        token_hash = _hashlib.sha256(token.encode("utf-8")).hexdigest()  # P0-4: hash 对比
+        # P0-07: TTL 强制执行（created_at + max_duration_sec）
+        cursor.execute("SELECT asset_id, status, fps_limit, created_at, max_duration_sec FROM remote_sessions WHERE id=%s AND session_token=%s", (session_id, token_hash))
+        row = cursor.fetchone()
+        if not row:
+            await close_browser_websocket(websocket, code=4401, reason="Invalid session token")
+            return
+        if row.get("status") in ("disconnected", "failed"):
+            await send_browser_session_error(websocket, "会话已结束，请重新发起", code=1008)
+            return
+        created_at = row.get("created_at")
+        max_sec = int(row.get("max_duration_sec") or 7200)
+        if created_at is not None:
+            import datetime as _dt
+            if _dt.datetime.now() > created_at + _dt.timedelta(seconds=max_sec):
+                try:
+                    cursor.execute("UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), disconnect_reason='expired' WHERE id=%s", (session_id,))
+                    conn.commit()
+                except Exception:
+                    pass
+                await close_browser_websocket(websocket, code=4400, reason="Session expired (TTL)")
+                return
+        asset_id = row["asset_id"]
+        fps_limit = row.get("fps_limit") or 20
+    except Exception as exc:
+        safe_console_print(f"[RemoteSessionWS] session={session_id} error: {exc}")
+        await send_browser_session_error(websocket, "会话校验失败", code=1011)
+        return
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+    asset = None
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        asset = get_asset_agent_target(cursor, asset_id)
+    except HTTPException as exc:
+        await send_browser_session_error(websocket, str(exc.detail), code=4400)
+        return
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+    if not asset or not asset.get("ip_address"):
+        await send_browser_session_error(websocket, "终端信息缺失", code=4400)
+        return
+
+    ip_address = str(asset.get("ip_address") or "").strip()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor(); cur.execute("UPDATE remote_sessions SET status='connecting' WHERE id=%s", (session_id,)); conn.commit()
+    except Exception:
+        pass
+    finally:
+        cur.close(); conn.close()
+
+    requester = f"session-{session_id}"
+    upstream_url = f"ws://{ip_address}:9000/remote-desktop?requester={requester}"
+    safe_console_print(f"[RemoteSessionWS] session={session_id} asset={asset_id} ip={ip_address}")
+
+    try:
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=build_agent_auth_headers({"X-Remote-Requester": requester}),
+            open_timeout=10, close_timeout=5, ping_interval=None, max_size=None,
+        ) as upstream_socket:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"type": "session_start", "fps": fps_limit}))
+            conn = get_db_connection()
+            try:
+                c2 = conn.cursor(); c2.execute("UPDATE remote_sessions SET status='connected', connected_at=NOW(), transport_type='ws-tcp' WHERE id=%s", (session_id,)); conn.commit()
+            except Exception:
+                pass
+            finally:
+                c2.close(); conn.close()
+
+            browser_to_agent_task = asyncio.create_task(relay_browser_to_agent(websocket, upstream_socket, asset_id=asset_id))
+            agent_to_browser_task = asyncio.create_task(relay_agent_to_browser(websocket, upstream_socket, asset_id=asset_id))
+            done, pending = await asyncio.wait({browser_to_agent_task, agent_to_browser_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+            await asyncio.gather(*done, return_exceptions=True)
+    except Exception as exc:
+        safe_console_print(f"[RemoteSessionWS] session={session_id} failed: {exc}")
+        if websocket.application_state == WebSocketState.CONNECTING:
+            await send_browser_session_error(websocket, "远程桌面服务不可用", code=1013)
+    finally:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), disconnect_reason='relay_ended' WHERE id=%s AND status!='disconnected'", (session_id,))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            cur.close(); conn.close()
+
+
 @app.post("/api/v1/assets/{asset_id}/command")
 def execute_asset_command(asset_id: int, payload: AssetCommandRequest, request: Request):
-    """通过平台代理执行单终端命令"""
+    # P0-10：自由命令需要显式 automation:execute 权限（viewer 天然拒绝）
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -4140,16 +3501,35 @@ def execute_asset_command(asset_id: int, payload: AssetCommandRequest, request: 
         asset = get_asset_agent_target(cursor, asset_id)
         requester = get_request_username(request, fallback=payload.requester or payload.operator or "console")
         request_payload = {
-            "command": payload.command,
+            "zview_cmd": {"op": "raw", "command": payload.command, "timeout_seconds": 60},
             "operator": requester,
-            "requester": requester,
         }
-        return proxy_agent_json_request(
+        result = proxy_agent_json_request(
             asset,
             "/api/v1/command",
             payload=request_payload,
             timeout_seconds=60,
         )
+        # 双侧审计：平台侧落 system_activity_logs（Agent 侧另有逐条告警日志）
+        try:
+            insert_system_activity_log(cursor, SystemActivityLogCreate(
+                source_type="platform",
+                module="remote_command",
+                category="operation",
+                action="asset_command",
+                level="warning",
+                result="success" if result.get("success") else "failed",
+                asset_id=asset_id,
+                hostname=asset.get("hostname"),
+                ip_address=asset.get("ip_address"),
+                operator_name=requester,
+                title="远程命令执行",
+                message=str(payload.command or "")[:2000],
+            ))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        return result
     finally:
         if cursor:
             cursor.close()
@@ -4194,7 +3574,7 @@ def trigger_asset_report(
 # ============================================================
 
 @app.get("/api/v1/software/all")
-def get_all_software():
+def get_all_software(asset_id: Optional[int] = Query(default=None)):
     """获取所有软件安装记录（详细清单）"""
     conn = get_db_connection()
     if not conn:
@@ -4203,7 +3583,7 @@ def get_all_software():
     try:
         cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("""
+        base_sql = """
             SELECT
                 s.id,
                 s.software_name,
@@ -4217,8 +3597,11 @@ def get_all_software():
             FROM asset_software s
             LEFT JOIN assets a ON s.asset_id = a.id
             WHERE a.deleted_at IS NULL
-            ORDER BY s.software_name, a.hostname
-        """)
+        """
+        if asset_id is not None:
+            cursor.execute(base_sql + " AND s.asset_id = %s ORDER BY s.software_name", (asset_id,))
+        else:
+            cursor.execute(base_sql + " ORDER BY s.software_name, a.hostname")
 
         software_list = cursor.fetchall()
 
@@ -4231,36 +3614,8 @@ def get_all_software():
         conn.close()
 
 
-@app.get("/api/v1/discovery/tasks")
-def get_discovery_tasks():
-    """获取资产发现任务列表"""
-    tasks = list_discovery_tasks()
-    return {"data": tasks, "total": len(tasks)}
 
 
-@app.get("/api/v1/discovery/tasks/{task_id}")
-def get_discovery_task_detail(task_id: str):
-    """获取资产发现任务详情"""
-    task = get_discovery_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Discovery task not found")
-    return serialize_discovery_task(task)
-
-
-@app.post("/api/v1/discovery/tasks/{task_id}/cancel")
-def cancel_discovery_task(task_id: str):
-    """取消资产发现任务"""
-    task = get_discovery_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Discovery task not found")
-    if task["status"] in {"completed", "failed", "cancelled"}:
-        return {"message": "Task already finished", "task_id": task_id, "status": task["status"]}
-
-    update_discovery_task(task_id, cancel_requested=True, status="cancelled", completed_at=datetime.now())
-    return {"message": "Task cancellation requested", "task_id": task_id, "status": "cancelled"}
-
-
-@app.post("/api/v1/discovery/ping")
 def start_ping_discovery(request: DiscoveryPingRequest):
     """启动 Ping 扫描任务"""
     targets = expand_discovery_targets(request.ip_ranges)
@@ -4290,788 +3645,14 @@ def start_ping_discovery(request: DiscoveryPingRequest):
     }
 
 
-@app.post("/api/v1/discovery/snmp")
-def start_snmp_discovery(request: DiscoverySNMPRequest):
-    """启动 SNMP 采集任务"""
-    if not request.targets:
-        raise HTTPException(status_code=400, detail="SNMP targets are required")
-    if len(request.targets) > DISCOVERY_MAX_TARGETS:
-        raise HTTPException(status_code=400, detail=f"SNMP targets exceed limit {DISCOVERY_MAX_TARGETS}")
-    if request.version not in (1, 2):
-        raise HTTPException(status_code=400, detail="SNMP version must be 1 or 2")
-
-    target_ips = [target.ip for target in request.targets]
-    expand_discovery_targets(target_ips, max_targets=DISCOVERY_MAX_TARGETS)
-
-    task = create_discovery_task(
-        "snmp",
-        ", ".join(target_ips[:3]) + (" ..." if len(target_ips) > 3 else ""),
-        len(request.targets),
-        {
-            "version": request.version,
-            "timeout": request.timeout,
-        },
-    )
-
-    worker = threading.Thread(
-        target=run_snmp_discovery_task,
-        args=(task["task_id"], request.targets, request.version, request.timeout),
-        daemon=True,
-        name=f"snmp-discovery-{task['task_id']}",
-    )
-    worker.start()
-
-    return {
-        "message": "SNMP discovery task started",
-        "task_id": task["task_id"],
-        "total_targets": len(request.targets),
-        "status": "pending",
-        "snmp_available": SNMP_IMPORT_ERROR is None,
-        "snmp_runtime_error": SNMP_IMPORT_ERROR,
-    }
-
 
 # ============================================================
 # Agent心跳接口
 # ============================================================
 
-@app.post("/api/v1/agent/heartbeat")
-def agent_heartbeat(data: dict, request: Request):
-    """接收Agent上报的心跳数据"""
-    require_agent_request(request)
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor(dictionary=True)
-
-        def normalize_text(value, invalid_values=None):
-            if value is None:
-                return None
-            value = str(value).strip()
-            if not value:
-                return None
-            invalid_set = {
-                "unknown",
-                "n/a",
-                "none",
-                "null",
-                "-",
-                "default string",
-                "to be filled by o.e.m.",
-                "system product name",
-                "system manufacturer",
-                "system serial number",
-            }
-            if invalid_values:
-                invalid_set.update({str(item).strip().lower() for item in invalid_values if str(item).strip()})
-            if value.lower() in invalid_set:
-                return None
-            return value
-
-        def normalize_positive_int(value):
-            try:
-                normalized = int(value)
-            except (TypeError, ValueError):
-                return None
-            return normalized if normalized > 0 else None
-
-        def normalize_dns_servers(value):
-            if value is None:
-                return None
-            if isinstance(value, str):
-                stripped = value.strip()
-                if not stripped:
-                    return None
-                if stripped.startswith("["):
-                    try:
-                        decoded = json.loads(stripped)
-                    except Exception:
-                        decoded = None
-                    if isinstance(decoded, list):
-                        value = decoded
-                    elif isinstance(decoded, str):
-                        value = [decoded]
-                    else:
-                        value = [stripped]
-                else:
-                    value = [stripped]
-            if isinstance(value, list):
-                normalized = [str(item).strip() for item in value if normalize_text(item)]
-                return normalized or None
-            text_value = normalize_text(value)
-            return [text_value] if text_value else None
-
-        def build_asset_identifier_clauses(hostname_value, ip_value, mac_value, serial_value):
-            clauses = []
-            params = []
-
-            if mac_value:
-                clauses.append("mac_address = %s")
-                params.append(mac_value)
-            if serial_value:
-                clauses.append("serial_number = %s")
-                params.append(serial_value)
-            if hostname_value:
-                clauses.append("hostname = %s")
-                params.append(hostname_value)
-            if ip_value:
-                clauses.append("ip_address = %s")
-                params.append(ip_value)
-
-            if not clauses and hostname_value and ip_value:
-                clauses.append("(hostname = %s AND ip_address = %s)")
-                params.extend([hostname_value, ip_value])
-
-            return clauses, params
-
-        def calculate_asset_match_score(asset_row, hostname_value, ip_value, mac_value, serial_value):
-            score = 0
-            if mac_value and asset_row.get("mac_address") == mac_value:
-                score += 100
-            if serial_value and asset_row.get("serial_number") == serial_value:
-                score += 80
-            if hostname_value and asset_row.get("hostname") == hostname_value:
-                score += 20
-            if ip_value and asset_row.get("ip_address") == ip_value:
-                score += 10
-
-            metadata_fields = (
-                "os_type",
-                "os_version",
-                "cpu_cores",
-                "memory_mb",
-                "disk_gb",
-                "serial_number",
-                "manufacturer",
-                "model",
-                "gateway",
-                "dns_servers",
-            )
-            for field_name in metadata_fields:
-                field_value = asset_row.get(field_name)
-                if field_name in {"cpu_cores", "memory_mb", "disk_gb"}:
-                    if normalize_positive_int(field_value) is not None:
-                        score += 1
-                elif field_name == "dns_servers":
-                    if normalize_dns_servers(field_value):
-                        score += 1
-                elif normalize_text(field_value) is not None:
-                    score += 1
-
-            return score
-
-        def select_best_asset_candidate(rows, hostname_value, ip_value, mac_value, serial_value):
-            if not rows:
-                return None
-            return max(
-                rows,
-                key=lambda row: (
-                    calculate_asset_match_score(row, hostname_value, ip_value, mac_value, serial_value),
-                    row.get("last_seen") or datetime.min,
-                    row.get("updated_at") or datetime.min,
-                    -(row.get("id") or 0),
-                ),
-            )
-
-        def load_matching_asset_candidates(include_deleted, exclude_asset_id=None):
-            if not identifier_clauses:
-                return []
-
-            delete_clause = "deleted_at IS NOT NULL" if include_deleted else "deleted_at IS NULL"
-            query = f"""
-                SELECT id, hostname, ip_address, mac_address, serial_number,
-                       os_type, os_version, cpu_cores, memory_mb, disk_gb,
-                       manufacturer, model, gateway, dns_servers,
-                       last_seen, updated_at, deleted_at
-                FROM assets
-                WHERE {delete_clause}
-                  AND ({' OR '.join(identifier_clauses)})
-            """
-            params = list(identifier_params)
-            if exclude_asset_id is not None:
-                query += " AND id <> %s"
-                params.append(exclude_asset_id)
-
-            cursor.execute(query, tuple(params))
-            return cursor.fetchall()
-
-        def build_missing_field_backfill(target_row, report_values, donor_row):
-            field_resolvers = {
-                "os_type": normalize_text,
-                "os_version": normalize_text,
-                "cpu_cores": normalize_positive_int,
-                "memory_mb": normalize_positive_int,
-                "disk_gb": normalize_positive_int,
-                "serial_number": normalize_text,
-                "manufacturer": normalize_text,
-                "model": normalize_text,
-                "gateway": normalize_text,
-                "dns_servers": normalize_dns_servers,
-            }
-
-            backfill_values = {}
-            for field_name, resolver in field_resolvers.items():
-                incoming_value = report_values.get(field_name)
-                if resolver(incoming_value) is not None:
-                    continue
-
-                current_value = target_row.get(field_name) if target_row else None
-                if resolver(current_value) is not None:
-                    continue
-
-                donor_value = donor_row.get(field_name) if donor_row else None
-                normalized_donor = resolver(donor_value)
-                if normalized_donor is not None:
-                    backfill_values[field_name] = normalized_donor
-
-            return backfill_values
-
-        def resolve_serial_update_conflict(target_asset_id, serial_value):
-            if not serial_value:
-                return None
-
-            cursor.execute("""
-                SELECT id, deleted_at
-                FROM assets
-                WHERE serial_number = %s AND id <> %s
-                ORDER BY deleted_at IS NULL DESC, id ASC
-            """, (serial_value, target_asset_id))
-            conflicts = cursor.fetchall()
-            if not conflicts:
-                return serial_value
-
-            active_conflict_ids = [row["id"] for row in conflicts if row.get("deleted_at") is None]
-            if active_conflict_ids:
-                safe_console_print(
-                    f"[Heartbeat] Skip serial update due to active conflict: target={target_asset_id}, "
-                    f"serial={serial_value}, conflict_ids={active_conflict_ids}"
-                )
-                return None
-
-            deleted_conflict_ids = [row["id"] for row in conflicts]
-            cursor.execute("""
-                UPDATE assets
-                SET serial_number = NULL, updated_at = NOW()
-                WHERE serial_number = %s AND id <> %s AND deleted_at IS NOT NULL
-            """, (serial_value, target_asset_id))
-            safe_console_print(
-                f"[Heartbeat] Released serial conflict from deleted assets: target={target_asset_id}, "
-                f"serial={serial_value}, donor_ids={deleted_conflict_ids}"
-            )
-            return serial_value
-
-        # 提取基本信息
-        hostname = data.get('hostname')
-        ip_address = data.get('ip_address')
-        mac_address = data.get('mac_address')
-        report_type = data.get('report_type', 'heartbeat')
-        serial_number = normalize_text(data.get("serial_number"))
-
-        safe_console_print(f"[Heartbeat] Received report: hostname={hostname}, type={report_type}")
-
-        if not hostname or not ip_address or not mac_address:
-            raise HTTPException(status_code=400, detail="Missing required fields: hostname, ip_address, mac_address")
-
-        identifier_clauses, identifier_params = build_asset_identifier_clauses(
-            hostname,
-            ip_address,
-            mac_address,
-            serial_number,
-        )
-
-        asset = None
-        if identifier_clauses:
-            asset_candidates = load_matching_asset_candidates(include_deleted=False)
-            asset = select_best_asset_candidate(
-                asset_candidates,
-                hostname,
-                ip_address,
-                mac_address,
-                serial_number,
-            )
-
-        if asset:
-            asset_id = asset['id']
-            before_asset_state = fetch_asset_row(cursor, asset_id, include_deleted=True)
-            # 更新资产基本信息
-            cursor.execute("""
-                UPDATE assets SET
-                    hostname = %s,
-                    ip_address = %s,
-                    mac_address = %s,
-                    last_seen = NOW(),
-                    status = 'online',
-                    agent_install_status = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-            """, (
-                hostname,
-                ip_address,
-                mac_address,
-                AGENT_INSTALL_STATUS_INSTALLED,
-                asset_id
-            ))
-            safe_console_print(
-                f"[Heartbeat] Matched active asset: asset_id={asset_id}, hostname={hostname}, ip={ip_address}"
-            )
-        else:
-            restored_asset = select_best_asset_candidate(
-                load_matching_asset_candidates(include_deleted=True),
-                hostname,
-                ip_address,
-                mac_address,
-                serial_number,
-            )
-
-            if restored_asset:
-                asset_id = restored_asset["id"]
-                before_asset_state = fetch_asset_row(cursor, asset_id, include_deleted=True)
-                cursor.execute("""
-                    UPDATE assets SET
-                        deleted_at = NULL,
-                        hostname = %s,
-                        ip_address = %s,
-                        mac_address = %s,
-                        last_seen = NOW(),
-                        status = 'online',
-                        agent_install_status = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (
-                    hostname,
-                    ip_address,
-                    mac_address,
-                    AGENT_INSTALL_STATUS_INSTALLED,
-                    asset_id
-                ))
-                asset = {
-                    **restored_asset,
-                    "deleted_at": None,
-                    "hostname": hostname,
-                    "ip_address": ip_address,
-                    "mac_address": mac_address,
-                }
-                safe_console_print(
-                    f"[Heartbeat] Reactivated deleted asset: restored_id={asset_id}, hostname={hostname}, ip={ip_address}"
-                )
-            else:
-                # 创建新资产 - 修复asset_type必须是enum中的值
-                cursor.execute("""
-                    INSERT INTO assets (
-                        asset_type, hostname, ip_address, mac_address,
-                        status, agent_install_status, last_seen, created_at, updated_at
-                    ) VALUES ('pc', %s, %s, %s, 'online', %s, NOW(), NOW(), NOW())
-                """, (hostname, ip_address, mac_address, AGENT_INSTALL_STATUS_INSTALLED))
-                asset_id = cursor.lastrowid
-                asset = {
-                    "id": asset_id,
-                    "hostname": hostname,
-                    "ip_address": ip_address,
-                    "mac_address": mac_address,
-                    "serial_number": None,
-                    "os_type": None,
-                    "os_version": None,
-                    "cpu_cores": None,
-                    "memory_mb": None,
-                    "disk_gb": None,
-                    "manufacturer": None,
-                    "model": None,
-                    "gateway": None,
-                    "dns_servers": None,
-                    "last_seen": None,
-                    "updated_at": None,
-                    "deleted_at": None,
-                }
-                safe_console_print(
-                    f"[Heartbeat] Created new asset: asset_id={asset_id}, hostname={hostname}, ip={ip_address}"
-                )
-
-        asset_update_fields = []
-        asset_update_values = []
-
-        normalized_report_values = {
-            "os_type": normalize_text(data.get("os_type")),
-            "os_version": normalize_text(data.get("os_version")),
-            "cpu_cores": normalize_positive_int(data.get("cpu_cores")),
-            "memory_mb": normalize_positive_int(data.get("memory_total")),
-            "disk_gb": normalize_positive_int(data.get("disk_total")),
-            "serial_number": serial_number,
-            "manufacturer": normalize_text(data.get("manufacturer")),
-            "model": normalize_text(data.get("model")),
-            "gateway": normalize_text(data.get("gateway")),
-        }
-
-        for field_name, field_value in normalized_report_values.items():
-            if field_value is not None:
-                asset_update_fields.append(f"{field_name} = %s")
-                asset_update_values.append(field_value)
-
-        dns_servers = normalize_dns_servers(data.get("dns_servers"))
-        normalized_report_values["dns_servers"] = dns_servers
-        if dns_servers is not None:
-            asset_update_fields.append("dns_servers = %s")
-            asset_update_values.append(json.dumps(dns_servers))
-
-        donor_asset = None
-        if identifier_clauses:
-            donor_candidates = load_matching_asset_candidates(
-                include_deleted=True,
-                exclude_asset_id=asset_id,
-            )
-            donor_asset = select_best_asset_candidate(
-                donor_candidates,
-                hostname,
-                ip_address,
-                mac_address,
-                serial_number,
-            )
-
-        if donor_asset:
-            backfill_values = build_missing_field_backfill(asset, normalized_report_values, donor_asset)
-            for field_name, field_value in backfill_values.items():
-                if field_name == "dns_servers":
-                    asset_update_fields.append("dns_servers = %s")
-                    asset_update_values.append(json.dumps(field_value))
-                else:
-                    asset_update_fields.append(f"{field_name} = %s")
-                    asset_update_values.append(field_value)
-            if backfill_values:
-                safe_console_print(
-                    f"[Heartbeat] Backfilled asset metadata: target={asset_id}, donor={donor_asset['id']}, "
-                    f"fields={','.join(sorted(backfill_values.keys()))}"
-                )
-
-        serial_field_indexes = [index for index, field in enumerate(asset_update_fields) if field == "serial_number = %s"]
-        if serial_field_indexes:
-            serial_index = serial_field_indexes[-1]
-            resolved_serial = resolve_serial_update_conflict(asset_id, asset_update_values[serial_index])
-            if resolved_serial is None:
-                del asset_update_fields[serial_index]
-                del asset_update_values[serial_index]
-            else:
-                asset_update_values[serial_index] = resolved_serial
-
-        if asset_update_fields:
-            asset_update_fields.append("updated_at = NOW()")
-            cursor.execute(f"""
-                UPDATE assets SET
-                    {", ".join(asset_update_fields)}
-                WHERE id = %s
-            """, (*asset_update_values, asset_id))
-        after_asset_state = fetch_asset_row(cursor, asset_id, include_deleted=True)
-        record_asset_changes(
-            cursor,
-            asset_id,
-            before_asset_state,
-            after_asset_state,
-            field_names=[
-                "hostname",
-                "ip_address",
-                "mac_address",
-                "serial_number",
-                "manufacturer",
-                "model",
-                "os_type",
-                "os_version",
-                "cpu_cores",
-                "memory_mb",
-                "disk_gb",
-                "status",
-                "agent_install_status",
-                "gateway",
-                "dns_servers",
-                "last_seen",
-                "deleted_at",
-            ],
-            change_type="agent_report",
-            source_type="agent",
-            operator_name=normalize_actor_name(f"agent:{asset_id}", fallback="agent"),
-            details={"report_type": report_type},
-        )
-
-        # 根据report_type处理不同类型的数据
-        if report_type in ['heartbeat', 'system_status']:
-            # 插入心跳记录
-            cursor.execute("""
-                INSERT INTO agent_heartbeat (
-                    asset_id, cpu_usage, memory_usage, disk_usage,
-                    process_count, logged_users, disk_info, heartbeat_time, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-            """, (
-                asset_id,
-                data.get('cpu_usage', 0),
-                data.get('memory_usage', 0),
-                data.get('disk_usage', 0),
-                data.get('process_count', 0),
-                data.get('logged_users', ''),
-                json.dumps(data.get('disk_info', [])) if data.get('disk_info') else None
-            ))
-
-        elif report_type == 'hardware':
-            # 保存磁盘详情
-            if data.get('disk_info'):
-                cursor.execute("""
-                    UPDATE agent_heartbeat SET
-                        disk_info = %s
-                    WHERE asset_id = %s
-                    ORDER BY heartbeat_time DESC
-                    LIMIT 1
-                """, (json.dumps(data.get('disk_info')), asset_id))
-
-        elif report_type == 'software':
-            # 更新软件清单
-            software_list = data.get('software_list', [])
-
-            safe_console_print(f"[Heartbeat] Received software inventory count={len(software_list)}")
-
-            # 删除旧的软件记录
-            cursor.execute("DELETE FROM asset_software WHERE asset_id = %s", (asset_id,))
-
-            # 插入新的软件记录
-            success_count = 0
-            error_count = 0
-
-            for software in software_list:
-                try:
-                    # 处理size字段：将字符串"1.5 MB"转换为数字
-                    size_str = software.get('size', '')
-                    size_mb = 0
-                    if size_str:
-                        try:
-                            if 'KB' in size_str:
-                                size_mb = float(size_str.replace('KB', '').strip()) / 1024
-                            elif 'MB' in size_str:
-                                size_mb = float(size_str.replace('MB', '').strip())
-                            elif 'GB' in size_str:
-                                size_mb = float(size_str.replace('GB', '').strip()) * 1024
-                            else:
-                                size_mb = 0
-                        except:
-                            size_mb = 0
-
-                    # 限制字段长度，避免数据库错误
-                    software_name = (software.get('name') or '')[:255]
-                    version = (software.get('version') or '')[:100]
-                    vendor = (software.get('vendor') or '')[:255]
-                    category = (software.get('category') or '')[:100]
-                    install_date = software.get('install_date')
-
-                    if not software_name:  # 跳过空名称
-                        continue
-
-                    cursor.execute("""
-                        INSERT INTO asset_software (
-                            asset_id, software_name, version, vendor, category,
-                            install_date, size_mb, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    """, (
-                        asset_id,
-                        software_name,
-                        version,
-                        vendor,
-                        category or None,
-                        install_date,
-                        size_mb
-                    ))
-                    success_count += 1
-
-                except Exception as e:
-                    error_count += 1
-                    if error_count <= 3:  # 只打印前3个错误
-                        safe_console_print(f"[Heartbeat] Software insert failed: name={software.get('name', 'Unknown')} error={str(e)[:100]}")
-
-            safe_console_print(f"[Heartbeat] Software sync complete: success={success_count}, failed={error_count}")
-
-        conn.commit()
-
-        return {
-            "status": "success",
-            "asset_id": asset_id,
-            "message": f"Heartbeat received: {report_type}"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        import traceback
-        error_detail = f"{str(e)}\n{traceback.format_exc()}"
-        safe_console_print(f"[Heartbeat] Processing failed: {error_detail}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-# ============================================================
-# 分组管理接口
 # ============================================================
 
-@app.get("/api/v1/groups")
-def get_groups():
-    """获取所有分组"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
 
-    try:
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("""
-            SELECT g.id, g.name, g.description, g.created_at,
-                   COUNT(a.id) as asset_count
-            FROM asset_groups g
-            LEFT JOIN assets a ON a.group_id = g.id AND a.deleted_at IS NULL
-            GROUP BY g.id, g.name, g.description, g.created_at
-            ORDER BY g.name
-        """)
-
-        groups = cursor.fetchall()
-
-        # 格式化日期
-        for group in groups:
-            if group.get('created_at'):
-                group['created_at'] = group['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-
-        return {"data": groups, "total": len(groups)}
-
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.post("/api/v1/groups")
-def create_group(data: dict):
-    """创建分组"""
-    name = data.get('name')
-    description = data.get('description', '')
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Group name is required")
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor()
-
-        # 检查名称是否重复
-        cursor.execute("SELECT id FROM asset_groups WHERE name = %s", (name,))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Group name already exists")
-
-        cursor.execute("""
-            INSERT INTO asset_groups (name, description, created_at)
-            VALUES (%s, %s, NOW())
-        """, (name, description))
-
-        conn.commit()
-        group_id = cursor.lastrowid
-
-        return {"message": "Group created successfully", "id": group_id}
-
-    except HTTPException:
-        raise
-    except Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.put("/api/v1/groups/{group_id}")
-def update_group(group_id: int, data: dict):
-    """更新分组"""
-    name = data.get('name')
-    description = data.get('description', '')
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Group name is required")
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor()
-
-        # 检查分组是否存在
-        cursor.execute("SELECT id FROM asset_groups WHERE id = %s", (group_id,))
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Group not found")
-
-        # 检查名称是否与其他分组重复
-        cursor.execute("SELECT id FROM asset_groups WHERE name = %s AND id != %s", (name, group_id))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Group name already exists")
-
-        cursor.execute("""
-            UPDATE asset_groups
-            SET name = %s, description = %s
-            WHERE id = %s
-        """, (name, description, group_id))
-
-        conn.commit()
-
-        return {"message": "Group updated successfully"}
-
-    except HTTPException:
-        raise
-    except Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.delete("/api/v1/groups/{group_id}")
-def delete_group(group_id: int):
-    """删除分组"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor()
-
-        # 检查分组是否存在
-        cursor.execute("SELECT id FROM asset_groups WHERE id = %s", (group_id,))
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Group not found")
-
-        # 检查是否有资产使用该分组
-        cursor.execute("SELECT COUNT(*) as count FROM assets WHERE group_id = %s AND deleted_at IS NULL", (group_id,))
-        result = cursor.fetchone()
-        if result and result[0] > 0:
-            raise HTTPException(status_code=400, detail=f"Cannot delete group with {result[0]} assets")
-
-        # 删除分组
-        cursor.execute("DELETE FROM asset_groups WHERE id = %s", (group_id,))
-        conn.commit()
-
-        return {"message": "Group deleted successfully"}
-
-    except HTTPException:
-        raise
-    except Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-# ============================================================
-# 软件管理接口
-# ============================================================
 
 @app.get("/api/v1/software/stats")
 def get_software_stats(limit: int = Query(default=10, ge=1, le=100)):
@@ -5110,298 +3691,384 @@ def get_software_stats(limit: int = Query(default=10, ge=1, le=100)):
 
 
 # ============================================================
-# 告警管理接口
+# 后台守护线程启动入口（修复：历史版本丢失 def 行导致 worker 从未启动）
 # ============================================================
 
-def normalize_alert_row(row: Dict[str, Any]):
-    """统一前端告警输出结构"""
-    details = row.get('details_json')
-    if isinstance(details, str):
-        try:
-            details = json.loads(details)
-        except json.JSONDecodeError:
-            details = None
-
-    return {
-        "id": row["id"],
-        "asset_id": row["asset_id"],
-        "hostname": row.get("hostname") or (details or {}).get("hostname") or f"资产 {row['asset_id']}",
-        "ip_address": row.get("ip_address") or (details or {}).get("ip_address") or "-",
-        "alert_type": row["alert_type"],
-        "severity": row["severity"],
-        "status": row["status"],
-        "message": row["message"],
-        "current_value": safe_float(row.get("current_value")),
-        "threshold_value": safe_float(row.get("threshold_value")),
-        "created_at": format_datetime(row.get("first_triggered_at")),
-        "last_seen_at": format_datetime(row.get("last_seen_at")),
-        "resolved_at": format_datetime(row.get("resolved_at")),
-        "resolved_by": row.get("resolved_by"),
-        "details": details
-    }
-
-
-def build_alert_filters(
-    status: Optional[str] = None,
-    severity: Optional[str] = None,
-    alert_type: Optional[str] = None,
-    keyword: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-) -> Tuple[str, List[Any]]:
-    where_clauses = ["1 = 1"]
-    params: List[Any] = []
-
-    if status:
-        where_clauses.append("al.status = %s")
-        params.append(status)
-
-    if severity:
-        where_clauses.append("al.severity = %s")
-        params.append(severity)
-
-    if alert_type:
-        where_clauses.append("al.alert_type = %s")
-        params.append(alert_type)
-
-    if keyword:
-        keyword_like = f"%{keyword}%"
-        where_clauses.append("""
-            (
-                al.message LIKE %s
-                OR a.hostname LIKE %s
-                OR a.ip_address LIKE %s
-            )
-        """)
-        params.extend([keyword_like, keyword_like, keyword_like])
-
-    if start_time:
-        where_clauses.append("COALESCE(al.first_triggered_at, al.created_at) >= %s")
-        params.append(start_time)
-
-    if end_time:
-        where_clauses.append("COALESCE(al.first_triggered_at, al.created_at) <= %s")
-        params.append(end_time)
-
-    return " AND ".join(where_clauses), params
-
-
-@app.get("/api/v1/alerts/stats")
-def get_alert_stats():
-    """获取告警统计"""
+@app.on_event("startup")
+def start_background_workers():
+    """启动后台守护线程。"""
     conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        ensure_alerts_table(conn)
+    if conn:
         try:
-            sync_alerts(conn)
-        except Exception as sync_error:
-            conn.rollback()
-            safe_console_print(f"[Alerts] Sync skipped during stats request: {sync_error}")
-
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("""
-            SELECT
-                COUNT(CASE WHEN first_triggered_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1 END) AS total_7days,
-                COUNT(CASE WHEN status = 'active' THEN 1 END) AS active,
-                COUNT(CASE WHEN status = 'resolved' THEN 1 END) AS resolved
-            FROM alerts
-        """)
-        summary = cursor.fetchone() or {}
-
-        cursor.execute("""
-            SELECT severity, COUNT(*) AS count
-            FROM alerts
-            WHERE status = 'active'
-            GROUP BY severity
-        """)
-        by_severity = {row["severity"]: row["count"] for row in cursor.fetchall()}
-
-        cursor.execute("""
-            SELECT alert_type, COUNT(*) AS count
-            FROM alerts
-            WHERE status = 'active'
-            GROUP BY alert_type
-        """)
-        by_type = {row["alert_type"]: row["count"] for row in cursor.fetchall()}
-
-        return {
-            "total_7days": summary.get("total_7days", 0) or 0,
-            "active": summary.get("active", 0) or 0,
-            "resolved": summary.get("resolved", 0) or 0,
-            "unresolved": summary.get("active", 0) or 0,
-            "by_severity": by_severity,
-            "by_type": by_type
-        }
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        conn.close()
+            ensure_assets_agent_schema(conn)
+            ensure_asset_changes_table(conn)
+            try:
+                from security_api import ensure_security_tables
+                ensure_security_tables(conn)
+            except Exception as exc:
+                safe_console_print(f"[Startup] security tables ensure warn: {exc}")
+        finally:
+            conn.close()
+    ensure_status_reconcile_worker_started()
+    ensure_data_retention_worker_started()
+    ensure_alert_sync_worker_started()
+    ensure_disk_guard_worker_started()
 
 
-@app.get("/api/v1/alerts")
-def get_alerts(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=100),
-    status: Optional[str] = Query(default=None),
-    severity: Optional[str] = Query(default=None),
-    alert_type: Optional[str] = Query(default=None),
-    keyword: Optional[str] = Query(default=None),
-    start_time: Optional[str] = Query(default=None),
-    end_time: Optional[str] = Query(default=None),
-):
-    """获取告警列表"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
+# ============================================================
+# Agent 设备凭据（一机一密，P0-01）
+# 协议：Authorization: Bearer zv1:{asset_id}:{device_secret}
+# 发放：Agent 用全局 token 心跳时，响应下发 agent_credential（仅一次）
+# 存储：DB 只存 SHA256(secret + pepper)，不存明文
+# ============================================================
 
-    cursor = conn.cursor(dictionary=True)
+def ensure_agent_credentials_table(conn) -> None:
+    cursor = conn.cursor()
     try:
-        sync_alerts(conn)
-        where_sql, params = build_alert_filters(
-            status=status,
-            severity=severity,
-            alert_type=alert_type,
-            keyword=keyword,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        cursor.execute(f"""
-            SELECT COUNT(*) AS total
-            FROM alerts al
-            LEFT JOIN assets a ON a.id = al.asset_id
-            WHERE {where_sql}
-        """, params)
-        total = cursor.fetchone()["total"]
-
-        offset = (page - 1) * page_size
-        cursor.execute(f"""
-            SELECT
-                al.*,
-                a.hostname,
-                a.ip_address
-            FROM alerts al
-            LEFT JOIN assets a ON a.id = al.asset_id
-            WHERE {where_sql}
-            ORDER BY
-                CASE al.status WHEN 'active' THEN 0 ELSE 1 END,
-                CASE al.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                al.last_seen_at DESC,
-                al.id DESC
-            LIMIT %s OFFSET %s
-        """, params + [page_size, offset])
-        rows = cursor.fetchall()
-
-        return {
-            "data": [normalize_alert_row(row) for row in rows],
-            "total": total,
-            "page": page,
-            "page_size": page_size
-        }
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_credentials (
+                asset_id BIGINT UNSIGNED PRIMARY KEY,
+                secret_hash CHAR(64) NOT NULL,
+                status ENUM('active','revoked') NOT NULL DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used_at DATETIME NULL,
+                CONSTRAINT fk_agent_credentials_asset
+                    FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
     finally:
         cursor.close()
-        conn.close()
 
 
-@app.get("/api/v1/alerts/{alert_id}/detail")
-def get_alert_detail(alert_id: int):
-    """获取告警详情"""
+def _hash_device_secret(asset_id: int, secret: str) -> str:
+    return hashlib.sha256(f"zv1:{asset_id}:{secret}:{TOKEN_SECRET}".encode("utf-8")).hexdigest()
+
+
+def verify_agent_device_credential(agent_id: int, secret: str) -> bool:
+    """auth_utils 设备凭据校验回调（注册于模块加载完成处）"""
+    if not isinstance(agent_id, int) or agent_id <= 0 or not secret:
+        return False
     conn = get_db_connection()
     if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
+        return False
     cursor = conn.cursor(dictionary=True)
     try:
-        sync_alerts(conn)
-        cursor.execute("""
-            SELECT
-                al.*,
-                a.hostname,
-                a.ip_address
-            FROM alerts al
-            LEFT JOIN assets a ON a.id = al.asset_id
-            WHERE al.id = %s
-            LIMIT 1
-        """, (alert_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Alert not found")
-        return normalize_alert_row(row)
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.post("/api/v1/alerts/resolve-batch")
-def resolve_alerts_batch(payload: AlertBatchResolveRequest, request: Request):
-    """批量标记告警为已解决"""
-    if not payload.ids:
-        raise HTTPException(status_code=400, detail="Alert ids are required")
-
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_alerts_table(conn)
-        placeholders = ", ".join(["%s"] * len(payload.ids))
-
         cursor.execute(
-            f"""
-            SELECT id, status
-            FROM alerts
-            WHERE id IN ({placeholders})
-            """,
-            payload.ids,
+            "SELECT secret_hash, status, last_used_at FROM agent_credentials WHERE asset_id=%s",
+            (agent_id,),
         )
+        row = cursor.fetchone()
+        if not row or row.get("status") != "active":
+            return False
+        expected = str(row.get("secret_hash") or "")
+        if not hmac.compare_digest(_hash_device_secret(agent_id, str(secret)), expected):
+            return False
+        cursor.execute(
+            "UPDATE agent_credentials SET last_used_at=NOW() WHERE asset_id=%s",
+            (agent_id,),
+        )
+        conn.commit()
+        return True
+    except Error:
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _agent_version_tuple(value: Any) -> tuple:
+    try:
+        parts = str(value or "").strip().split(".")
+        return tuple(int(p) for p in parts[:3]) if parts and parts[0] else (0, 0, 0)
+    except (TypeError, ValueError):
+        return (0, 0, 0)
+
+
+def _issue_agent_device_credential(asset_id: int, cursor, allow_rotate: bool = False) -> Optional[Dict[str, Any]]:
+    """为资产签发设备凭据。
+    - 无凭据行 / 已吊销 → 签发新凭据
+    - 已有 active 凭据 → 默认不重发（明文不可恢复）；
+      allow_rotate=True（Agent 已是 1.6.0+，具备保存能力）时轮换重发，
+      覆盖"旧版本期间凭据已签发但被忽略"的灰度断点。"""
+    cursor.execute(
+        "SELECT status FROM agent_credentials WHERE asset_id=%s FOR UPDATE",
+        (asset_id,),
+    )
+    row = cursor.fetchone()
+    if row and row.get("status") == "active" and not allow_rotate:
+        return None
+    device_secret = secrets.token_urlsafe(32)
+    cursor.execute("""
+        INSERT INTO agent_credentials (asset_id, secret_hash, status)
+        VALUES (%s, %s, 'active')
+        ON DUPLICATE KEY UPDATE secret_hash=VALUES(secret_hash), status='active', last_used_at=NULL
+    """, (asset_id, _hash_device_secret(asset_id, device_secret)))
+    return {"agent_id": asset_id, "device_secret": device_secret}
+
+
+# 注册设备凭据校验器（必须在函数定义之后）
+set_agent_device_credential_verifier(verify_agent_device_credential)
+
+
+def _enforce_device_asset_binding(request: Request, asset_id: int) -> None:
+    """设备凭据只能访问自身资产的数据（全局 token 在迁移窗口内不受限）"""
+    from auth_utils import get_request_agent_auth
+    auth_info = get_request_agent_auth(request)
+    if auth_info and auth_info.get("agent_auth_type") == "device":
+        if auth_info.get("agent_id") != asset_id:
+            raise HTTPException(status_code=403, detail="Agent credential does not match this asset")
+
+
+# ============================================================
+# 终端安全管理 - Agent 上报端点（agent_token 认证）
+# ============================================================
+
+from security_api import (
+    mount_security_api,
+)
+
+# 挂载 security router（/api/v1/security/* 走用户认证中间件）
+mount_security_api(app)
+
+# P1-01：告警中心路由（platform.routers.alerts）
+app.include_router(alerts_platform_router)
+app.include_router(logs_platform_router)  # P1-01：统一日志路由
+app.include_router(batch_platform_router)  # P1-01：批量操作路由
+app.include_router(discovery_platform_router)  # P1-01：终端发现路由
+app.include_router(groups_platform_router)  # P1-01：终端分组路由
+app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
+app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
+
+# 网络监控路由（第一阶段：实时状态 + 历史趋势）
+from zvplatform.routers.network import router as network_router
+app.include_router(network_router)
+
+
+# ============================================================
+# 远程桌面会话 API（/api/v1/remote/*）
+# ============================================================
+from remote_desktop_api import mount_remote_desktop_api
+mount_remote_desktop_api(app)
+
+# ============================================================
+# Agent 自动升级 API（/api/v1/agent/upgrade/*）
+# ============================================================
+from agent_upgrade_api import mount_agent_upgrade_api
+mount_agent_upgrade_api(app)
+
+
+# ============================================================
+# 设备凭据管理台（admin/policies:write）
+# ============================================================
+# ============================================================
+# 终端部署三件套（P1-04，参照火绒企业版）：
+# 1) 网页自助下载安装包  2) 一键部署脚本（域开机脚本/三方桌管静默推送）
+# Agent 侧配套：Z-View.exe --install --quiet --server-url <center>
+# ============================================================
+
+
+def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
+    import os
+
+    from agent_upgrade_api import UPGRADE_DIR, get_latest_upgrade
+
+    latest = get_latest_upgrade()
+    version = str(latest.get("version") or "")
+    if not version:
+        return None, None
+    exe_path = os.path.join(UPGRADE_DIR, version, "Z-View.exe")
+    if not os.path.exists(exe_path):
+        return None, None
+    return version, exe_path
+
+
+@app.get("/api/v1/console/agent-deploy/package")
+def download_agent_deploy_package(request: Request):
+    """网页自助部署：下载最新版 Agent 安装包（admin）。
+
+    终端用户拿到包后运行 `Z-View.exe --install --quiet --server-url <中心地址>`，
+    或配合部署脚本自动完成。升级通道已有 SHA256 校验，无需重复签名。
+    """
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    version, exe_path = _resolve_latest_agent_package()
+    if not exe_path:
+        raise HTTPException(
+            status_code=404,
+            detail="No agent package available; upload one via /api/v1/agent/upgrade/upload first",
+        )
+    return FileResponse(
+        exe_path,
+        media_type="application/octet-stream",
+        filename=f"Z-View-Setup-{version}.exe",
+    )
+
+
+def _build_agent_deploy_ps_script(center_url: str, deploy_token: str) -> str:
+    return f"""# Z-View Agent 一键部署脚本（需管理员权限运行）
+# 生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}   中心: {center_url}
+# 用途: 网页自助部署 / 域开机脚本 / 三方桌管静默推送（火绒企业版同款三件套）
+# 注意: 脚本内嵌 Agent Token，仅限内部分发，勿公开传播
+$ErrorActionPreference = 'Stop'
+$Center = '{center_url}'
+$Token  = '{deploy_token}'
+$WorkDir = Join-Path $env:TEMP 'zview-agent-deploy'
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
+Write-Host '[1/2] downloading agent package...'
+Invoke-WebRequest -UseBasicParsing `
+    -Uri "$Center/api/v1/agent/upgrade/download?agent_token=$Token" `
+    -OutFile (Join-Path $WorkDir 'Z-View.exe')
+
+Write-Host '[2/2] installing service...'
+& (Join-Path $WorkDir 'Z-View.exe') --install --quiet --server-url $Center
+if ($LASTEXITCODE -eq 0) {{
+    Write-Host 'Z-View Agent deployed successfully.'
+}} else {{
+    Write-Host "deploy failed: exit=$LASTEXITCODE" -ForegroundColor Red
+    exit 1
+}}
+"""
+
+
+@app.get("/api/v1/console/agent-deploy/script")
+def get_agent_deploy_script(
+    request: Request,
+    center: Optional[str] = Query(default=None, description="覆盖中心地址（终端访问用的 IP/域名），默认取当前访问地址"),
+):
+    """生成终端一键部署脚本（内嵌中心地址与下载 Token，admin 专用，勿外发）。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    if center:
+        base_url = center.rstrip("/")
+    else:
+        host = request.headers.get("host") or request.url.netloc
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+        base_url = f"{scheme}://{host}"
+    from auth_utils import get_expected_agent_token
+
+    token = get_expected_agent_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="agent token not configured on server")
+    content = _build_agent_deploy_ps_script(base_url, token)
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=deploy-zview-agent.ps1"},
+    )
+
+
+# ============================================================
+# 告警通知配置（P1 告警中心通知层，V1.7.1）
+# ============================================================
+
+
+@app.get("/api/v1/console/alert-notify-config")
+def get_alert_notify_config_api(request: Request):
+    """读取告警通知配置（密码脱敏）。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    from zvplatform.services.alert_notify import get_notify_config
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cfg = get_notify_config(conn)
+        cfg["has_smtp_password"] = bool(cfg.get("smtp_password"))
+        cfg.pop("smtp_password", None)
+        return cfg
+    finally:
+        conn.close()
+
+
+@app.put("/api/v1/console/alert-notify-config")
+def update_alert_notify_config_api(request: Request, patch: dict):
+    """更新告警通知配置（合并式；smtp_password 传空串表示保持不变）。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    if not isinstance(patch, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+    from zvplatform.services.alert_notify import update_notify_config
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        cfg = update_notify_config(conn, patch)
+        cfg["has_smtp_password"] = bool(cfg.get("smtp_password"))
+        cfg.pop("smtp_password", None)
+        return cfg
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/console/agent-credentials")
+def list_agent_credentials(request: Request):
+    """设备凭据注册状态（含未注册资产）"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = conn.cursor(dictionary=True)
+    try:
+        ensure_agent_credentials_table(conn)
+        cursor.execute("""
+            SELECT a.id AS asset_id, a.hostname, a.ip_address, a.status, a.last_seen,
+                   ac.status AS credential_status, ac.created_at AS enrolled_at, ac.last_used_at
+            FROM assets a
+            LEFT JOIN agent_credentials ac ON ac.asset_id = a.id
+            WHERE a.deleted_at IS NULL
+            ORDER BY (ac.asset_id IS NULL) ASC, a.id ASC
+        """)
         rows = cursor.fetchall()
-        if not rows:
-            raise HTTPException(status_code=404, detail="No alerts found")
+        for r in rows:
+            r["last_seen"] = fmt_dt(r.get("last_seen"))
+            r["enrolled_at"] = fmt_dt(r.get("enrolled_at"))
+            r["last_used_at"] = fmt_dt(r.get("last_used_at"))
+            r["enrolled"] = r.get("credential_status") == "active"
+        enrolled = sum(1 for r in rows if r["enrolled"])
+        return {"data": rows, "total": len(rows), "enrolled": enrolled, "pending": len(rows) - enrolled}
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
 
-        existing_ids = {row["id"] for row in rows}
-        missing_ids = [alert_id for alert_id in payload.ids if alert_id not in existing_ids]
-        active_ids = [row["id"] for row in rows if row["status"] == "active"]
-        resolved_by = get_request_username(request, fallback="console")
 
-        resolved_count = 0
-        if active_ids:
-            active_placeholders = ", ".join(["%s"] * len(active_ids))
-            cursor.execute(
-                f"""
-                UPDATE alerts
-                SET status = 'resolved',
-                    active_fingerprint = NULL,
-                    resolved_at = NOW(),
-                    resolved_by = %s,
-                    updated_at = NOW()
-                WHERE id IN ({active_placeholders})
-                """,
-                [resolved_by] + active_ids,
-            )
-            resolved_count = cursor.rowcount or 0
+@app.delete("/api/v1/console/agent-credentials/{asset_id}")
+def revoke_agent_credential(asset_id: int, request: Request):
+    """吊销设备凭据：Agent 下次全局 token 心跳时自动重新签发"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = conn.cursor()
+    try:
+        ensure_agent_credentials_table(conn)
+        cursor.execute(
+            "UPDATE agent_credentials SET status='revoked' WHERE asset_id=%s AND status='active'",
+            (asset_id,),
+        )
+        revoked = cursor.rowcount
+        conn.commit()
+        if not revoked:
+            raise HTTPException(status_code=404, detail="No active credential for this asset")
+        conn.commit()
+        # 写审计
+        try:
+            insert_system_activity_log(cursor, SystemActivityLogCreate(
+                source_type="platform",
+                module="agent_credentials",
+                category="security",
+                action="agent_credential_revoke",
+                level="warning",
+                result="success",
+                asset_id=asset_id,
+                operator_name=get_request_username(request, fallback="console"),
+                title="吊销 Agent 设备凭据",
+                message=f"Agent 设备凭据已吊销，等待全局 token 心跳重新签发 (asset_id={asset_id})",
+                details={"asset_id": asset_id},
+            ))
             conn.commit()
-
-        return {
-            "message": "Batch resolve completed",
-            "requested": len(payload.ids),
-            "resolved": resolved_count,
-            "resolved_count": resolved_count,
-            "already_resolved": len(rows) - len(active_ids),
-            "missing_ids": missing_ids,
-        }
+        except Error:
+            conn.rollback()
+        return {"status": "success", "asset_id": asset_id, "revoked": True}
     except HTTPException:
         raise
     except Error as e:
@@ -5412,159 +4079,57 @@ def resolve_alerts_batch(payload: AlertBatchResolveRequest, request: Request):
         conn.close()
 
 
-@app.put("/api/v1/alerts/{alert_id}/resolve")
-def resolve_alert(alert_id: int, request: Request):
-    """标记告警为已解决"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_alerts_table(conn)
-
-        cursor.execute("""
-            SELECT id, status
-            FROM alerts
-            WHERE id = %s
-        """, (alert_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Alert not found")
-
-        if row["status"] != "active":
-            return {"message": "Alert already resolved"}
-
-        resolved_by = get_request_username(request, fallback="console")
-        cursor.execute("""
-            UPDATE alerts
-            SET status = 'resolved',
-                active_fingerprint = NULL,
-                resolved_at = NOW(),
-                resolved_by = %s,
-                updated_at = NOW()
-            WHERE id = %s
-        """, (resolved_by, alert_id))
-        conn.commit()
-
-        return {"message": "Alert resolved successfully"}
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/v1/alerts/export")
-def export_alerts(
-    status: Optional[str] = Query(default=None),
-    severity: Optional[str] = Query(default=None),
-    alert_type: Optional[str] = Query(default=None),
-    keyword: Optional[str] = Query(default=None),
-    start_time: Optional[str] = Query(default=None),
-    end_time: Optional[str] = Query(default=None),
+@app.get("/api/v1/agent/security-policies")
+def agent_get_security_policies(
+    request: Request,
+    asset_id: int = Query(...),
 ):
-    """导出告警列表 CSV"""
+    """Agent 拉取安全策略（按三级优先级解析：global > group > asset）"""
+    require_agent_request(request)
+    _enforce_device_asset_binding(request, asset_id)
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-
-    severity_labels = {
-        "critical": "严重",
-        "error": "错误",
-        "warning": "警告",
-        "info": "信息",
-    }
-    type_labels = {
-        "cpu": "CPU",
-        "memory": "内存",
-        "disk": "磁盘",
-        "offline": "离线",
-        "health": "健康度",
-        "warranty": "保修",
-    }
-    status_labels = {
-        "active": "活跃",
-        "resolved": "已解决",
-    }
-
     cursor = conn.cursor(dictionary=True)
     try:
-        sync_alerts(conn)
-        where_sql, params = build_alert_filters(
-            status=status,
-            severity=severity,
-            alert_type=alert_type,
-            keyword=keyword,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        cursor.execute(
-            f"""
-            SELECT
-                al.*,
-                a.hostname,
-                a.ip_address
-            FROM alerts al
-            LEFT JOIN assets a ON a.id = al.asset_id
-            WHERE {where_sql}
-            ORDER BY
-                CASE al.status WHEN 'active' THEN 0 ELSE 1 END,
-                CASE al.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                al.last_seen_at DESC,
-                al.id DESC
-            """,
-            params,
-        )
-        rows = cursor.fetchall()
+        from security_api import ensure_security_tables
+        ensure_security_tables(conn)
+        # 查询 asset 的 group_id
+        cursor.execute("SELECT group_id FROM assets WHERE id=%s", (asset_id,))
+        row = cursor.fetchone()
+        group_id = row.get("group_id") if row else None
 
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow([
-            "告警ID",
-            "资产ID",
-            "主机名",
-            "IP地址",
-            "告警类型",
-            "严重程度",
-            "状态",
-            "告警信息",
-            "当前值",
-            "阈值",
-            "首次触发时间",
-            "最近出现时间",
-            "解决时间",
-            "解决人",
-        ])
-
-        for row in rows:
-            normalized = normalize_alert_row(row)
-            writer.writerow([
-                normalized["id"],
-                normalized["asset_id"],
-                normalized["hostname"],
-                normalized["ip_address"],
-                type_labels.get(normalized["alert_type"], normalized["alert_type"]),
-                severity_labels.get(normalized["severity"], normalized["severity"]),
-                status_labels.get(normalized["status"], normalized["status"]),
-                normalized["message"],
-                normalized["current_value"] if normalized["current_value"] is not None else "",
-                normalized["threshold_value"] if normalized["threshold_value"] is not None else "",
-                normalized["created_at"] or "",
-                normalized["last_seen_at"] or "",
-                normalized["resolved_at"] or "",
-                normalized["resolved_by"] or "",
-            ])
-
-        csv_content = "\ufeff" + output.getvalue()
-        return Response(
-            content=csv_content,
-            media_type="text/csv; charset=utf-8",
-            headers={
-                "Content-Disposition": f"attachment; filename=alerts-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
-            },
-        )
+        # 优先级：asset > group > global（数值越大优先级越高，取最高优先级的生效配置合并）
+        cursor.execute("""
+            SELECT sp.id, sp.policy_name, sp.policy_type, sp.priority, sp.version,
+                   sp.config_json, spb.scope_type, spb.scope_id
+            FROM security_policy_bindings spb
+            JOIN security_policies sp ON sp.id=spb.policy_id
+            WHERE spb.enabled=TRUE AND sp.enabled=TRUE AND (
+                spb.scope_type='global'
+                OR (spb.scope_type='asset' AND spb.scope_id=%s)
+                OR (spb.scope_type='group' AND spb.scope_id=%s)
+            )
+        """, (asset_id, group_id))  # P1-05：排序与去重收敛到 policy_engine
+        policies = []
+        for r in cursor.fetchall():
+            try:
+                config = json.loads(r.get("config_json") or "{}")
+            except Exception:
+                config = {}
+            policies.append({
+                "id": r["id"],
+                "policy_name": r["policy_name"],
+                "policy_type": r["policy_type"],
+                "priority": int(r["priority"] or 0),
+                "version": int(r["version"] or 1),
+                "scope_type": r["scope_type"],
+                "config": config,
+            })
+        # P1-05：统一策略引擎解析生效策略
+        from zvplatform.policy_engine import resolve_effective_policies
+        return {"status": "success", "asset_id": asset_id,
+                "policies": resolve_effective_policies(policies)}
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -5572,41 +4137,39 @@ def export_alerts(
         conn.close()
 
 
-@app.post("/api/v1/logs")
-def create_system_activity_log(payload: SystemActivityLogCreate, request: Request):
-    """写入统一运行时日志。"""
-    token = extract_bearer_token(request)
-    auth_user = verify_access_token(token)
-    agent_auth = None
-    if auth_user:
-        # 该接口对 Agent 上报做了中间件豁免，平台用户仍必须按 RBAC 校验写入权限。
-        require_request_permission(auth_user, request.url.path, request.method)
-        request.state.auth_user = auth_user
-        payload.operator_name = normalize_actor_name(auth_user.get("username"), fallback="console")
-    else:
-        agent_auth = verify_agent_token(token)
-        if agent_auth:
-            request.state.agent_auth = agent_auth
-            payload.operator_name = build_trusted_agent_operator_name(payload)
-
-    if not auth_user and not agent_auth:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+@app.post("/api/v1/agent/security-policy-result")
+def agent_security_policy_result(data: dict, request: Request):
+    """Agent 回传策略执行结果"""
+    require_agent_request(request)
+    _enforce_device_asset_binding(request, int(data.get("asset_id") or 0))
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-
     cursor = conn.cursor()
     try:
-        ensure_system_activity_logs_table(conn)
-        log_id, event_time = insert_system_activity_log(cursor, payload)
+        from security_api import ensure_security_tables
+        ensure_security_tables(conn)
+        policy_id = data.get("policy_id")
+        asset_id = data.get("asset_id")
+        status = data.get("status", "success")
+        if not policy_id or not asset_id:
+            raise HTTPException(status_code=422, detail="policy_id and asset_id required")
+        cursor.execute("SELECT id FROM security_policies WHERE id=%s", (policy_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Policy not found")
+        cursor.execute("""
+            INSERT INTO security_policy_exec_results
+                (policy_id, asset_id, scope_type, status, applied_rules, failed_rules, error_detail, executed_at, reported_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        """, (
+            policy_id, asset_id, data.get("scope_type", "asset"),
+            status, int(data.get("applied_rules") or 0), int(data.get("failed_rules") or 0),
+            data.get("error_detail"),
+        ))
         conn.commit()
-
-        return {
-            "message": "Log created successfully",
-            "id": log_id,
-            "event_time": format_datetime(event_time),
-        }
+        return {"status": "success"}
+    except HTTPException:
+        raise
     except Error as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -5615,166 +4178,38 @@ def create_system_activity_log(payload: SystemActivityLogCreate, request: Reques
         conn.close()
 
 
-@app.get("/api/v1/logs")
-def get_unified_logs(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=200),
-    source_type: Optional[str] = Query(default=None),
-    module: Optional[str] = Query(default=None),
-    category: Optional[str] = Query(default=None),
-    asset_id: Optional[int] = Query(default=None),
-    level: Optional[str] = Query(default=None),
-    result: Optional[str] = Query(default=None),
-    keyword: Optional[str] = Query(default=None),
-    start_time: Optional[str] = Query(default=None),
-    end_time: Optional[str] = Query(default=None),
-):
-    """聚合查询统一日志。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_system_activity_logs_table(conn)
-        union_sql = build_unified_logs_union(conn)
-        where_sql, params = build_unified_logs_where(
-            source_type=source_type,
-            module=module,
-            category=category,
-            asset_id=asset_id,
-            keyword=keyword,
-            level=level,
-            result=result,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        cursor.execute(f"""
-            SELECT COUNT(*) AS total
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-        """, params)
-        total = (cursor.fetchone() or {}).get("total", 0) or 0
-
-        offset = (page - 1) * page_size
-        cursor.execute(f"""
-            SELECT *
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-            ORDER BY logs.event_time DESC, logs.source_id DESC
-            LIMIT %s OFFSET %s
-        """, params + [page_size, offset])
-        rows = cursor.fetchall()
-
-        return {
-            "data": [normalize_log_row(row) for row in rows],
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-        }
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/v1/logs/stats")
-def get_unified_log_stats(
-    start_time: Optional[str] = Query(default=None),
-    end_time: Optional[str] = Query(default=None),
-):
-    """获取统一日志统计。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_system_activity_logs_table(conn)
-        union_sql = build_unified_logs_union(conn)
-        where_sql, params = build_unified_logs_where(
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        cursor.execute(f"""
-            SELECT
-                COUNT(*) AS total,
-                COUNT(CASE WHEN logs.event_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 1 END) AS total_24h,
-                COUNT(CASE WHEN logs.event_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1 END) AS total_7days,
-                COUNT(CASE WHEN logs.level = 'error' THEN 1 END) AS error_count,
-                COUNT(CASE WHEN logs.level = 'warning' THEN 1 END) AS warning_count
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-        """, params)
-        summary = cursor.fetchone() or {}
-
-        cursor.execute(f"""
-            SELECT logs.level, COUNT(*) AS count
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-            GROUP BY logs.level
-            ORDER BY count DESC
-        """, params)
-        by_level = {row["level"] or "unknown": row["count"] for row in cursor.fetchall()}
-
-        cursor.execute(f"""
-            SELECT logs.module, COUNT(*) AS count
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-            GROUP BY logs.module
-            ORDER BY count DESC
-        """, params)
-        by_module = {row["module"] or "unknown": row["count"] for row in cursor.fetchall()}
-
-        cursor.execute(f"""
-            SELECT logs.source_type, COUNT(*) AS count
-            FROM ({union_sql}) logs
-            WHERE {where_sql}
-            GROUP BY logs.source_type
-            ORDER BY count DESC
-        """, params)
-        by_source_type = {row["source_type"] or "unknown": row["count"] for row in cursor.fetchall()}
-
-        return {
-            "total": summary.get("total", 0) or 0,
-            "total_24h": summary.get("total_24h", 0) or 0,
-            "total_7days": summary.get("total_7days", 0) or 0,
-            "error_count": summary.get("error_count", 0) or 0,
-            "warning_count": summary.get("warning_count", 0) or 0,
-            "by_level": by_level,
-            "by_module": by_module,
-            "by_source_type": by_source_type,
-        }
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.on_event("startup")
-def startup_background_workers():
-    """启动后台守护线程。"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            ensure_assets_agent_schema(conn)
-            ensure_asset_changes_table(conn)
-        finally:
-            conn.close()
-    ensure_status_reconcile_worker_started()
-
-
 if __name__ == "__main__":
     import uvicorn
+
+    # P0-02：Agent 控制面 TLS 监听（8443），与 8080 同一应用双监听。
+    # 证书复用 frontend/certs 自签根（SAN 含 172.16.250.120）；Agent 用同一证书作 CA bundle 校验。
+    def _start_tls_listener():
+        import os as _os
+        if str(get_env("ZVIEW_AGENT_TLS_ENABLED", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+            safe_console_print("[TLS] 8443 listener disabled by ZVIEW_AGENT_TLS_ENABLED")
+            return
+        from zvplatform.settings import get_settings as _get_settings
+        _app_settings = _get_settings()
+        cert_file = _app_settings.platform.tls_certfile or _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)), "frontend", "certs", "zview-cert.pem")
+        key_file = _app_settings.platform.tls_keyfile or _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)), "frontend", "certs", "zview-key.pem")
+        if not (_os.path.exists(cert_file) and _os.path.exists(key_file)):
+            safe_console_print(f"[TLS] cert/key not found ({cert_file}); 8443 listener skipped")
+            return
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=8443,
+                        ssl_certfile=cert_file, ssl_keyfile=key_file, log_level="warning")
+        except Exception as exc:
+            safe_console_print(f"[TLS] 8443 listener failed: {exc}")
+
+    threading.Thread(target=_start_tls_listener, daemon=True, name="assets-api-tls-8443").start()
 
     safe_console_print("=" * 60)
     safe_console_print("Z-View Assets API Starting...")
     safe_console_print("=" * 60)
     safe_console_print("Service: http://localhost:8080")
+    safe_console_print("Agent TLS: https://localhost:8443")
     safe_console_print("API Docs: http://localhost:8080/docs")
     safe_console_print("Health Check: http://localhost:8080/")
     safe_console_print("=" * 60)

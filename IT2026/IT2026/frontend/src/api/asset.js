@@ -8,6 +8,13 @@ export function getAssetList(params) {
   })
 }
 
+export function getAssetOptions() {
+  return request({
+    url: '/assets/options',
+    method: 'get'
+  })
+}
+
 export function getAssetDetail(id) {
   return request({
     url: `/assets/${id}/detail`,

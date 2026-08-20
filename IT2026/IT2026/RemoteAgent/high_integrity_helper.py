@@ -15,12 +15,22 @@ from Common.logging_utils import make_component_logger
 from Common.runtime_paths import get_high_integrity_helper_pipe_name
 from IPC.named_pipe import NamedPipeCommandServer
 from Input.input_controller import InputInjector
-from agent_consent_ipc import get_current_process_session_id, get_current_username
+from agent_consent_ipc import (
+    get_current_process_session_id,
+    get_current_username,
+    load_agent_config,
+    load_tray_settings,
+)
 from desktop_context import InputDesktopController
 from input_injector import MouseButton, MouseEvent, MouseEventType
 
 
 pyautogui.FAILSAFE = False
+
+
+class SecureDesktopInputBlocked(RuntimeError):
+    """策略禁止在安全桌面（UAC 提示所在桌面）上注入输入时抛出。"""
+
 
 
 class _DesktopBindingMismatch(RuntimeError):
@@ -52,6 +62,7 @@ class _DesktopBoundWorker:
         logger: Callable[[str], None],
         on_binding_applied: Callable[[dict[str, Any]], None] | None = None,
         on_worker_recycled: Callable[[dict[str, Any]], None] | None = None,
+        secure_desktop_input_policy: Callable[[], bool] | None = None,
     ):
         self.name = name
         self.binding_mode = str(binding_mode or "input").strip().lower()
@@ -59,6 +70,8 @@ class _DesktopBoundWorker:
         self.logger = logger
         self.on_binding_applied = on_binding_applied
         self.on_worker_recycled = on_worker_recycled
+        # 安全桌面（UAC）输入策略：返回 False 时注入线程拒绝绑定/执行于安全桌面
+        self.secure_desktop_input_policy = secure_desktop_input_policy
         self._tasks: queue.Queue | None = None
         self._worker_stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
@@ -529,6 +542,29 @@ class _DesktopBoundWorker:
                     resolved_binding_payload = self._resolve_binding_payload(binding_state, resolved_binding_payload)
                     current_target_signature = self._resolve_target_signature(binding_state, resolved_binding_payload)
                     binding_state["input_target_signature"] = current_target_signature
+                input_desktop_kind = str(
+                    binding_state.get("input_desktop_kind")
+                    or binding_state.get("desktop_kind")
+                    or ""
+                ).strip().lower()
+                if self.binding_mode == "input" and input_desktop_kind.startswith("secure"):
+                    allowed = True
+                    if self.secure_desktop_input_policy is not None:
+                        try:
+                            allowed = bool(self.secure_desktop_input_policy())
+                        except Exception:
+                            allowed = True
+                    if not allowed:
+                        raise SecureDesktopInputBlocked(
+                            f"{self.name} secure desktop input disabled by policy: "
+                            f"desktop={binding_state.get('input_desktop') or 'unknown'}"
+                        )
+                    # 审计：每次对安全桌面（UAC）的授权注入都留痕
+                    self.logger(
+                        f"AUDIT {self.name} secure-desktop input authorized: reason={reason} "
+                        f"desktop={binding_state.get('input_desktop') or 'unknown'}"
+                    )
+                    binding_state["secure_desktop_authorized"] = True
                 self._record_binding_state(binding_state)
                 current_signature = str(binding_state.get("desktop_signature") or "").strip()
                 if current_signature and current_signature != self._last_desktop_signature:
@@ -764,12 +800,44 @@ class HighIntegritySessionHelperRuntime:
             desktop_controller=self.input_desktop_controller,
             logger=self.logger,
             on_binding_applied=self._handle_input_binding_applied,
+            secure_desktop_input_policy=self._secure_desktop_input_allowed,
         )
+        self._secure_desktop_policy_cache = {"value": None, "expires": 0.0}
         self._pipe_server = NamedPipeCommandServer(
             self.pipe_name,
             self._handle_request,
             logger=self.logger,
+            allow_all_users=True,
+            # 安全审计 P0-5：会话范围 DACL + 客户端会话校验
+            expected_session_id=self.session_id,
+            enforce_session_scope=True,
         )
+
+    def _secure_desktop_input_allowed(self) -> bool:
+        """安全桌面（UAC）输入策略：config 默认值 + 托盘开关覆盖，带 2 秒缓存。"""
+        now = time.monotonic()
+        cache = getattr(self, "_secure_desktop_policy_cache", None)
+        if cache is None:
+            cache = self._secure_desktop_policy_cache = {"value": None, "expires": 0.0}
+        if now < float(cache["expires"]) and cache["value"] is not None:
+            return bool(cache["value"])
+
+        allowed = True  # 与商业远控一致：会话已获同意的前提下默认允许操作 UAC
+        try:
+            remote_settings = (load_agent_config() or {}).get("remote_desktop") or {}
+            allowed = bool(remote_settings.get("allow_secure_desktop_input", True))
+        except Exception:
+            pass
+        try:
+            tray_value = load_tray_settings().get("allow_secure_desktop_input")
+            if tray_value is not None:
+                allowed = bool(tray_value)
+        except Exception:
+            pass
+
+        cache["value"] = bool(allowed)
+        cache["expires"] = now + 2.0
+        return bool(allowed)
 
     def run_forever(self) -> None:
         self._capture_worker.start()
@@ -779,6 +847,19 @@ class HighIntegritySessionHelperRuntime:
             "helper runtime active: "
             f"session_id={self.session_id} pipe={self.pipe_name} username={get_current_username()}"
         )
+        # 预热 H.264 编码器依赖：av/FFmpeg 首次导入约 1-2s，提前后台完成，
+        # 避免远控会话首个关键帧卡顿（对桌面切换/助手重建场景尤其明显）
+        import threading as _threading
+
+        def _warm_h264():
+            try:
+                from Codec.h264_encoder import h264_available  # noqa: F401
+
+                h264_available()
+            except Exception:
+                pass
+
+        _threading.Thread(target=_warm_h264, daemon=True, name="h264-warmup").start()
         try:
             while not self._stop_event.wait(1.0):
                 pass
@@ -970,6 +1051,29 @@ class HighIntegritySessionHelperRuntime:
             return "best_effort_capture_context"
         return ""
 
+    def _encode_h264_packets(self, screenshot, force_keyframe: bool) -> list[dict[str, Any]]:
+        """抓屏帧 → H.264 Annex-B 包（base64），持久编码器随分辨率重建。"""
+        import base64 as _base64
+        from Codec.h264_encoder import H264StreamEncoder
+
+        width = int(getattr(screenshot, "width", 0) or 0)
+        height = int(getattr(screenshot, "height", 0) or 0)
+        enc = getattr(self, "_h264_encoder", None)
+        if enc is None or enc.width != width or enc.height != height:
+            try:
+                if enc is not None:
+                    enc.close()
+            except Exception:
+                pass
+            enc = H264StreamEncoder(width, height, fps=30, crf=int(getattr(self, "_h264_crf", 21)))
+            self._h264_encoder = enc
+            self._h264_fail_count = 0
+        pkts = enc.encode(screenshot, keyframe=force_keyframe)
+        return [
+            {"data": _base64.b64encode(p["data"]).decode("ascii"), "keyframe": bool(p["keyframe"])}
+            for p in pkts
+        ]
+
     def _capture_frame(self, payload: dict[str, Any]) -> dict[str, Any]:
         quality = max(25, min(95, int(payload.get("quality") or 75)))
         scale = float(payload.get("scale") or 1.0)
@@ -981,23 +1085,27 @@ class HighIntegritySessionHelperRuntime:
         )
         
         def capture_operation(binding_state: dict[str, Any]) -> dict[str, Any]:
+            op_started_at = time.perf_counter()
             captured_at = time.time()
             desktop_state, display_presence, _display_inventory = self._enrich_desktop_state_with_display_presence(
                 binding_state
             )
             desktop_signature = str(desktop_state.get("desktop_signature") or "").strip()
+            enrich_done_at = time.perf_counter()
             self.frame_capturer.prepare_for_desktop(
                 desktop_signature,
                 desktop_state=desktop_state,
                 reason="capture_worker_desktop_transition",
             )
+            prepare_done_at = time.perf_counter()
             backend_diagnostics = (
                 self.frame_capturer.describe_backend_state()
                 if include_backend_diagnostics
                 else None
             )
             blocker = self._non_persistent_capture_blocker(display_presence, desktop_state)
-            if blocker:
+            fallback_allowed = self.frame_capturer.fallback_capture_allowed()
+            if blocker and not fallback_allowed:
                 return {
                     "captured": False,
                     "empty": True,
@@ -1009,7 +1117,10 @@ class HighIntegritySessionHelperRuntime:
                     "desktop_context": desktop_state if include_desktop_state else None,
                     "backend_diagnostics": backend_diagnostics,
                 }
+            # blocker 存在但允许回退（RustDesk 式 GDI 降级）：继续尝试采集，
+            # capture_raw 内部会用 mss/gdi 系后端读取桌面表面，出帧后标记 captured_fallback。
             screenshot = self.frame_capturer.capture_raw()
+            grab_done_at = time.perf_counter()
             backend_diagnostics = (
                 self.frame_capturer.describe_backend_state()
                 if include_backend_diagnostics
@@ -1019,6 +1130,7 @@ class HighIntegritySessionHelperRuntime:
                 return {
                     "captured": False,
                     "empty": True,
+                    "blocker": blocker or None,
                     "session_id": self.session_id,
                     "backend": str(self.frame_capturer.capture_backend or ""),
                     "captured_at": captured_at,
@@ -1040,13 +1152,70 @@ class HighIntegritySessionHelperRuntime:
                     "display_presence": display_presence,
                     "backend_diagnostics": backend_diagnostics,
                 }
+                if blocker:
+                    # 回退出帧成功：向平台透出兼容模式标记
+                    response["blocker"] = blocker
+                    response["fallback_capture"] = True
                 if include_desktop_state:
                     response["desktop_context"] = desktop_state
 
                 if not response["unchanged"]:
-                    frame = self.frame_capturer.encode_frame(screenshot, quality=quality, scale=scale)
-                    frame["signature"] = signature
-                    response["frame"] = frame
+                    if (
+                        payload.get("codec") == "h264"
+                        and not getattr(self, "_h264_disabled", False)
+                        and not getattr(self, "_h264_unavailable", False)
+                    ):
+                        # 助手侧直接 H.264 编码：抓屏后不再走 JPEG 编码，
+                        # 管道只传小体积 H.264 包（服务端零转码直发观看端）
+                        try:
+                            # 动态分辨率：按引擎下发的 scale 缩放（弱机降采样保帧率）
+                            h264_scale = 1.0
+                            try:
+                                h264_scale = float(payload.get("scale") or 1.0)
+                            except Exception:
+                                h264_scale = 1.0
+                            if h264_scale < 0.99 and screenshot.width > 4:
+                                try:
+                                    from PIL import Image as _PILImage
+                                    new_w = max(2, int(screenshot.width * h264_scale) // 2 * 2)
+                                    new_h = max(2, int(screenshot.height * h264_scale) // 2 * 2)
+                                    screenshot = screenshot.resize((new_w, new_h), _PILImage.BILINEAR)
+                                except Exception:
+                                    pass
+                            self._h264_crf = int(payload.get("crf") or 21)
+                            packets = self._encode_h264_packets(
+                                screenshot, force_keyframe=bool(payload.get("force_keyframe"))
+                            )
+                            response["codec"] = "h264"
+                            response["h264_packets"] = packets
+                            response["h264_width"] = int(getattr(screenshot, "width", 0) or 0)
+                            response["h264_height"] = int(getattr(screenshot, "height", 0) or 0)
+                        except Exception as exc:
+                            self._h264_fail_count = int(getattr(self, "_h264_fail_count", 0)) + 1
+                            self.logger(
+                                f"h264 helper encode failed streak={self._h264_fail_count} error={exc}"
+                            )
+                            if self._h264_fail_count >= 5:
+                                self._h264_disabled = True
+                            # 编码失败：回落 JPEG 路径
+                            frame = self.frame_capturer.encode_frame(screenshot, quality=quality, scale=scale)
+                            frame["signature"] = signature
+                            response["frame"] = frame
+                    else:
+                        frame = self.frame_capturer.encode_frame(screenshot, quality=quality, scale=scale)
+                        frame["signature"] = signature
+                        response["frame"] = frame
+                encode_done_at = time.perf_counter()
+                self.logger(
+                    "capture_frame timing: "
+                    f"enrich={enrich_done_at - op_started_at:.3f}s "
+                    f"prepare={prepare_done_at - enrich_done_at:.3f}s "
+                    f"grab={grab_done_at - prepare_done_at:.3f}s "
+                    f"encode+sig={encode_done_at - grab_done_at:.3f}s "
+                    f"total={encode_done_at - op_started_at:.3f}s "
+                    f"backend={self.frame_capturer.capture_backend} "
+                    f"unchanged={response.get('unchanged')}"
+                )
                 return response
             finally:
                 try:
@@ -1167,7 +1336,14 @@ class HighIntegritySessionHelperRuntime:
                         pyautogui.press(key)
                 elif action == "type":
                     if text:
-                        pyautogui.typewrite(text, interval=0.01)
+                        try:
+                            from Input.input_controller import send_unicode_text
+
+                            # 逐键模拟会被终端输入法拦截成拼音组合，必须走 UNICODE 注入
+                            if not send_unicode_text(text):
+                                pyautogui.typewrite(text, interval=0.01)
+                        except ImportError:
+                            pyautogui.typewrite(text, interval=0.01)
                 else:
                     raise ValueError(f"unsupported keyboard action: {action}")
             return {

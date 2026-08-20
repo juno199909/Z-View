@@ -1,479 +1,323 @@
 <template>
-  <div class="log-page app-container">
-    <el-row :gutter="20" class="stats-row">
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="日志总量" :value="stats.total" />
-        </el-card>
-      </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="24小时新增" :value="stats.total_24h" />
-        </el-card>
-      </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="错误日志" :value="stats.error_count" />
-        </el-card>
-      </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="hover" class="stat-card">
-          <el-statistic title="告警/警告" :value="stats.warning_count" />
-        </el-card>
-      </el-col>
-    </el-row>
+  <div class="zv-page">
+    <div class="zv-page-header">
+      <div>
+        <h2 class="zv-page-title">日志总览</h2>
+        <div class="zv-page-subtitle">系统全量日志 · 实时滚动 {{ stats.total || 0 }} 条</div>
+      </div>
+      <div class="zv-page-actions">
+        <el-button :icon="Refresh" @click="loadData">刷新</el-button>
+        <el-button type="primary" plain :icon="Download" @click="handleExport">导出</el-button>
+      </div>
+    </div>
 
-    <el-card class="table-card">
-      <div class="toolbar">
-        <div class="toolbar-filters">
-          <el-select v-model="filters.source_type" clearable placeholder="来源" style="width: 140px" @change="handleFilterChange">
-            <el-option v-for="option in sourceTypeOptions" :key="option.value" :label="option.label" :value="option.value" />
-          </el-select>
-          <el-select v-model="filters.module" clearable placeholder="模块" style="width: 160px" @change="handleFilterChange">
-            <el-option v-for="option in moduleOptions" :key="option.value" :label="option.label" :value="option.value" />
-          </el-select>
-          <el-select v-model="filters.level" clearable placeholder="级别" style="width: 120px" @change="handleFilterChange">
-            <el-option label="信息" value="info" />
-            <el-option label="警告" value="warning" />
-            <el-option label="错误" value="error" />
-          </el-select>
-          <el-input
-            v-model="filters.asset_id"
-            placeholder="资产ID"
-            clearable
-            style="width: 120px"
-            @clear="handleFilterChange"
-            @keyup.enter="handleFilterChange"
-          />
-          <el-input
-            v-model="filters.keyword"
-            placeholder="主机 / IP / 内容"
-            clearable
-            style="width: 220px"
-            @clear="handleFilterChange"
-            @keyup.enter="handleFilterChange"
-          />
-          <el-date-picker
-            v-model="timeRange"
-            type="datetimerange"
-            range-separator="至"
-            start-placeholder="开始时间"
-            end-placeholder="结束时间"
-            value-format="YYYY-MM-DD HH:mm:ss"
-            @change="handleFilterChange"
-          />
-        </div>
-        <div class="toolbar-actions">
-          <el-switch v-model="autoRefresh" inline-prompt active-text="自动刷新" inactive-text="手动" />
-          <el-button @click="handleFilterChange">查询</el-button>
-          <el-button :icon="Refresh" :loading="loading" @click="refreshAll">刷新</el-button>
-        </div>
+    <div class="zv-log-stats">
+      <div class="zv-stat-mini"><div class="zv-stat-num">{{ stats.total || 0 }}</div><div class="zv-stat-lbl">日志总量</div></div>
+      <div class="zv-stat-mini zv-stat-info"><div class="zv-stat-num">{{ stats.total_24h || 0 }}</div><div class="zv-stat-lbl">24h 新增</div></div>
+      <div class="zv-stat-mini zv-stat-danger"><div class="zv-stat-num">{{ stats.error_count || 0 }}</div><div class="zv-stat-lbl">错误</div></div>
+      <div class="zv-stat-mini zv-stat-warning"><div class="zv-stat-num">{{ stats.warning_count || 0 }}</div><div class="zv-stat-lbl">警告</div></div>
+    </div>
+
+    <div class="zv-card">
+      <div class="zv-filter-bar">
+        <el-form :inline="true">
+          <el-form-item label="级别">
+            <el-select v-model="filters.level" placeholder="全部" clearable style="width: 110px" @change="handleFilterChange">
+              <el-option label="信息" value="info" />
+              <el-option label="警告" value="warning" />
+              <el-option label="错误" value="error" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="来源">
+            <el-input v-model="filters.source_type" placeholder="来源" clearable style="width: 140px" @keyup.enter="handleFilterChange" />
+          </el-form-item>
+          <el-form-item label="模块">
+            <el-input v-model="filters.module" placeholder="模块" clearable style="width: 140px" @keyup.enter="handleFilterChange" />
+          </el-form-item>
+          <el-form-item label="关键字">
+            <el-input v-model="filters.keyword" placeholder="主机 / IP / 内容" clearable style="width: 220px" @keyup.enter="handleFilterChange" />
+          </el-form-item>
+          <el-form-item label="时间">
+            <el-date-picker
+              v-model="timeRange"
+              type="datetimerange"
+              range-separator="至"
+              start-placeholder="开始"
+              end-placeholder="结束"
+              value-format="YYYY-MM-DD HH:mm:ss"
+              style="width: 360px"
+              @change="handleFilterChange"
+            />
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :icon="Search" @click="handleFilterChange">查询</el-button>
+            <el-button :icon="RefreshLeft" @click="handleReset">重置</el-button>
+          </el-form-item>
+        </el-form>
       </div>
 
-      <div class="summary-tags">
-        <div class="summary-group">
-          <span class="summary-label">按级别</span>
-          <el-tag v-for="(count, level) in stats.by_level" :key="level" :type="getLevelTagType(level)" effect="plain">
-            {{ getLevelText(level) }} {{ count }}
-          </el-tag>
-        </div>
-        <div class="summary-group">
-          <span class="summary-label">按模块</span>
-          <el-tag v-for="(count, module) in stats.by_module" :key="module" effect="plain">
-            {{ formatModuleText(module) }} {{ count }}
-          </el-tag>
-        </div>
-      </div>
-
-      <el-table :data="logs" v-loading="loading" row-key="id" style="width: 100%">
-        <el-table-column prop="event_time" label="时间" width="168" />
-        <el-table-column label="来源 / 模块" width="170">
+      <el-table v-loading="loading" :data="tableData">
+        <el-table-column label="时间" width="170">
           <template #default="{ row }">
-            <div>{{ formatSourceText(row.source_type) }}</div>
-            <div class="muted-text">{{ formatModuleText(row.module) }}</div>
+            <span class="zv-mono">{{ formatTime(row.event_time) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="主机" width="170">
+        <el-table-column label="级别" width="80">
           <template #default="{ row }">
-            <div>{{ row.hostname || '-' }}</div>
-            <div class="muted-text">{{ row.ip_address || '-' }}</div>
+            <el-tag size="small" :type="getLevelType(row.level)" effect="light">{{ getLevelText(row.level) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="级别" width="90">
+        <el-table-column prop="source_type" label="来源" width="110" />
+        <el-table-column prop="module" label="模块" width="120" />
+        <el-table-column label="主机" width="160">
           <template #default="{ row }">
-            <el-tag :type="getLevelTagType(row.level)" size="small">{{ getLevelText(row.level) }}</el-tag>
+            <div class="zv-host-cell-mini">
+              <span class="zv-host-name">{{ row.hostname || '-' }}</span>
+              <span class="zv-host-ip">{{ row.ip_address || '' }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="结果" width="120">
+        <el-table-column prop="message" label="消息" min-width="280" show-overflow-tooltip />
+        <el-table-column label="操作" width="100" align="right">
           <template #default="{ row }">
-            <el-tag :type="getResultTagType(row.result)" size="small">{{ row.result || '-' }}</el-tag>
+            <el-button text type="primary" size="small" @click="openDetail(row)">详情</el-button>
           </template>
         </el-table-column>
-        <el-table-column prop="action" label="动作" width="130" show-overflow-tooltip />
-        <el-table-column label="标题 / 内容" min-width="340" show-overflow-tooltip>
-          <template #default="{ row }">
-            <div class="log-title">{{ row.title || row.action }}</div>
-            <div class="log-message">{{ row.message }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作员" width="110">
-          <template #default="{ row }">
-            {{ row.operator_name || '-' }}
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="90" fixed="right">
-          <template #default="{ row }">
-            <el-button type="primary" link @click="openDetail(row)">详情</el-button>
-          </template>
-        </el-table-column>
+        <template #empty><el-empty description="暂无日志" :image-size="80" /></template>
       </el-table>
 
-      <div class="pagination-container">
+      <div class="zv-pagination">
         <el-pagination
-          v-model:current-page="currentPage"
-          v-model:page-size="pageSize"
+          v-model:current-page="pagination.page"
+          v-model:page-size="pagination.page_size"
+          :total="pagination.total"
           :page-sizes="[20, 50, 100, 200]"
-          :total="total"
           layout="total, sizes, prev, pager, next, jumper"
-          @current-change="loadLogs"
-          @size-change="handlePageSizeChange"
+          background
+          @size-change="loadData"
+          @current-change="loadData"
         />
       </div>
-    </el-card>
+    </div>
 
-    <el-drawer v-model="detailVisible" title="日志详情" size="55%">
-      <template v-if="selectedLog">
-        <el-descriptions :column="2" border>
-          <el-descriptions-item label="时间">{{ selectedLog.event_time }}</el-descriptions-item>
-          <el-descriptions-item label="来源">{{ formatSourceText(selectedLog.source_type) }}</el-descriptions-item>
-          <el-descriptions-item label="模块">{{ formatModuleText(selectedLog.module) }}</el-descriptions-item>
-          <el-descriptions-item label="动作">{{ selectedLog.action || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="级别">
-            <el-tag :type="getLevelTagType(selectedLog.level)" size="small">{{ getLevelText(selectedLog.level) }}</el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="结果">{{ selectedLog.result || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="主机">{{ selectedLog.hostname || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="IP">{{ selectedLog.ip_address || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="会话ID">{{ selectedLog.session_id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="资产ID">{{ selectedLog.asset_id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="操作员">{{ selectedLog.operator_name || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="分类">{{ selectedLog.category || '-' }}</el-descriptions-item>
-        </el-descriptions>
-
-        <el-card class="detail-card" shadow="never">
-          <template #header>消息</template>
-          <div class="detail-text">{{ selectedLog.message || '-' }}</div>
-        </el-card>
-
-        <el-card v-if="selectedLog.details" class="detail-card" shadow="never">
-          <template #header>详情</template>
-          <pre class="code-block">{{ formatJson(selectedLog.details) }}</pre>
-        </el-card>
-
-        <el-card v-if="selectedLog.stdout_log" class="detail-card" shadow="never">
-          <template #header>标准输出</template>
-          <pre class="code-block">{{ selectedLog.stdout_log }}</pre>
-        </el-card>
-
-        <el-card v-if="selectedLog.stderr_log" class="detail-card" shadow="never">
-          <template #header>错误输出</template>
-          <pre class="code-block error-block">{{ selectedLog.stderr_log }}</pre>
-        </el-card>
-      </template>
+    <el-drawer v-model="detailVisible" title="日志详情" size="640px" destroy-on-close>
+      <div v-if="currentLog" class="zv-log-detail">
+        <div class="zv-detail-row"><span class="zv-label">时间</span><span class="zv-mono">{{ formatTime(currentLog.event_time) }}</span></div>
+        <div class="zv-detail-row"><span class="zv-label">级别</span><el-tag size="small" :type="getLevelType(currentLog.level)">{{ getLevelText(currentLog.level) }}</el-tag></div>
+        <div class="zv-detail-row"><span class="zv-label">来源</span>{{ currentLog.source_type }}</div>
+        <div class="zv-detail-row"><span class="zv-label">模块</span>{{ currentLog.module }}</div>
+        <div class="zv-detail-row"><span class="zv-label">主机</span>{{ currentLog.hostname || '-' }} <span class="zv-mono">({{ currentLog.ip_address || '-' }})</span></div>
+        <div class="zv-detail-row zv-detail-full"><span class="zv-label">消息</span>{{ currentLog.message }}</div>
+        <div v-if="currentLog.context" class="zv-detail-row zv-detail-full">
+          <span class="zv-label">上下文</span>
+          <pre class="zv-pre">{{ JSON.stringify(currentLog.context, null, 2) }}</pre>
+        </div>
+      </div>
     </el-drawer>
   </div>
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
-import { getLogList, getLogStats } from '@/api/log'
+import { onMounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { Search, RefreshLeft, Refresh, Download } from '@element-plus/icons-vue'
+import { getLogList, getLogStats, exportLogs } from '@/api/log'
+import dayjs from 'dayjs'
 
 const loading = ref(false)
-const logs = ref([])
-const total = ref(0)
-const currentPage = ref(1)
-const pageSize = ref(50)
-const autoRefresh = ref(true)
-const refreshTimer = ref(null)
-const timeRange = ref([])
+const tableData = ref([])
+const stats = ref({})
+const currentLog = ref(null)
 const detailVisible = ref(false)
-const selectedLog = ref(null)
 
-const filters = reactive({
-  source_type: '',
-  module: '',
-  level: '',
-  asset_id: '',
-  keyword: ''
-})
-
-const stats = ref({
-  total: 0,
-  total_24h: 0,
-  total_7days: 0,
-  error_count: 0,
-  warning_count: 0,
-  by_level: {},
-  by_module: {},
-  by_source_type: {}
-})
-
-const sourceTypeOptions = [
-  { label: 'Agent', value: 'agent' },
-  { label: '平台', value: 'platform' },
-  { label: '告警中心', value: 'alert' },
-  { label: '软件任务', value: 'software_task' },
-  { label: '策略日志', value: 'policy_log' },
-  { label: '审计日志', value: 'software_audit' }
-]
-
-const moduleOptions = computed(() => {
-  const statModules = Object.keys(stats.value.by_module || {})
-  const merged = ['agent', 'auth', 'remote_command', 'remote_desktop', 'software_task', 'software_management', 'software_policy', 'alert_center']
-  return [...new Set([...merged, ...statModules])]
-    .filter(Boolean)
-    .map(item => ({ label: formatModuleText(item), value: item }))
-})
-
-const buildQueryParams = () => {
-  const params = {
-    page: currentPage.value,
-    page_size: pageSize.value
-  }
-  if (filters.source_type) params.source_type = filters.source_type
-  if (filters.module) params.module = filters.module
-  if (filters.level) params.level = filters.level
-  if (filters.asset_id !== '') params.asset_id = Number(filters.asset_id)
-  if (filters.keyword.trim()) params.keyword = filters.keyword.trim()
-  if (timeRange.value?.length === 2) {
-    params.start_time = timeRange.value[0]
-    params.end_time = timeRange.value[1]
-  }
-  return params
-}
+const filters = reactive({ level: '', source_type: '', module: '', keyword: '', asset_id: '' })
+const timeRange = ref([])
+const pagination = reactive({ page: 1, page_size: 50, total: 0 })
 
 const loadStats = async () => {
-  const params = {}
-  if (timeRange.value?.length === 2) {
-    params.start_time = timeRange.value[0]
-    params.end_time = timeRange.value[1]
-  }
-  stats.value = await getLogStats(params)
+  try { stats.value = await getLogStats() } catch {}
 }
 
-const loadLogs = async () => {
+const loadData = async () => {
   loading.value = true
   try {
-    const response = await getLogList(buildQueryParams())
-    logs.value = response.data || []
-    total.value = response.total || 0
+    const params = {
+      page: pagination.page,
+      page_size: pagination.page_size,
+      level: filters.level || undefined,
+      source_type: filters.source_type || undefined,
+      module: filters.module || undefined,
+      keyword: filters.keyword || undefined,
+      asset_id: filters.asset_id || undefined,
+      start_time: timeRange.value?.[0] || undefined,
+      end_time: timeRange.value?.[1] || undefined
+    }
+    const res = await getLogList(params)
+    tableData.value = res.data || []
+    pagination.total = res.total || 0
+  } catch (error) {
+    console.error('加载日志失败:', error)
   } finally {
     loading.value = false
   }
 }
 
-const refreshAll = async () => {
-  await Promise.all([loadStats(), loadLogs()])
+const handleFilterChange = () => { pagination.page = 1; loadData() }
+const handleReset = () => {
+  Object.assign(filters, { level: '', source_type: '', module: '', keyword: '', asset_id: '' })
+  timeRange.value = []
+  handleFilterChange()
 }
 
-const handleFilterChange = () => {
-  currentPage.value = 1
-  refreshAll()
+const handleExport = async () => {
+  try {
+    // 导出与列表使用相同的筛选条件，保证所见即所得
+    const blob = await exportLogs({
+      level: filters.level || undefined,
+      source_type: filters.source_type || undefined,
+      module: filters.module || undefined,
+      asset_id: filters.asset_id || undefined,
+      keyword: filters.keyword || undefined,
+      start_time: timeRange.value?.[0] || undefined,
+      end_time: timeRange.value?.[1] || undefined
+    })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `logs-${dayjs().format('YYYYMMDD-HHmmss')}.xlsx`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+  } catch (error) {
+    ElMessage.error('导出失败')
+  }
 }
 
-const handlePageSizeChange = () => {
-  currentPage.value = 1
-  loadLogs()
-}
-
-const openDetail = row => {
-  selectedLog.value = row
+const openDetail = (row) => {
+  currentLog.value = row
   detailVisible.value = true
 }
 
-const formatSourceText = value => {
-  return sourceTypeOptions.find(item => item.value === value)?.label || value || '-'
-}
+const getLevelType = (l) => ({ error: 'danger', warning: 'warning', info: 'info' }[l] || 'info')
+const getLevelText = (l) => ({ error: '错误', warning: '警告', info: '信息' }[l] || l)
+const formatTime = (v) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '-'
 
-const formatModuleText = value => {
-  const mapping = {
-    agent: 'Agent',
-    auth: '登录鉴权',
-    remote_command: '远程命令',
-    remote_desktop: '远程桌面',
-    software_task: '软件任务',
-    software_management: '软件管理',
-    software_policy: '软件策略',
-    alert_center: '告警中心'
-  }
-  return mapping[value] || value || '-'
-}
-
-const getLevelText = value => {
-  return {
-    info: '信息',
-    warning: '警告',
-    error: '错误'
-  }[value] || value || '-'
-}
-
-const getLevelTagType = value => {
-  return {
-    info: 'info',
-    warning: 'warning',
-    error: 'danger'
-  }[value] || 'info'
-}
-
-const getResultTagType = value => {
-  if (!value) return 'info'
-  if (['success', 'approved', 'started', 'closed', 'resolved'].includes(value)) return 'success'
-  if (['failed', 'rejected', 'error'].includes(value)) return 'danger'
-  if (['warning', 'timeout', 'blocked', 'pending', 'partial', 'cancelled'].includes(value)) return 'warning'
-  return 'info'
-}
-
-const formatJson = value => {
-  if (typeof value === 'string') {
-    return value
-  }
-  return JSON.stringify(value, null, 2)
-}
-
-const startRefreshTimer = () => {
-  if (refreshTimer.value) {
-    clearInterval(refreshTimer.value)
-  }
-  if (autoRefresh.value) {
-    refreshTimer.value = setInterval(() => {
-      refreshAll()
-    }, 15000)
-  }
-}
-
-watch(autoRefresh, () => {
-  startRefreshTimer()
-})
-
-onMounted(() => {
-  refreshAll()
-  startRefreshTimer()
-})
-
-onBeforeUnmount(() => {
-  if (refreshTimer.value) {
-    clearInterval(refreshTimer.value)
-    refreshTimer.value = null
-  }
-})
+onMounted(() => { loadStats(); loadData() })
 </script>
 
 <style lang="scss" scoped>
-.log-page {
-  padding: 20px;
-}
+@use '@/assets/styles/variables.scss' as *;
 
-.stats-row {
-  margin-bottom: 20px;
-}
+.zv-page { padding: $content-padding; max-width: 1600px; margin: 0 auto; }
+.zv-page-actions { display: flex; gap: 10px; }
 
-.stat-card {
-  min-height: 110px;
-}
-
-.table-card {
-  border-radius: 12px;
-}
-
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-
-.toolbar-filters,
-.toolbar-actions,
-.summary-group {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.summary-tags {
-  display: flex;
-  flex-direction: column;
+.zv-log-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
   margin-bottom: 16px;
 }
 
-.summary-label {
-  color: #606266;
-  font-size: 13px;
+.zv-stat-mini {
+  background: $bg-card;
+  border: 1px solid $border-color-light;
+  border-left: 3px solid $border-color;
+  border-radius: $border-radius;
+  padding: 14px 18px;
+  box-shadow: $shadow-xs;
+
+  &.zv-stat-info    { border-left-color: $info-color; }
+  &.zv-stat-danger  { border-left-color: $danger-color; }
+  &.zv-stat-warning { border-left-color: $warning-color; }
 }
 
-.muted-text {
-  color: #909399;
+.zv-stat-num {
+  font-size: 22px;
+  font-weight: 700;
+  color: $text-primary;
+  font-family: $font-mono;
+  line-height: 1;
+}
+
+.zv-stat-lbl {
   font-size: 12px;
+  color: $text-secondary;
+  margin-top: 4px;
 }
 
-.log-title {
-  font-weight: 600;
-  color: #303133;
-  margin-bottom: 4px;
+.zv-card { padding: 0; }
+
+.zv-filter-bar {
+  padding: 18px 24px;
+  border-bottom: 1px solid $border-color-light;
+  background: $slate-50;
 }
 
-.log-message {
-  color: #606266;
-  line-height: 1.5;
+:deep(.el-form-item) { margin-bottom: 0; margin-right: 12px; }
+:deep(.el-input__wrapper),
+:deep(.el-select__wrapper) {
+  background: $bg-card;
+  box-shadow: none;
+  border-radius: $border-radius;
+  transition: all $transition-base;
+  &:hover { box-shadow: 0 0 0 1px $brand-primary-100; }
+  &.is-focus { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10); }
 }
 
-.pagination-container {
+.zv-host-cell-mini { line-height: 1.3; }
+.zv-host-name { font-size: 13px; font-weight: 600; color: $text-primary; }
+.zv-host-ip { display: block; font-size: 11px; color: $text-tertiary; font-family: $font-mono; margin-top: 2px; }
+.zv-mono { font-family: $font-mono; font-size: 12px; color: $text-secondary; }
+
+.zv-pagination {
+  padding: 16px 22px;
   display: flex;
   justify-content: flex-end;
-  margin-top: 20px;
+  border-top: 1px solid $border-color-light;
 }
 
-.detail-card {
-  margin-top: 16px;
+.zv-log-detail {
+  padding: 0 20px;
 }
 
-.detail-text,
-.code-block {
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin: 0;
-  font-family: Consolas, 'Courier New', monospace;
-  line-height: 1.6;
+.zv-detail-row {
+  display: flex;
+  padding: 12px 0;
+  border-bottom: 1px solid $border-color-light;
+  gap: 16px;
+
+  &.zv-detail-full { flex-direction: column; }
 }
 
-.code-block {
-  background: #0f172a;
-  color: #e2e8f0;
-  border-radius: 10px;
-  padding: 14px;
-  overflow: auto;
+.zv-label {
+  font-size: 12px;
+  color: $text-tertiary;
+  width: 60px;
+  flex-shrink: 0;
 }
 
-.error-block {
-  color: #fecaca;
+.zv-pre {
+  background: $slate-50;
+  padding: 12px;
+  border-radius: $border-radius;
+  font-family: $font-mono;
+  font-size: 12px;
+  color: $text-primary;
+  margin-top: 8px;
+  overflow-x: auto;
 }
 
-@media (max-width: 768px) {
-  .log-page {
-    padding: 12px;
+:deep(.el-table) {
+  --el-table-header-bg-color: #fafbfc;
+  th.el-table__cell {
+    background: #fafbfc;
+    color: $text-secondary;
+    font-weight: 600;
+    font-size: 12px;
   }
-
-  .toolbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .toolbar-actions {
-    justify-content: flex-end;
-  }
+  tr:hover > td.el-table__cell { background: rgba(37, 99, 235, 0.03) !important; }
+  td.el-table__cell { border-bottom: 1px solid $slate-100 !important; }
+  .el-table__inner-wrapper::before { height: 0; }
 }
 </style>

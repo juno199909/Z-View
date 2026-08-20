@@ -38,13 +38,34 @@ class CoordinateMapper:
             getattr(self, "primary_width", None),
             getattr(self, "primary_height", None),
         )
-        self.virtual_screen_x = self.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-        self.virtual_screen_y = self.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-        self.virtual_screen_width = self.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-        self.virtual_screen_height = self.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        # 线程级强制 Per-Monitor v2 上下文：进程 DPI 感知可能被其他组件抢先设置成
+        # 不感知/系统感知，导致本线程读到 1536x864 一类虚拟化度量；线程上下文
+        # 优先级最高且不可被否决，读取完毕后恢复原上下文。
+        set_thread_context = getattr(
+            self.user32, "SetThreadDpiAwarenessContext", None
+        )
+        old_context = None
+        if callable(set_thread_context):
+            try:
+                set_thread_context.argtypes = [ctypes.c_void_p]
+                set_thread_context.restype = ctypes.c_void_p
+                old_context = set_thread_context(ctypes.c_void_p(-4))
+            except Exception:
+                old_context = None
+        try:
+            self.virtual_screen_x = self.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            self.virtual_screen_y = self.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            self.virtual_screen_width = self.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            self.virtual_screen_height = self.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
 
-        self.primary_width = self.user32.GetSystemMetrics(0)  # SM_CXSCREEN
-        self.primary_height = self.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+            self.primary_width = self.user32.GetSystemMetrics(0)  # SM_CXSCREEN
+            self.primary_height = self.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+        finally:
+            if old_context is not None:
+                try:
+                    set_thread_context(old_context)
+                except Exception:
+                    pass
 
         current_metrics = (
             self.virtual_screen_x,
@@ -85,6 +106,10 @@ class CoordinateMapper:
         """
         将归一化坐标 (0.0-1.0) 转换为被控端屏幕坐标
 
+        与前端 normalize 约定一致：normalized 按位图全宽/全高计算，
+        解算时同样按全尺寸比例四舍五入（int 截断会产生 ≤1px 的左/上系统性偏移），
+        并与 InputInjector._denormalize_to_virtual_desktop 保持同一换算。
+
         参数:
             normalized_x, normalized_y: 归一化坐标 (0.0-1.0)
 
@@ -92,8 +117,8 @@ class CoordinateMapper:
             (screen_x, screen_y): 被控端屏幕绝对坐标
         """
         # 转换为虚拟屏幕坐标
-        screen_x = int(normalized_x * self.virtual_screen_width + self.virtual_screen_x)
-        screen_y = int(normalized_y * self.virtual_screen_height + self.virtual_screen_y)
+        screen_x = int(round(normalized_x * self.virtual_screen_width)) + self.virtual_screen_x
+        screen_y = int(round(normalized_y * self.virtual_screen_height)) + self.virtual_screen_y
 
         # 边界检查
         max_x = self.virtual_screen_x + self.virtual_screen_width - 1

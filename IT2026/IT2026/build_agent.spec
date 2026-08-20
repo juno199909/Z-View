@@ -118,6 +118,7 @@ hiddenimports = sorted(
         + _safe_collect_submodules("PIL")
         + _safe_collect_submodules("dxcam")
         + _safe_collect_submodules("mss")
+        + _safe_collect_submodules("av")
         + _safe_collect_submodules("comtypes")
         + _safe_collect_submodules("numpy")
         + _safe_collect_submodules("Common")
@@ -132,7 +133,9 @@ hiddenimports = sorted(
         + [
             "agent_consent_ipc",
             "auth_utils",
+            "cmdb_agent_core",
             "cmdb_agent_consent_ui",
+            "network_monitor",
             "comtypes",
             "console_utils",
             "coordinate_mapper",
@@ -150,6 +153,7 @@ hiddenimports = sorted(
             "pyrect",
             "remote_desktop_engine_v2",
             "remote_desktop_protocol",
+            "security_manager",
             "requests",
             "psutil",
             "servicemanager",
@@ -164,9 +168,11 @@ hiddenimports = sorted(
             "win32security",
             "win32service",
             "win32serviceutil",
+            "pythoncom",
             "win32timezone",
             "win32ts",
             "winreg",
+            "websockets",
         ]
         + sum((_safe_collect_importable_module(module_name) for module_name in _WGC_OPTIONAL_MODULES), [])
     )
@@ -187,13 +193,14 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# V1.6.0：onefile → onedir。onefile 每次进程启动解压 ~140MB 到 %TEMP%\_MEI，
+# 异常退出即泄漏（2026-09-09 升级风暴 44GB 事故根源）；onedir 直接从
+# versions\<ver>\ 目录运行，多进程共享同一份程序文件，无解压、秒启。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="Z-View",
     icon=executable_icon,
     debug=False,
@@ -202,4 +209,14 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="Z-View",
 )

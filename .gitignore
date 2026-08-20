@@ -38,3 +38,31 @@ IT2026/IT2026/**/__pycache__/
 IT2026/IT2026/**/*.py[cod]
 IT2026/IT2026/**/*.log
 IT2026/IT2026/**/*.err.log
+
+# P0-1 整改：运行时密钥与部署配置不入库（原规则路径多一层未匹配）
+IT2026/.env
+IT2026/.env.local
+IT2026/config.json
+IT2026/config.local.json
+IT2026/IT2026/.env
+IT2026/IT2026/config.json
+IT2026/GPO部署包/config.json
+*.secret
+IT2026/IT2026/agent_upgrade/
+
+# Code signing private key (P0-05) - never commit
+IT2026/IT2026/IT2026/signing/
+
+
+# Agent 构建产物与发布包（V1.6.0 onedir 流程，二进制不入库）
+IT2026/dist_agent/
+IT2026/dist_agent_onefile/
+IT2026/dist_updater/
+IT2026/build_agent_work/
+IT2026/build_updater_work/
+IT2026/releases/
+IT2026/agent_upgrade/
+
+# 本地临时测试/运维脚本（含敏感 token，不入库）
+IT2026/kilo_tmp/
+kilo_tmp/

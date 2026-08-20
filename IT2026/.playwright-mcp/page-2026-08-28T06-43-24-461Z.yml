@@ -1,0 +1,152 @@
+- generic [ref=f31e4]:
+  - complementary [ref=f31e5]:
+    - generic [ref=f31e11]:
+      - generic [ref=f31e12]: Z-View
+      - generic [ref=f31e13]: 终端运维平台
+    - menubar [ref=f31e17]:
+      - menuitem "仪表板" [ref=f31e18] [cursor=pointer]
+      - menuitem "终端概览" [ref=f31e25] [cursor=pointer]
+      - menuitem "资产分组" [ref=f31e30] [cursor=pointer]
+      - menuitem "资产列表" [ref=f31e35] [cursor=pointer]
+      - menuitem "软件管理" [ref=f31e42] [cursor=pointer]
+      - menuitem "告警中心" [ref=f31e47] [cursor=pointer]
+      - menuitem "日志中心" [ref=f31e54] [cursor=pointer]
+      - menuitem "批量操作" [ref=f31e59] [cursor=pointer]
+      - menuitem "资产发现" [ref=f31e64] [cursor=pointer]
+      - menuitem "终端策略" [ref=f31e69] [cursor=pointer]
+    - generic [ref=f31e74] [cursor=pointer]: 收起菜单
+  - generic [ref=f31e79]:
+    - banner [ref=f31e80]:
+      - navigation "面包屑" [ref=f31e83]:
+        - link "Z-View" [ref=f31e85]
+      - generic [ref=f31e92]:
+        - generic [ref=f31e93] [cursor=pointer]
+        - generic [ref=f31e97] [cursor=pointer]
+        - generic [ref=f31e101] [cursor=pointer]
+        - button "A admin 系统管理员" [ref=f31e107] [cursor=pointer]:
+          - generic [ref=f31e108]: A
+          - generic [ref=f31e109]:
+            - generic [ref=f31e110]: admin
+            - generic [ref=f31e111]: 系统管理员
+    - main [ref=f31e115]:
+      - generic [ref=f31e116]:
+        - generic [ref=f31e117]:
+          - generic [ref=f31e118]:
+            - heading "资产列表" [level=2] [ref=f31e119]
+            - generic [ref=f31e120]: 共 2 台设备 · 在线 2 台
+          - generic [ref=f31e121]:
+            - button "导出" [ref=f31e122] [cursor=pointer]
+            - button "新增资产" [ref=f31e127] [cursor=pointer]
+        - generic [ref=f31e133]:
+          - generic [ref=f31e134]:
+            - generic [ref=f31e135]: 资产类型
+            - generic [ref=f31e138] [cursor=pointer]:
+              - generic:
+                - combobox "资产类型" [ref=f31e140]
+                - generic [ref=f31e141]: 全部
+          - generic [ref=f31e146]:
+            - generic [ref=f31e147]: 运行状态
+            - generic [ref=f31e150] [cursor=pointer]:
+              - generic:
+                - combobox "运行状态" [ref=f31e152]
+                - generic [ref=f31e153]: 全部
+          - generic [ref=f31e158]:
+            - generic [ref=f31e159]: 所属分组
+            - generic [ref=f31e162]:
+              - generic [ref=f31e163]:
+                - combobox "所属分组" [ref=f31e165]
+                - generic [ref=f31e166]: 全部
+              - generic [ref=f31e168] [cursor=pointer]
+          - generic [ref=f31e171]:
+            - generic [ref=f31e172]: 关键字
+            - textbox "关键字" [ref=f31e176]:
+              - /placeholder: 主机名 / IP / MAC
+          - generic [ref=f31e179]:
+            - button "查询" [ref=f31e180] [cursor=pointer]
+            - button "重置" [ref=f31e185] [cursor=pointer]
+        - generic [ref=f31e190]:
+          - generic [ref=f31e191]:
+            - generic [ref=f31e192]: 双击行查看详情
+            - generic [ref=f31e197]:
+              - button "批量删除" [disabled] [ref=f31e198]
+              - button [ref=f31e203] [cursor=pointer]
+          - generic [ref=f31e208]:
+            - table [ref=f31e210]:
+              - rowgroup [ref=f31e221]:
+                - row [ref=f31e222]:
+                  - columnheader [ref=f31e223]:
+                    - generic "选择所有行" [ref=f31e225] [cursor=pointer]:
+                      - generic [ref=f31e226]:
+                        - checkbox "选择所有行"
+                  - columnheader "主机名" [ref=f31e228]
+                  - columnheader "MAC" [ref=f31e230]
+                  - columnheader "类型" [ref=f31e232]
+                  - columnheader "分组" [ref=f31e234]
+                  - columnheader "状态" [ref=f31e236]
+                  - columnheader "位置" [ref=f31e238]
+                  - columnheader "最后在线" [ref=f31e240]
+                  - columnheader "操作" [ref=f31e242]
+            - generic [ref=f31e245]:
+              - table [ref=f31e248]:
+                - rowgroup [ref=f31e259]:
+                  - row [ref=f31e260] [cursor=pointer]:
+                    - cell [ref=f31e261]:
+                      - generic "选择当前行" [ref=f31e263]:
+                        - generic [ref=f31e264]:
+                          - checkbox "选择当前行"
+                    - cell "DESKTOP-JEGI046 172.16.250.84" [ref=f31e266]:
+                      - generic [ref=f31e273]:
+                        - generic [ref=f31e274]: DESKTOP-JEGI046
+                        - generic [ref=f31e275]: 172.16.250.84
+                    - cell "00-50-56-8E-27-42" [ref=f31e276]
+                    - cell "PC 终端" [ref=f31e278]
+                    - cell "未分组" [ref=f31e282]:
+                      - generic [ref=f31e286]:
+                        - combobox [ref=f31e288]
+                        - generic [ref=f31e289]: 未分组
+                    - cell "在线" [ref=f31e294]
+                    - cell [ref=f31e298]
+                    - cell "2026-08-28 14:42:18" [ref=f31e299]
+                    - cell [ref=f31e301]:
+                      - generic [ref=f31e302]:
+                        - button "详情" [active] [ref=f31e303]
+                        - button "编辑" [ref=f31e308]
+                        - button "删除" [ref=f31e314]
+                  - row [ref=f31e319] [cursor=pointer]:
+                    - cell [ref=f31e320]:
+                      - generic "选择当前行" [ref=f31e322]:
+                        - generic [ref=f31e323]:
+                          - checkbox "选择当前行"
+                    - cell "XXH-XXX 172.16.250.120" [ref=f31e325]:
+                      - generic [ref=f31e332]:
+                        - generic [ref=f31e333]: XXH-XXX
+                        - generic [ref=f31e334]: 172.16.250.120
+                    - cell "00-50-56-8E-7A-7C" [ref=f31e335]
+                    - cell "PC 终端" [ref=f31e337]
+                    - cell "未分组" [ref=f31e341]:
+                      - generic [ref=f31e345]:
+                        - combobox [ref=f31e347]
+                        - generic [ref=f31e348]: 未分组
+                    - cell "在线" [ref=f31e353]
+                    - cell [ref=f31e357]
+                    - cell "2026-08-28 14:42:27" [ref=f31e358]
+                    - cell [ref=f31e360]:
+                      - generic [ref=f31e361]:
+                        - button "详情" [ref=f31e362]
+                        - button "编辑" [ref=f31e367]
+                        - button "删除" [ref=f31e373]
+              - generic [ref=f31e402] [cursor=pointer]
+          - generic [ref=f31e379]:
+            - generic [ref=f31e380]: 共 2 条
+            - generic [ref=f31e383] [cursor=pointer]:
+              - generic:
+                - combobox [ref=f31e385]
+                - generic [ref=f31e386]: 20条/页
+            - button "上一页" [disabled] [ref=f31e391]
+            - list [ref=f31e392]:
+              - listitem "第 1 页" [ref=f31e393]: "1"
+            - button "下一页" [disabled] [ref=f31e394]
+            - generic [ref=f31e395]:
+              - generic [ref=f31e396]: 前往
+              - spinbutton "页" [ref=f31e399]: "1"
+              - generic [ref=f31e400]: 页

@@ -1672,7 +1672,15 @@ class InputDesktopController:
         return session_id
 
     def _same_handle(self, left_handle, right_handle) -> bool:
-        return self._get_handle_value(left_handle) == self._get_handle_value(right_handle)
+        if self._get_handle_value(left_handle) == self._get_handle_value(right_handle):
+            return True
+        # OpenInputDesktop/GetThreadDesktop 每次返回不同的句柄值，
+        # 同一桌面的句柄值并不相等——必须按桌面名比较。
+        left_name = self._get_desktop_name(left_handle)
+        right_name = self._get_desktop_name(right_handle)
+        if left_name and right_name:
+            return self._normalize_name(left_name) == self._normalize_name(right_name)
+        return False
 
     def _build_handle_scope_signature(
         self,

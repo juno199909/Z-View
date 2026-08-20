@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -102,6 +103,16 @@ class DisplayPresenceProbe:
                 return dict(self._inventory_cache)
 
             inventory = self._probe_display_inventory()
+            # ZVIEW_DISABLE_VIRTUAL_DISPLAY=1：信任现有物理显示器可捕获。
+            # 服务进程(Session 0)枚举 DISPLAY_DEVICE_ACTIVE 对 console 显示器可能为
+            # False（会话相关视图），导致全链路误判 headless 并阻塞捕获。
+            import os as _os
+            if _os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True"):
+                if not inventory.get("physical_display_attached"):
+                    inventory["physical_display_attached"] = True
+                    inventory["skipped_by_env"] = True
+                    if not int(inventory.get("attached_display_count") or 0):
+                        inventory["attached_display_count"] = 1
             self._inventory_cache = dict(inventory)
             self._inventory_cache_at = now
             return dict(inventory)
@@ -187,6 +198,9 @@ class DisplayPresenceProbe:
             state.get("capture_target_is_remote_session"),
             bool(getattr(descriptor, "is_remote_session", False)),
         )
+        # VMware/RDP环境禁用虚拟显示器开关：影响RDP session persistent判定 + Console不假装有虚拟显示面
+        _vd_disabled = os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True")
+        _rdp_rank_override = None
         is_console_session = self._coerce_bool(
             state.get("capture_target_is_console_session"),
             bool(getattr(descriptor, "is_console_session", False)),
@@ -226,11 +240,14 @@ class DisplayPresenceProbe:
         elif is_remote_session:
             substrate_class = "remote_session_surface"
             continuity_mode = "best_effort_remote"
-            persistent = False
-            best_effort_only = True
+            # RDP会话在禁用虚拟显示器环境下视为持久（VMware/RDP环境唯一可抓桌面）
+            persistent = bool(_vd_disabled)
+            best_effort_only = not _vd_disabled
             remote_display_surface = True
             secure_desktop_surface = False
-            requires_virtual_display = not (physical_display_attached or virtual_display_attached)
+            requires_virtual_display = False if _vd_disabled else (not (physical_display_attached or virtual_display_attached))
+            # RDP persistent 时给更好的 rank（比 console_headless=4 更优先）
+            _rdp_rank_override = 0 if _vd_disabled else None
         elif is_console_session and is_secure_desktop and (physical_display_attached or virtual_display_attached):
             substrate_class = "secure_console_surface"
             continuity_mode = "secure_console_persistent"
@@ -245,7 +262,7 @@ class DisplayPresenceProbe:
             best_effort_only = False
             remote_display_surface = False
             secure_desktop_surface = False
-        elif is_console_session and virtual_display_attached:
+        elif is_console_session and virtual_display_attached and not _vd_disabled:
             substrate_class = "virtual_display_surface"
             continuity_mode = "virtual_console_persistent"
             persistent = True
@@ -311,7 +328,7 @@ class DisplayPresenceProbe:
             render_monitor_count=render_monitor_count,
             attached_display_count=attached_display_count,
             requires_virtual_display_for_full_continuity=bool(requires_virtual_display),
-            rank_hint=rank_map.get(substrate_class, 99),
+            rank_hint=(_rdp_rank_override if _rdp_rank_override is not None else rank_map.get(substrate_class, 99)),
             notes=notes,
         )
 

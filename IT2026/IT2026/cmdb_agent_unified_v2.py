@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import ctypes
 import csv
+import importlib
 from ctypes import wintypes
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
@@ -126,6 +127,18 @@ WTS_DOMAIN_NAME = 7
 
 @lru_cache(maxsize=1)
 def load_core_module():
+    bundled_import_error = None
+    try:
+        bundled_module = importlib.import_module("cmdb_agent_core")
+        if hasattr(bundled_module, "CONFIG") and hasattr(bundled_module, "SOFTWARE_CONFIG"):
+            return bundled_module
+        bundled_import_error = ImportError("Bundled cmdb_agent_core is missing required configuration attributes")
+    except Exception as exc:
+        bundled_import_error = exc
+
+    if getattr(sys, "frozen", False):
+        raise ImportError("Unable to load bundled cmdb_agent_core") from bundled_import_error
+
     core_module_path = next((candidate for candidate in _CORE_MODULE_CANDIDATES if candidate.exists()), None)
     if core_module_path is None:
         candidate_text = ", ".join(str(candidate) for candidate in _CORE_MODULE_CANDIDATES)
@@ -202,7 +215,299 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="install self to Program Files and register/start the CMDB-Agent service (idempotent)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--server-url",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--migrate-from",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--migrate-to",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     return parser
+
+
+def run_self_install(quiet: bool = False, server_url: str = "",
+                     migrate_from: str = "", migrate_to: str = "") -> int:
+    """自安装：把当前程序部署到 Program Files\\CMDB-Agent 并注册/启动服务（幂等）。
+
+    部署三件套（P1-04）之静默安装：网页自助下载后运行、批处理/域开机脚本、
+    三方桌管推送统一走本入口：
+        Z-View.exe --install --quiet --server-url http://center:8080
+
+    双布局自适应：
+    - onedir（exe 旁有 _internal，V1.6.0+）：部署到 versions\\<ver>\\，
+      创建 current junction，服务指向 current\\Z-View.exe，升级只翻 junction；
+    - 单文件（旧版 exe）：沿用旧布局（兼容存量终端）。
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    def _say(message: str):
+        if not quiet:
+            print(message)
+        log_runtime_event("SelfInstall", message)
+
+    def _migration_state(stage: str, reason: str = "") -> None:
+        """迁移场景写入升级终态，服务端经心跳感知（P0-06 审计）。"""
+        if not (migrate_from and migrate_to):
+            return
+        try:
+            import cmdb_agent_layout as _layout_state
+            path = _layout_state.UPGRADE_STATE_PATH
+            state = {}
+            if path.exists():
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    state = {}
+            state.update({"stage": stage, "from_version": migrate_from,
+                          "to_version": migrate_to,
+                          "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+            if reason:
+                state["failure_reason"] = reason[:300]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    if os.name != "nt":
+        _say("self install requires Windows")
+        return 1
+    if not getattr(sys, "frozen", False):
+        _say("self install requires the packaged exe (frozen build)")
+        return 1
+
+    creation_flags = getattr(_subprocess, "CREATE_NO_WINDOW", 0)
+    service_name = "CMDB-Agent"
+    program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    vroot = Path(program_files) / "CMDB-Agent"
+    source_exe = Path(sys.executable).resolve()
+    source_dir = source_exe.parent
+    is_onedir = (source_dir / "_internal").is_dir()
+
+    def _run(cmd: list[str]) -> int:
+        completed = _subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            creationflags=creation_flags,
+            timeout=120,
+        )
+        return completed.returncode
+
+    def _write_program_data_config() -> bool:
+        try:
+            config_dir = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "config"
+            config_path = config_dir / "config.local.json"
+            existing = {}
+            if config_path.exists():
+                try:
+                    existing = json.loads(config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
+            # V1.6.0 修复：合并构建内置 config.json（token/intervals/远控配置），
+            # 否则安装器写入的 server_url-only 配置会丢 token（updater 401、远控配置回默认）
+            bundled_names = (["_internal/config.json"] if is_onedir else ["config.json"])
+            for name in bundled_names:
+                bundled = source_dir / name
+                if bundled.exists():
+                    try:
+                        bundled_cfg = json.loads(bundled.read_text(encoding="utf-8"))
+                        if isinstance(bundled_cfg, dict):
+                            for key, value in bundled_cfg.items():
+                                existing.setdefault(key, value)
+                    except Exception:
+                        pass
+            if server_url:
+                existing["server_url"] = server_url
+                existing["software_server_url"] = server_url.replace(":8080", ":8081")
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps(existing, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _say(f"config written: {config_path}")
+            return True
+        except Exception as exc:
+            _say(f"write config failed: {exc}")
+            return False
+
+    _say(f"install layout: {'onedir' if is_onedir else 'single-file'}")
+    _migration_state("MIGRATING")
+
+    if is_onedir:
+        import cmdb_agent_layout as _layout
+
+        try:
+            import cmdb_agent_core as _core
+            agent_version = str(_core.AGENT_VERSION)
+        except Exception:
+            version_note = source_dir / "version.txt"
+            agent_version = version_note.read_text(encoding="utf-8").strip() if version_note.exists() else "0.0.0"
+
+        version_target = _layout.version_dir(agent_version)
+        _say(f"install target: {version_target}")
+
+        # 1. 复制程序目录（exe + _internal + version.txt），运行中的文件锁跳过
+        try:
+            version_target.mkdir(parents=True, exist_ok=True)
+            for item in source_dir.iterdir():
+                if item.name in ("config.local.json", "zv-credential.json"):
+                    continue
+                dest = version_target / item.name
+                try:
+                    if item.is_dir():
+                        if dest.exists():
+                            _shutil.rmtree(dest, ignore_errors=True)
+                        _shutil.copytree(item, dest)
+                    else:
+                        _shutil.copy2(item, dest)
+                except PermissionError:
+                    _say(f"locked file skipped (running?): {item.name}")
+        except Exception as exc:
+            _say(f"copy program files failed: {exc}")
+            _migration_state("FAILED", f"copy program files failed: {exc}")
+            return 1
+
+        # 2. updater 就位
+        try:
+            package_updater = source_dir / "updater" / "ZViewUpdater.exe"
+            if package_updater.exists():
+                _layout.UPDATER_DIR.mkdir(parents=True, exist_ok=True)
+                _shutil.copy2(package_updater, _layout.UPDATER_DIR / "ZViewUpdater.exe")
+        except Exception as exc:
+            _say(f"updater copy skipped: {exc}")
+
+        # 3. 配置写入 ProgramData
+        if not _write_program_data_config():
+            _migration_state("FAILED", "write programdata config failed")
+            return 1
+
+        # 4. current junction
+        if _layout.CURRENT_LINK.exists() or _layout.CURRENT_LINK.is_symlink():
+            _run(["cmd", "/c", "rmdir", str(_layout.CURRENT_LINK)])
+        if _run(["cmd", "/c", "mklink", "/J",
+                 str(_layout.CURRENT_LINK), str(version_target)]) != 0:
+            _say("mklink /J current failed")
+            _migration_state("FAILED", "mklink current failed")
+            return 1
+        _layout.write_current_version(agent_version)
+
+        # 5. 服务处理：迁移场景旧服务可能正在运行 —— 先停、清残留、改 binPath、再启
+        was_running = _run(["sc", "query", service_name]) == 0
+        if was_running:
+            _run(["net", "stop", service_name])
+            self_pid = os.getpid()
+            _run(["taskkill", "/F", "/IM", "Z-View.exe", "/FI", f"PID ne {self_pid}"])
+            time.sleep(2)
+
+        bin_path = f'"{_layout.CURRENT_LINK / "Z-View.exe"}" --service-host'
+        query_rc = _run(["sc", "query", service_name])
+        if query_rc == 1060:
+            _say("creating service...")
+            rc = _run([
+                "sc", "create", service_name,
+                "binPath=", bin_path,
+                "start=", "auto",
+                "obj=", "LocalSystem",
+                "DisplayName=", "Z-View Agent",
+            ])
+        else:
+            _say("service exists; updating config...")
+            rc = _run(["sc", "config", service_name, "binPath=", bin_path, "start=", "auto"])
+        if rc != 0:
+            _say(f"service register failed: rc={rc}")
+            _migration_state("FAILED", f"service register failed rc={rc}")
+            return 1
+
+        _run(["sc", "failure", service_name, "reset=", "86400", "actions=", "restart/60000"])
+        _run(["reg", "add",
+              rf"HKLM\SYSTEM\CurrentControlSet\Services\{service_name}",
+              "/v", "DelayedAutostart", "/t", "REG_DWORD", "/d", "1", "/f"])
+
+        start_rc = _run(["sc", "start", service_name])
+        if start_rc not in (0, 1056):
+            _say(f"sc start failed: rc={start_rc}")
+            _migration_state("FAILED", f"service start failed rc={start_rc}")
+            return 1
+        _migration_state("COMMITTED")
+        _say(f"Z-View Agent {agent_version} installed (onedir) and started.")
+        return 0
+
+    # ---- 旧版单文件布局（兼容存量）----
+    target_dir = vroot
+    target_exe = target_dir / "Z-View.exe"
+    _say(f"install target: {target_exe}")
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if source_exe != target_exe:
+            if target_exe.exists():
+                try:
+                    if target_exe.stat().st_size == source_exe.stat().st_size:
+                        _say("same-version exe already in place; skip copy")
+                    else:
+                        _shutil.copy2(source_exe, target_exe)
+                except PermissionError:
+                    _say("target exe locked (service running); keep existing file")
+            else:
+                _shutil.copy2(source_exe, target_exe)
+    except Exception as exc:
+        _say(f"copy exe failed: {exc}")
+        return 1
+
+    if not _write_program_data_config():
+        return 1
+
+    bin_path = f'"{target_exe}" --service-host'
+    query_rc = _run(["sc", "query", service_name])
+    if query_rc == 1060:
+        _say("creating service...")
+        rc = _run([
+            "sc", "create", service_name,
+            "binPath=", bin_path,
+            "start=", "auto",
+            "obj=", "LocalSystem",
+            "DisplayName=", "Z-View Agent",
+        ])
+        if rc != 0:
+            _say(f"sc create failed: rc={rc}")
+            return 1
+    else:
+        _say("service exists; updating config...")
+        rc = _run(["sc", "config", service_name, "binPath=", bin_path, "start=", "auto"])
+        if rc != 0:
+            _say(f"sc config failed: rc={rc}")
+            return 1
+
+    _run(["sc", "failure", service_name, "reset=", "86400", "actions=", "restart/60000"])
+    _run(["reg", "add",
+          rf"HKLM\SYSTEM\CurrentControlSet\Services\{service_name}",
+          "/v", "DelayedAutostart", "/t", "REG_DWORD", "/d", "1", "/f"])
+
+    if _run(["sc", "query", service_name]) != 0:
+        start_rc = _run(["sc", "start", service_name])
+        if start_rc not in (0, 1056):
+            _say(f"sc start failed: rc={start_rc}")
+            return 1
+    _say("Z-View Agent installed and started.")
+    return 0
 
 
 def keep_worker_alive():
@@ -240,6 +545,22 @@ def append_runtime_log(component: str, message: str):
             file.write(line + "\n")
     except Exception:
         pass
+
+
+def _open_worker_log():
+    """打开 worker 日志文件（追加模式，>10MB 轮转为 .old）。"""
+
+    log_path = _RUNTIME_LOG_FILE.parent / "agent-worker.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > 10 * 1024 * 1024:
+            old_path = log_path.with_suffix(".old.log")
+            if old_path.exists():
+                old_path.unlink()
+            log_path.rename(old_path)
+        return open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+    except Exception:
+        return subprocess.DEVNULL
 
 
 def log_runtime_event(component: str, message: str):
@@ -437,34 +758,72 @@ def list_frozen_executable_processes() -> list[dict[str, int | str]]:
     return processes
 
 
+from typing import Any
+
+_ZVIEW_CMDLINE_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _get_zview_process_command_lines() -> dict[int, tuple[int, str]]:
+    """返回 {pid: (session_id, command_line)}，带短 TTL 缓存。"""
+    now = time.time()
+    if now - float(_ZVIEW_CMDLINE_CACHE.get("at") or 0.0) < 5.0:
+        cached = _ZVIEW_CMDLINE_CACHE.get("data") or {}
+        return dict(cached)
+
+    data: dict[int, tuple[int, str]] = {}
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='Z-View.exe'\" | "
+                "ForEach-Object { Write-Output ('{0}|{1}|{2}' -f $_.ProcessId, $_.SessionId, $_.CommandLine) }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        for line in (completed.stdout or "").splitlines():
+            parts = line.split("|", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0].strip())
+                process_session_id = int(parts[1].strip())
+            except ValueError:
+                continue
+            data[pid] = (process_session_id, parts[2])
+    except Exception:
+        pass
+
+    _ZVIEW_CMDLINE_CACHE["at"] = now
+    _ZVIEW_CMDLINE_CACHE["data"] = dict(data)
+    return dict(data)
+
+
 def list_user_session_agent_pids(session_id: int | None, exclude_pid: int | None = None) -> list[int]:
+    """按 --user-session-agent 命令行参数精确识别用户态代理进程。
+
+    不能按镜像名+会话枚举：helper/consent-ui 是同 exe 同会话的不同角色，
+    心跳文件又存在启动初期的空窗，误判会让 supervisor 认为代理已在运行
+    而永远不拉起（重启后 user-session-agent 缺失的直接原因）。
+    """
     if session_id is None:
         return []
 
-    pid_set: set[int] = set()
-    for item in list_frozen_executable_processes():
-        pid = int(item.get("pid") or 0)
-        process_session_id = int(item.get("session_id") or -1)
-        if pid <= 0 or process_session_id != int(session_id):
+    pids: set[int] = set()
+    for pid, (process_session_id, command_line) in _get_zview_process_command_lines().items():
+        if process_session_id != int(session_id):
             continue
-        if exclude_pid is not None and pid == exclude_pid:
-            continue
-        pid_set.add(pid)
+        if "--user-session-agent" in (command_line or ""):
+            pids.add(pid)
 
-    consent_ui_payload = read_role_runtime_state(
-        "consent-ui",
-        session_bound=True,
-        session_id=session_id,
-    ) or {}
-    consent_ui_pid = int(consent_ui_payload.get("pid") or 0)
-    if consent_ui_pid > 0 and has_recent_role_runtime_state(
-        "consent-ui",
-        session_bound=True,
-        session_id=session_id,
-    ):
-        pid_set.discard(consent_ui_pid)
+    if exclude_pid is not None:
+        pids.discard(int(exclude_pid))
 
-    return sorted(pid_set)
+    return sorted(pids)
 
 
 def list_role_runtime_pids(
@@ -816,17 +1175,27 @@ def get_interactive_session_ids() -> list[int]:
                 continue
 
             session_id = int(session_info.SessionId)
+            identity = _query_session_identity(session_id)
+            if not identity:
+                # No user identity — skip (Services / headless console etc.)
+                continue
             if session_info.State == WTS_ACTIVE:
-                if _query_session_identity(session_id):
-                    active_sessions_with_user.append(session_id)
-                else:
-                    active_sessions_without_user.append(session_id)
+                active_sessions_with_user.append(session_id)
             elif session_info.State == WTS_CONNECTED:
-                if _query_session_identity(session_id):
-                    connected_sessions_with_user.append(session_id)
+                connected_sessions_with_user.append(session_id)
+            else:
+                # Disconnected / Idle / etc. — keep the session as long as it
+                # has a user identity, so RDP-target consoles still have a
+                # place to host the user-session agent.
+                connected_sessions_with_user.append(session_id)
 
         ordered_sessions: list[int] = []
-        if preferred_console is not None and preferred_console in active_sessions_with_user:
+        # On Windows server / headless / VMware console, the console session
+        # often has no logged-on user identity (e.g. RDP-target console).
+        # Always try the active console first regardless of identity, so the
+        # supervisor can still launch the user-session agent there. Fall
+        # back to sessions with a real interactive user afterwards.
+        if preferred_console is not None:
             ordered_sessions.append(preferred_console)
 
         for session_id in active_sessions_with_user + connected_sessions_with_user:
@@ -918,7 +1287,6 @@ def launch_user_session_agent_for_session(session_id: int) -> bool:
         import win32con
         import win32process
         import win32profile
-        import win32security
         import win32ts
 
         log_runtime_event(
@@ -1266,7 +1634,33 @@ def start_user_session_supervisor():
                         if primary_session_id is None:
                             continue
 
-                        if session_id != primary_session_id:
+                        # Only treat a session as "stray" if the primary has a
+                        # confirmed, recently-beating user-session agent.
+                        # Otherwise the primary is probably a headless / no-user
+                        # console (VMware, RDP-target console) and the RDP
+                        # session with a real interactive user is the
+                        # authoritative host. Letting it run avoids killing
+                        # the only working session.
+                        primary_alive = False
+                        primary_hb = read_role_runtime_state(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        ) or {}
+                        primary_pids = list_user_session_agent_pids(primary_session_id)
+                        primary_heartbeat_recent = has_recent_role_runtime_state(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        )
+                        primary_mutex = is_role_mutex_active(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        )
+                        primary_alive = bool(primary_heartbeat_recent and (primary_mutex or primary_pids))
+
+                        if session_id != primary_session_id and primary_alive:
                             stray_pids: list[int] = []
                             candidate_pids = {
                                 int(pid)
@@ -1324,7 +1718,11 @@ def start_user_session_supervisor():
     thread.start()
 
 
-def run_agent_service(enable_remote_desktop: bool = True, disable_session_supervisor: bool = False):
+def run_agent_service(
+    enable_remote_desktop: bool = True,
+    disable_session_supervisor: bool = False,
+    start_consent_ui: bool = False,
+):
     module = load_core_module()
     config = module.CONFIG
     software_config = module.SOFTWARE_CONFIG
@@ -1348,7 +1746,8 @@ def run_agent_service(enable_remote_desktop: bool = True, disable_session_superv
         if asset_id:
             print(f"[Software] Step 3: Starting software management with asset_id={asset_id}")
             module.start_software_management(asset_id)
-            print("[Software] Step 4: Software management started successfully")
+            module.start_security_policy_sync(asset_id)
+            print("[Software] Step 4: Software management + security policy sync started")
         else:
             print("[Software] ERROR: Failed to get asset_id, software management disabled")
     except Exception as exc:
@@ -1359,9 +1758,14 @@ def run_agent_service(enable_remote_desktop: bool = True, disable_session_superv
     print("[Agent] Startup handoff to remote desktop server")
     if enable_remote_desktop:
         module.start_remote_desktop_server()
-        return
+        if start_consent_ui:
+            if launch_consent_ui_background():
+                log_runtime_event("ConsentUI", "background tray helper launched for direct agent startup")
+            else:
+                log_runtime_event("ConsentUI", "background tray helper failed to launch for direct agent startup")
+    else:
+        print("[Agent] Remote desktop server disabled for this role")
 
-    print("[Agent] Remote desktop server disabled for this role")
     if disable_session_supervisor:
         print("[Agent] Session supervisor delegated to service runtime")
     else:
@@ -1424,6 +1828,7 @@ def launch_consent_ui_background() -> bool:
             creation_flags = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
 
         process = subprocess.Popen(
@@ -1509,7 +1914,7 @@ def run_user_session_agent():
 
     runtime = RemoteDesktopUserAgentRuntime(
         session_id=session_id,
-        start_remote_desktop_server=module.start_remote_desktop_server,
+        start_remote_desktop_server=lambda: module.start_remote_desktop_server(wait=True),
         launch_consent_ui_background=launch_consent_ui_background,
         keepalive=keep_worker_alive,
         log_runtime_event=log_runtime_event,
@@ -1594,10 +1999,15 @@ def run_service_worker_loop(stop_event_handle, win32event):
                 command = build_agent_worker_command()
                 creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 print(f"[Service] Starting worker: {' '.join(command)}")
+                # P0-06/P1-03：worker stdout/stderr 重定向到文件（此前继承服务
+                # 进程无效句柄，心跳失败异常全部丢失，无法定位 worker 卡死）
+                worker_log_handle = _open_worker_log()
                 worker_process = subprocess.Popen(
                     command,
                     cwd=str(_APP_DIR),
                     creationflags=creation_flags,
+                    stdout=worker_log_handle,
+                    stderr=subprocess.STDOUT,
                 )
 
             wait_result = win32event.WaitForSingleObject(stop_event_handle, 5000)
@@ -1711,7 +2121,84 @@ def run_service_host():
     servicemanager.StartServiceCtrlDispatcher()
 
 
+def ensure_windows_dpi_awareness() -> bool:
+    """尽早将进程标记为 Per-Monitor DPI 感知。
+
+    远控的 screen_info 上报、坐标换算与抓屏区域全部依赖屏幕度量；进程若处于
+    DPI 不感知状态，在 125%/150% 缩放的会话里会读到 1536x864 一类虚拟化值，
+    造成远控画面被裁剪、画面内容与点击映射错位。必须在任何窗口或抓屏库
+    （tkinter、dxcam、pyautogui 等）初始化之前调用；若感知已被其他组件抢先
+    设置，本函数会静默失败并保持现有状态。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return True
+    except Exception:
+        pass
+    try:
+        user32 = getattr(ctypes.windll, "user32", None)
+        if user32 is not None and hasattr(user32, "SetProcessDPIAware"):
+            return bool(user32.SetProcessDPIAware())
+    except Exception:
+        pass
+    return False
+
+
+def cleanup_stale_mei_dirs(max_age_minutes: int = 30) -> int:
+    """自清前代已死进程遗留的 _MEI* 临时解压目录（2026-09-09 事故修复）。
+
+    onefile 进程每次启动解压 ~140MB 到 %TEMP%\\_MEI<rand>，正常退出时
+    bootloader 自删；被杀/崩溃/子进程仍存活时泄漏。升级风暴曾在 1.5h 内
+    泄漏 320 个目录（44GB）撑满 C 盘。每个进程启动时清理前代残留，
+    使堆积始终被钳制在"最近一轮"量级；存活进程的在用目录受文件锁
+    保护，删除失败静默跳过。
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return 0
+    import tempfile
+
+    own_meipass = str(getattr(sys, "_MEIPASS", "") or "")
+    temp_root = tempfile.gettempdir()
+    cutoff = time.time() - max_age_minutes * 60
+    removed = 0
+    try:
+        entries = list(os.scandir(temp_root))
+    except Exception:
+        return 0
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith("_MEI") and name[4:].isdigit()):
+            continue
+        try:
+            if own_meipass and os.path.samefile(entry.path, own_meipass):
+                continue
+        except Exception:
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            import shutil
+
+            shutil.rmtree(entry.path, ignore_errors=True)
+            removed += 1
+        except Exception:
+            continue
+    if removed:
+        log_runtime_event(
+            "MEICleanup",
+            f"removed {removed} stale _MEI dirs (age>{max_age_minutes}min)",
+        )
+    return removed
+
+
 def main(argv: list[str] | None = None):
+    ensure_windows_dpi_awareness()
+    try:
+        cleanup_stale_mei_dirs()
+    except Exception:
+        pass
     raw_args = list(sys.argv[1:] if argv is None else argv)
 
     if should_handle_service_command(raw_args):
@@ -1719,6 +2206,12 @@ def main(argv: list[str] | None = None):
         return
 
     args = build_arg_parser().parse_args(raw_args)
+
+    if args.install:
+        raise SystemExit(
+            run_self_install(quiet=args.quiet, server_url=args.server_url,
+                             migrate_from=args.migrate_from, migrate_to=args.migrate_to)
+        )
 
     if args.restart_user_session_agent:
         raise SystemExit(
@@ -1753,7 +2246,8 @@ def main(argv: list[str] | None = None):
 
     run_agent_service(
         enable_remote_desktop=not args.no_remote_desktop,
-        disable_session_supervisor=args.disable_session_supervisor,
+        disable_session_supervisor=True,
+        start_consent_ui=not args.no_remote_desktop,
     )
 
 

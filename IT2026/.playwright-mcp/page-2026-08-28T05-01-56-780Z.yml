@@ -1,0 +1,171 @@
+- generic [active] [ref=f4e1]:
+  - generic [ref=f4e62]:
+    - complementary [ref=f4e63]:
+      - generic [ref=f4e69]:
+        - generic [ref=f4e70]: Z-View
+        - generic [ref=f4e71]: 终端运维平台
+      - menubar [ref=f4e75]:
+        - menuitem "仪表板" [ref=f4e76] [cursor=pointer]
+        - menuitem "终端概览" [ref=f4e83] [cursor=pointer]
+        - menuitem "资产分组" [ref=f4e88] [cursor=pointer]
+        - menuitem "资产列表" [ref=f4e93] [cursor=pointer]
+        - menuitem "软件管理" [ref=f4e100] [cursor=pointer]
+        - menuitem "告警中心" [ref=f4e105] [cursor=pointer]
+        - menuitem "日志中心" [ref=f4e112] [cursor=pointer]
+        - menuitem "批量操作" [ref=f4e117] [cursor=pointer]
+        - menuitem "资产发现" [ref=f4e122] [cursor=pointer]
+        - menuitem "终端策略" [ref=f4e127] [cursor=pointer]
+      - generic [ref=f4e132] [cursor=pointer]: 收起菜单
+    - generic [ref=f4e137]:
+      - banner [ref=f4e138]:
+        - navigation "面包屑" [ref=f4e141]:
+          - generic [ref=f4e142]:
+            - link "Z-View" [ref=f4e143]
+            - text: ›
+          - link "仪表板" [ref=f4e147]
+        - generic [ref=f4e150]:
+          - generic [ref=f4e151] [cursor=pointer]
+          - generic [ref=f4e155] [cursor=pointer]
+          - generic [ref=f4e159] [cursor=pointer]
+          - button "A admin 系统管理员" [ref=f4e165] [cursor=pointer]:
+            - generic [ref=f4e166]: A
+            - generic [ref=f4e167]:
+              - generic [ref=f4e168]: admin
+              - generic [ref=f4e169]: 系统管理员
+      - main [ref=f4e173]:
+        - generic [ref=f4e174]:
+          - generic [ref=f4e175]:
+            - generic [ref=f4e176]:
+              - heading "中午好，admin 👋" [level=2] [ref=f4e177]
+              - paragraph [ref=f4e178]: 这是 Z-View 运维平台 · 实时掌握企业终端健康度
+            - generic [ref=f4e179]:
+              - button "批量操作" [ref=f4e180] [cursor=pointer]
+              - button "新增资产" [ref=f4e185] [cursor=pointer]
+          - generic [ref=f4e190]:
+            - generic [ref=f4e191]:
+              - generic [ref=f4e192]: +12.5%
+              - generic [ref=f4e200]: "2"
+              - generic [ref=f4e201]: 总资产数
+            - generic [ref=f4e203]:
+              - generic [ref=f4e204]: 100% 在线
+              - generic [ref=f4e211]: "2"
+              - generic [ref=f4e212]: 在线设备
+            - generic [ref=f4e214]:
+              - generic [ref=f4e215]: 需关注
+              - generic [ref=f4e221]: "0"
+              - generic [ref=f4e222]: 告警 / 异常
+            - generic [ref=f4e224]:
+              - generic [ref=f4e225]: 在线
+              - generic [ref=f4e231]: "0"
+              - generic [ref=f4e232]: 服务器数
+          - generic [ref=f4e234]:
+            - generic [ref=f4e235]:
+              - generic [ref=f4e236]:
+                - generic [ref=f4e237]:
+                  - generic [ref=f4e238]:
+                    - generic [ref=f4e239]: 设备健康概览
+                    - generic [ref=f4e240]: 最近 24 小时 · 实时刷新
+                  - button "查看全部" [ref=f4e241] [cursor=pointer]
+                - generic [ref=f4e246]:
+                  - generic [ref=f4e251]:
+                    - generic [ref=f4e252]: 100%
+                    - generic [ref=f4e253]: 在线率
+                  - generic [ref=f4e254]:
+                    - generic [ref=f4e257]:
+                      - generic [ref=f4e258]: 在线
+                      - generic [ref=f4e259]: 2 台
+                    - generic [ref=f4e262]:
+                      - generic [ref=f4e263]: 离线
+                      - generic [ref=f4e264]: 0 台
+                    - generic [ref=f4e267]:
+                      - generic [ref=f4e268]: 降级
+                      - generic [ref=f4e269]: 0 台
+                    - generic [ref=f4e272]:
+                      - generic [ref=f4e273]: 未知
+                      - generic [ref=f4e274]: 0 台
+              - generic [ref=f4e275]:
+                - generic [ref=f4e276]:
+                  - generic [ref=f4e277]:
+                    - generic [ref=f4e278]: 最近资产
+                    - generic [ref=f4e279]: 最新 5 台
+                  - button "查看全部" [ref=f4e280] [cursor=pointer]
+                - generic [ref=f4e286]:
+                  - table [ref=f4e288]:
+                    - rowgroup [ref=f4e295]:
+                      - row [ref=f4e296]:
+                        - columnheader [ref=f4e297]
+                        - columnheader "主机名" [ref=f4e298]
+                        - columnheader "系统" [ref=f4e300]
+                        - columnheader "状态" [ref=f4e302]
+                        - columnheader "操作" [ref=f4e304]
+                  - table [ref=f4e310]:
+                    - rowgroup [ref=f4e317]:
+                      - row [ref=f4e318]:
+                        - cell [ref=f4e319]
+                        - cell "DESKTOP-JEGI046 172.16.250.84" [ref=f4e322]:
+                          - generic [ref=f4e323]:
+                            - generic [ref=f4e324]: DESKTOP-JEGI046
+                            - generic [ref=f4e325]: 172.16.250.84
+                        - cell "Windows-10-10.0.19045-SP0" [ref=f4e326]
+                        - cell "在线" [ref=f4e330]
+                        - cell [ref=f4e334]:
+                          - button "详情" [ref=f4e336] [cursor=pointer]
+                      - row [ref=f4e338]:
+                        - cell [ref=f4e339]
+                        - cell "XXH-XXX 172.16.250.120" [ref=f4e342]:
+                          - generic [ref=f4e343]:
+                            - generic [ref=f4e344]: XXH-XXX
+                            - generic [ref=f4e345]: 172.16.250.120
+                        - cell "Windows-11-10.0.22631-SP0" [ref=f4e346]
+                        - cell "在线" [ref=f4e350]
+                        - cell [ref=f4e354]:
+                          - button "详情" [ref=f4e356] [cursor=pointer]
+            - generic [ref=f4e362]:
+              - generic [ref=f4e363]:
+                - generic [ref=f4e365]:
+                  - generic [ref=f4e366]: 分组分布
+                  - generic [ref=f4e367]: 按业务分组
+                - generic [ref=f4e369]:
+                  - generic [ref=f4e370]: 未分组
+                  - generic [ref=f4e373]:
+                    - generic [ref=f4e374]: "2"
+                    - generic [ref=f4e375]: 100%
+              - generic [ref=f4e376]:
+                - generic [ref=f4e377]:
+                  - generic [ref=f4e378]:
+                    - generic [ref=f4e379]: 热门软件
+                    - generic [ref=f4e380]: Top 5 装机量
+                  - button [ref=f4e381] [cursor=pointer]
+                - generic [ref=f4e386]:
+                  - generic [ref=f4e387]:
+                    - generic [ref=f4e388]: "1"
+                    - generic [ref=f4e389]:
+                      - generic [ref=f4e390]: Microsoft Edge
+                      - generic [ref=f4e391]: Microsoft Corporation
+                    - generic [ref=f4e392]: "2"
+                  - generic [ref=f4e393]:
+                    - generic [ref=f4e394]: "2"
+                    - generic [ref=f4e395]:
+                      - generic [ref=f4e396]: Microsoft Edge WebView2 Runtime
+                      - generic [ref=f4e397]: Microsoft Corporation
+                    - generic [ref=f4e398]: "2"
+                  - generic [ref=f4e399]:
+                    - generic [ref=f4e400]: "3"
+                    - generic [ref=f4e401]:
+                      - generic [ref=f4e402]: Microsoft Visual C++ 2008 Redistributable - x86 9.0.30729.6161
+                      - generic [ref=f4e403]: Microsoft Corporation
+                    - generic [ref=f4e404]: "2"
+                  - generic [ref=f4e405]:
+                    - generic [ref=f4e406]: "4"
+                    - generic [ref=f4e407]:
+                      - generic [ref=f4e408]: 123云盘
+                      - generic [ref=f4e409]: 123云盘
+                    - generic [ref=f4e410]: "1"
+                  - generic [ref=f4e411]:
+                    - generic [ref=f4e412]: "5"
+                    - generic [ref=f4e413]:
+                      - generic [ref=f4e414]: aCheck 版本 6.0.5
+                      - generic [ref=f4e415]: Sangfor, Inc.
+                    - generic [ref=f4e416]: "1"
+  - alert [ref=f4e417]:
+    - paragraph [ref=f4e421]: 登录成功

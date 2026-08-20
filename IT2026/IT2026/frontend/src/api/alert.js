@@ -45,3 +45,18 @@ export function exportAlerts(params) {
     responseType: 'blob'
   })
 }
+
+export function fetchAlertNotifyConfig() {
+  return request({
+    url: '/console/alert-notify-config',
+    method: 'get'
+  })
+}
+
+export function updateAlertNotifyConfig(patch) {
+  return request({
+    url: '/console/alert-notify-config',
+    method: 'put',
+    data: patch
+  })
+}

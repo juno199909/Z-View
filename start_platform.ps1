@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('Start', 'Stop', 'Restart')]
     [string]$Action = 'Start',
     [switch]$OpenBrowser,
@@ -127,6 +127,15 @@ function Save-State {
     $Entries | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StateFile -Encoding UTF8
 }
 
+function Stop-OrphanedManagedProcesses {
+    $managedScriptPattern = '(^|\s)(assets_api\.py|software_management_api_complete_v2\.py|software_policy_api\.py)(\s|$)'
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | ForEach-Object {
+        if ($_.CommandLine -and $_.CommandLine -match $managedScriptPattern) {
+            Stop-Tree -ProcessId ([int]$_.ProcessId)
+        }
+    }
+}
+
 function Stop-ManagedPlatform {
     $entries = Load-State
     foreach ($entry in ($entries | Sort-Object @{ Expression = { $_.name -eq 'frontend' }; Descending = $true })) {
@@ -134,6 +143,7 @@ function Stop-ManagedPlatform {
             Stop-Tree -ProcessId ([int]$entry.pid)
         }
     }
+    Stop-OrphanedManagedProcesses
     if (Test-Path -LiteralPath $StateFile) {
         Remove-Item -LiteralPath $StateFile -Force
     }
@@ -144,6 +154,35 @@ function Test-PythonDeps {
 
     & $PythonExe -c "import fastapi,uvicorn,mysql.connector,requests,websockets" | Out-Null
     return ($LASTEXITCODE -eq 0)
+}
+
+function Ensure-AgentService {
+    # P0-06 教训：平台启动时确保 CMDB-Agent 服务在线（幂等：启动→缺失则重建）
+    $svc = Get-Service -Name 'CMDB-Agent' -ErrorAction SilentlyContinue
+    if ($null -ne $svc -and $svc.Status -eq 'Running') {
+        Write-Host 'Agent service: already running.'
+        return
+    }
+
+    if ($null -eq $svc) {
+        Write-Host 'Agent service key missing (AV interference?) - recreating...'
+        & sc.exe delete CMDB-Agent | Out-Null
+        Start-Sleep -Seconds 2
+        New-Service -Name 'CMDB-Agent' `
+            -BinaryPathName '"C:\Program Files\CMDB-Agent\Z-View.exe" --service-host' `
+            -DisplayName 'Z-View Agent' -StartupType Automatic | Out-Null
+        & sc.exe failure CMDB-Agent reset= 86400 actions= restart/60000 | Out-Null
+        # P1-03：延迟自启（避开平台启动窗口，防止心跳连接拒绝循环）
+        & reg add 'HKLM\SYSTEM\CurrentControlSet\Services\CMDB-Agent' /v DelayedAutostart /t REG_DWORD /d 1 /f | Out-Null
+    }
+
+    if ($null -ne (Get-Service -Name 'CMDB-Agent' -ErrorAction SilentlyContinue)) {
+        Write-Host 'Agent service: starting...'
+        Start-Service -Name 'CMDB-Agent' -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        $svc = Get-Service -Name 'CMDB-Agent' -ErrorAction SilentlyContinue
+        Write-Host ("Agent service: " + $svc.Status)
+    }
 }
 
 function Start-ManagedProcess {
@@ -161,7 +200,8 @@ function Start-ManagedProcess {
         [Parameter(Mandatory)]
         [string]$StdOutLog,
         [Parameter(Mandatory)]
-        [string]$StdErrLog
+        [string]$StdErrLog,
+        [switch]$SkipPortCheck
     )
 
     $process = Start-Process `
@@ -173,7 +213,7 @@ function Start-ManagedProcess {
         -RedirectStandardOutput $StdOutLog `
         -RedirectStandardError $StdErrLog
 
-    if (-not (Wait-Port -Port $Port -TimeoutSeconds 60)) {
+    if (-not $SkipPortCheck -and -not (Wait-Port -Port $Port -TimeoutSeconds 60)) {
         Stop-Tree -ProcessId $process.Id
         throw "$Name did not become ready on port $Port."
     }
@@ -201,9 +241,13 @@ if ($Action -eq 'Restart') {
 
 $PythonExe = Get-CommandPath -Name 'python'
 $NpmExe = Get-CommandPath -Name 'npm'
+$NodeExe = Get-CommandPath -Name 'node'
+
+Ensure-AgentService
 
 $RequirementsPath = Join-Path $AppRoot 'requirements.txt'
 $FrontendRoot = Join-Path $AppRoot 'frontend'
+$ViteEntrypoint = Join-Path $FrontendRoot 'node_modules\vite\bin\vite.js'
 
 if ($InstallDependencies -or -not (Test-PythonDeps -PythonExe $PythonExe)) {
     Write-Host 'Installing/updating Python dependencies...'
@@ -218,6 +262,10 @@ if ($InstallDependencies -or -not (Test-Path -LiteralPath (Join-Path $FrontendRo
     } finally {
         Pop-Location
     }
+}
+
+if (-not (Test-Path -LiteralPath $ViteEntrypoint -PathType Leaf)) {
+    throw "Vite entrypoint not found after dependency setup: $ViteEntrypoint"
 }
 
 Stop-ManagedPlatform
@@ -253,12 +301,31 @@ $processes += Start-ManagedProcess `
 
 $processes += Start-ManagedProcess `
     -Name 'frontend' `
-    -FilePath $NpmExe `
-    -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1') `
+    -FilePath $NodeExe `
+        -ArgumentList @($ViteEntrypoint, 'preview', '--host', '0.0.0.0') `
     -WorkingDirectory $FrontendRoot `
     -Port 5173 `
     -StdOutLog (Join-Path $LogDir 'frontend.out.log') `
     -StdErrLog (Join-Path $LogDir 'frontend.err.log')
+
+# WebTransport (QUIC/UDP) 网关：观看端 UDP 优先传输
+$WtPort = 4433
+$processes += Start-ManagedProcess `
+    -Name 'wt-gateway' `
+    -FilePath $PythonExe `
+        -ArgumentList @(Join-Path $AppRoot 'webtransport_gateway.py'), '--port', $WtPort `
+    -WorkingDirectory $AppRoot `
+    -Port $WtPort `
+    -SkipPortCheck `
+    -StdOutLog (Join-Path $LogDir 'wt-gateway.out.log') `
+    -StdErrLog (Join-Path $LogDir 'wt-gateway.err.log')
+
+# 平台防火墙放行 UDP 4433（WebTransport）
+netsh advfirewall firewall delete rule name='zv-platform-wt-udp' | Out-Null
+netsh advfirewall firewall add rule name='zv-platform-wt-udp' dir=in action=allow protocol=UDP localport=4433 | Out-Null
+# P0-02：Agent 控制面 TLS 端口
+netsh advfirewall firewall delete rule name='zv-platform-agent-tls' | Out-Null
+netsh advfirewall firewall add rule name='zv-platform-agent-tls' dir=in action=allow protocol=TCP localport=8443 | Out-Null
 
 Save-State -Entries $processes
 

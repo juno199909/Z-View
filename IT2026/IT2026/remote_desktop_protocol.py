@@ -131,7 +131,8 @@ def _parse_wheel_steps(message: dict) -> int:
     elif delta_mode == 2:
         delta_y *= 400
 
-    magnitude = max(1, min(6, int(round(abs(delta_y) / 96.0))))
+    # 与前端 normalizeWheelSteps 的 ±12 步上限保持一致
+    magnitude = max(1, min(12, int(round(abs(delta_y) / 96.0))))
     return magnitude if delta_y < 0 else -magnitude
 
 

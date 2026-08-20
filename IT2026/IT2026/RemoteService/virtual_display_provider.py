@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import ctypes
 import json
 import shutil
@@ -36,6 +37,17 @@ class VirtualDisplayProvider:
         self._cached_at = 0.0
 
     def get_status(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        # 环境变量开关：禁用虚拟显示器状态查询（避免VMware下反复PowerShell查询+修复死循环）
+        if os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True"):
+            return {
+                "provisioning_state": "attached",
+                "attached_virtual_display": True,
+                "virtual_display_attached": True,
+                "physical_display_attached": True,
+                "skipped_by_env": True,
+                "available_tools": {},
+                "hardware_ids": [],
+            }
         if (
             not force_refresh
             and self._cached_status is not None
@@ -49,6 +61,15 @@ class VirtualDisplayProvider:
         return dict(status)
 
     def ensure_attached(self) -> dict[str, Any]:
+        # 环境变量开关：禁用虚拟显示器修复（VMware/RDP环境下用现有显示器捕获，避免修复死循环）
+        if os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True"):
+            return {
+                "action": "ensure_attached",
+                "changed": False,
+                "provisioning_state": "attached",
+                "attached_virtual_display": True,
+                "skipped_by_env": True,
+            }
         status = self.get_status(force_refresh=True)
         tools = status.get("available_tools") or {}
         if not tools.get("pnputil") and not tools.get("devcon"):
@@ -137,6 +158,14 @@ class VirtualDisplayProvider:
         return refreshed
 
     def repair(self) -> dict[str, Any]:
+        if os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True"):
+            return {
+                "action": "repair",
+                "changed": False,
+                "provisioning_state": "attached",
+                "attached_virtual_display": True,
+                "skipped_by_env": True,
+            }
         status = self.get_status(force_refresh=True)
         tools = status.get("available_tools") or {}
         if not tools.get("pnputil") and not tools.get("devcon"):
@@ -481,11 +510,19 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             [powershell_path, "-NoProfile", "-Command", script],
             allow_failure=True,
         )
+        if self.logger is not None:
+            try:
+                preview = (output or "")[:500]
+                self.logger(f"virtual_display_query_output preview={preview!r}")
+            except Exception:
+                pass
         if not output:
             return []
         try:
             parsed = json.loads(output)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            if self.logger is not None:
+                self.logger(f"virtual_display_query_json_decode_error err={exc} output={output[:500]!r}")
             return []
 
         if isinstance(parsed, dict):
@@ -612,14 +649,36 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     ) -> dict[str, Any] | None:
         if not devices:
             return None
-        ranked = sorted(
-            devices,
-            key=lambda item: (
-                0 if str(item.get("Status") or "").strip().lower() == "ok" else 1,
-                0 if self._is_attached_like(item, manifest=manifest) else 1,
-                str(item.get("FriendlyName") or "").lower(),
-            ),
-        )
+        manifest = manifest or {}
+        manifest_hwids = [
+            str(h).strip().lower()
+            for h in (manifest.get("hardware_ids") or [])
+            if str(h).strip()
+        ]
+
+        def _rank_key(item: dict[str, Any]) -> tuple:
+            instance_id = str(item.get("InstanceId") or "").strip().lower()
+            friendly = str(item.get("FriendlyName") or "").strip().lower()
+            status_ok = str(item.get("Status") or "").strip().lower() == "ok"
+            attached_like = self._is_attached_like(item, manifest=manifest)
+            hwid_exact = 0 if (manifest_hwids and instance_id in manifest_hwids) else 1
+            return (
+                hwid_exact,
+                0 if status_ok else 1,
+                0 if attached_like else 1,
+                friendly,
+                instance_id,
+            )
+
+        ranked = sorted(devices, key=_rank_key)
+        if self.logger is not None:
+            try:
+                self.logger(
+                    f"virtual_display_select_best hwids={manifest_hwids} ranked="
+                    f"{[(d.get('FriendlyName'), d.get('InstanceId')) for d in ranked]}"
+                )
+            except Exception:
+                pass
         return ranked[0]
 
     def _is_remote_display_adapter(
