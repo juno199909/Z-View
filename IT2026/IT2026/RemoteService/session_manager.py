@@ -1086,6 +1086,9 @@ class SessionManager:
         last_virtual_display_ensure_at = 0.0
         last_virtual_display_repair_signature = ""
         last_virtual_display_repair_at = 0.0
+        # 虚拟显示器修复连续失败计数：指数退避，避免 45s 一次的失败修复
+        # 无限回收会话助手（84 号 VM 上导致输入/帧反复中断的根因）
+        self._virtual_display_repair_fail_count = 0
 
         while not self._stop_event.is_set():
             try:
@@ -1428,16 +1431,21 @@ class SessionManager:
                                     f"state={ensure_state}",
                                 )
                                 if (
-                                    ensure_changed
-                                    or ensure_attached
-                                    or ensure_state
-                                    != str(
-                                        display_substrate.get(
-                                            "virtual_display_provisioning_state"
+                                    not ensure_status.get("skipped_by_env")
+                                    and ensure_attached
+                                    and (
+                                        ensure_changed
+                                        or ensure_attached
+                                        or ensure_state
+                                        != str(
+                                            display_substrate.get(
+                                                "virtual_display_provisioning_state"
+                                            )
+                                            or "unknown"
                                         )
-                                        or "unknown"
                                     )
                                 ):
+                                    # 仅在虚拟显示器真正附着时回收助手；附着失败不回收
                                     self._schedule_helper_recycle(
                                         helper_recycle_reasons,
                                         "virtual_display_ensure_changed",
@@ -1467,9 +1475,11 @@ class SessionManager:
                                             ensure_status.get("device_instance_id") or "none",
                                         ]
                                     )
-                                    repair_cooldown_seconds = max(
-                                        float(self.retry_seconds) * 2.0,
-                                        45.0,
+                                    repair_cooldown_seconds = min(
+                                        45.0 * (2 ** int(
+                                            getattr(self, "_virtual_display_repair_fail_count", 0)
+                                        )),
+                                        900.0,
                                     )
                                     if (
                                         repair_signature
@@ -1507,13 +1517,24 @@ class SessionManager:
                                                 "VirtualDisplay",
                                                 "automatic repair_virtual_display result: "
                                                 f"changed={repair_changed} attached={repair_attached} "
-                                                f"state={repair_state}",
+                                                f"state={repair_state} fail_streak={getattr(self, '_virtual_display_repair_fail_count', 0)}",
                                             )
+                                            if repair_attached:
+                                                # 附着成功：重置失败退避
+                                                self._virtual_display_repair_fail_count = 0
+                                            else:
+                                                self._virtual_display_repair_fail_count = (
+                                                    int(getattr(self, "_virtual_display_repair_fail_count", 0)) + 1
+                                                )
                                             if (
-                                                repair_changed
-                                                or repair_attached
-                                                or repair_state != ensure_state
+                                                repair_attached
+                                                and (
+                                                    repair_changed
+                                                    or repair_state != ensure_state
+                                                )
                                             ):
+                                                # 仅在虚拟显示器真正附着（拓扑实际变化）时回收助手；
+                                                # 附着失败的尝试不回收，避免会话被 45s 循环打断
                                                 self._schedule_helper_recycle(
                                                     helper_recycle_reasons,
                                                     "virtual_display_repair_changed",
@@ -1679,30 +1700,71 @@ class SessionManager:
                     if primary_session_id is None:
                         continue
 
+                    # If the primary session has no live user-session agent
+                    # (e.g. the console session is headless / has no logged-on
+                    # user, so the helper can never launch there), do NOT kill
+                    # non-primary sessions. The RDP/active-user session is the
+                    # authoritative capture host in that case.
                     if session_id != primary_session_id:
-                        stray_pids: list[int] = []
-                        candidate_pids = {
-                            int(pid)
-                            for pid in session_pids + ([heartbeat_pid] if heartbeat_pid > 0 else [])
-                            if int(pid) > 0
-                        }
-                        for pid in sorted(candidate_pids):
-                            if self.bridge.terminate_process(pid):
-                                stray_pids.append(pid)
-                        if stray_pids:
+                        primary_alive_for_supervisor = False
+                        try:
+                            primary_hb = self.bridge.read_role_runtime_state(
+                                "user-session-agent",
+                                session_bound=True,
+                                session_id=primary_session_id,
+                            ) or {}
+                            primary_pids = self.bridge.list_user_session_agent_pids(primary_session_id)
+                            primary_heartbeat_recent = self.bridge.has_recent_role_runtime_state(
+                                "user-session-agent",
+                                session_bound=True,
+                                session_id=primary_session_id,
+                            )
+                            primary_mutex = self.bridge.is_role_mutex_active(
+                                "user-session-agent",
+                                session_bound=True,
+                                session_id=primary_session_id,
+                            )
+                            primary_alive_for_supervisor = bool(
+                                primary_heartbeat_recent
+                                and (primary_mutex or primary_pids)
+                            )
+                        except Exception:
+                            primary_alive_for_supervisor = False
+
+                        if not primary_alive_for_supervisor:
+                            # Primary can't host a working agent; let this
+                            # session keep running as the real host. Fall
+                            # through to the launch attempt below so a healthy
+                            # user-session agent is started here even though
+                            # the primary is dead.
                             self.bridge.log_runtime_event(
                                 "ServiceRuntime",
-                                "terminated non-primary user-session agent(s): "
-                                f"session={session_id} primary_session={primary_session_id} pids={stray_pids}",
+                                f"primary not alive; treating session={session_id} as authoritative host",
                             )
-                        elif mutex_active or heartbeat_active or session_pids:
-                            self.bridge.log_runtime_event(
-                                "ServiceRuntime",
-                                "non-primary user-session agent state detected but no terminable pid found: "
-                                f"session={session_id} primary_session={primary_session_id} "
-                                f"mutex_active={mutex_active} heartbeat_active={heartbeat_active}",
-                            )
-                        continue
+                        else:
+                            stray_pids: list[int] = []
+                            candidate_pids = {
+                                int(pid)
+                                for pid in session_pids + ([heartbeat_pid] if heartbeat_pid > 0 else [])
+                                if int(pid) > 0
+                            }
+                            for pid in sorted(candidate_pids):
+                                if self.bridge.terminate_process(pid):
+                                    stray_pids.append(pid)
+                            if stray_pids:
+                                self.bridge.log_runtime_event(
+                                    "ServiceRuntime",
+                                    "terminated non-primary user-session agent(s): "
+                                    f"session={session_id} primary_session={primary_session_id} pids={stray_pids}",
+                                )
+                            elif mutex_active or heartbeat_active or session_pids:
+                                self.bridge.log_runtime_event(
+                                    "ServiceRuntime",
+                                    "non-primary user-session agent state detected but no terminable pid found: "
+                                    f"session={session_id} primary_session={primary_session_id} "
+                                    f"mutex_active={mutex_active} heartbeat_active={heartbeat_active}",
+                                )
+                            continue
 
                     if mutex_active or heartbeat_active or session_pids:
                         continue
@@ -1916,15 +1978,19 @@ class SessionManager:
         active_descriptor = self._get_active_capture_descriptor()
         preferred_capture_descriptor = self.get_preferred_capture_host_session()
         console_descriptor = self.get_console_session()
+        # 优先用 capture helper 的 session（输入和捕获应在同一会话）
+        if capture_helper_descriptor is not None and capture_helper_descriptor.identity:
+            return capture_helper_descriptor
+        # 禁用虚拟显示器时，优先选有用户identity的active session（RDP session 2）
+        if primary_descriptor is not None and not primary_descriptor.is_disconnected and primary_descriptor.identity:
+            return primary_descriptor
+        if active_descriptor is not None and active_descriptor.identity:
+            return active_descriptor
         if capture_helper_descriptor is not None:
             return capture_helper_descriptor
-        if primary_descriptor is not None and not primary_descriptor.is_disconnected:
-            return primary_descriptor
-        if active_descriptor is not None:
-            return active_descriptor
         if preferred_capture_descriptor is not None and not preferred_capture_descriptor.is_disconnected:
             return preferred_capture_descriptor
-        if console_descriptor is not None:
+        if console_descriptor is not None and console_descriptor.identity:
             return console_descriptor
         return primary_descriptor or preferred_capture_descriptor
 
@@ -2202,9 +2268,11 @@ class SessionManager:
         }
 
     def _invoke_capture_frame_action(self, normalized_action: str, payload: dict) -> dict:
+        frame_started_at = time.perf_counter()
         original_payload = dict(payload)
         requested_session_id = self._payload_session_id(original_payload)
         descriptors = self._build_capture_candidate_descriptors(requested_session_id)
+        descriptors_done_at = time.perf_counter()
         if not descriptors:
             raise RuntimeError("no session available for capture")
         binding_descriptors = [
@@ -2215,6 +2283,7 @@ class SessionManager:
             )
             for descriptor in descriptors
         ]
+        binding_done_at = time.perf_counter()
 
         helper_payload = dict(original_payload)
         helper_payload.pop("session_id", None)
@@ -2235,12 +2304,23 @@ class SessionManager:
             candidate_payload["capture_attempt_index"] = attempt_index
             candidate_payload["capture_attempt_count"] = len(binding_descriptors)
             try:
+                helper_call_started_at = time.perf_counter()
                 helper_response = self._invoke_helper_command(
                     descriptor.session_id,
                     "capture_frame",
                     candidate_payload,
                     helper_role="capture",
                 )
+                helper_call_elapsed = time.perf_counter() - helper_call_started_at
+                if helper_call_elapsed > 0.25:
+                    self.bridge.log_runtime_event(
+                        "ServiceRuntime",
+                        "capture_frame slow: "
+                        f"descriptor_setup={(helper_call_started_at - frame_started_at):.3f}s "
+                        f"helper_pipe_roundtrip={helper_call_elapsed:.3f}s "
+                        f"session={descriptor.session_id} "
+                        f"resp_bytes={len(json.dumps(helper_response, ensure_ascii=False, default=str))}",
+                    )
             except Exception as exc:
                 last_error = exc
                 attempted_sessions.append(
@@ -3470,10 +3550,14 @@ class SessionManager:
     ) -> SessionDescriptor | None:
         if not descriptors:
             return None
-        primary_descriptor = self._find_best_primary_remote_descriptor(descriptors)
+        # 无用户identity的session（如RDP-Tcp监听session 65536）不能做capture host
+        eligible = [d for d in descriptors if d.identity]
+        if not eligible:
+            eligible = descriptors
+        primary_descriptor = self._find_best_primary_remote_descriptor(eligible)
         active_descriptor = self._get_active_capture_descriptor()
-        console_affine_descriptor = self._find_console_affine_descriptor(primary_descriptor, descriptors)
-        best_console_descriptor = self._find_best_console_descriptor(descriptors)
+        console_affine_descriptor = self._find_console_affine_descriptor(primary_descriptor, eligible)
+        best_console_descriptor = self._find_best_console_descriptor(eligible)
 
         if (
             console_affine_descriptor is not None
@@ -3491,7 +3575,7 @@ class SessionManager:
         ):
             return active_descriptor
         return min(
-            descriptors,
+            eligible,
             key=lambda item: self._capture_descriptor_selection_key(
                 item,
                 primary_descriptor=primary_descriptor,
@@ -3694,7 +3778,13 @@ class SessionManager:
     def _descriptor_is_transient_remote_surface(self, descriptor: SessionDescriptor | None) -> bool:
         if descriptor is None:
             return False
-        return self._assess_capture_surface(descriptor).substrate_class == "remote_session_surface"
+        assessment = self._assess_capture_surface(descriptor)
+        if assessment.substrate_class != "remote_session_surface":
+            return False
+        # 禁用虚拟显示器时，RDP session 视为持久，不算 transient（避免 supervisor 反复 recycle）
+        if assessment.persistent:
+            return False
+        return True
 
     def _descriptor_is_non_persistent_capture_surface(
         self,
@@ -3709,6 +3799,10 @@ class SessionManager:
         assessment: DisplayPresenceAssessment | None,
     ) -> bool:
         if assessment is None:
+            return False
+        # persistent=True 的表面（如禁用虚拟显示器时的RDP会话）不算non-persistent，
+        # 否则 supervisor 会反复 recycle helper 导致 capture_loop 中断。
+        if assessment.persistent:
             return False
         substrate_class = str(assessment.substrate_class or "").strip().lower()
         if substrate_class in _NON_PERSISTENT_CAPTURE_SUBSTRATES:

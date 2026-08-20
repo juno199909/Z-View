@@ -1,4 +1,5 @@
 import { fileURLToPath } from 'node:url'
+import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
@@ -14,8 +15,20 @@ export default defineConfig(({ mode }) => {
   const softwareTarget = env.VITE_PROXY_SOFTWARE_TARGET || 'http://127.0.0.1:8081'
   const policyTarget = env.VITE_PROXY_POLICY_TARGET || 'http://127.0.0.1:8082'
   const proxy = {
+    '/api/v1/software/all': {
+      target: assetsTarget,
+      changeOrigin: true
+    },
+    '/api/v1/software/stats': {
+      target: assetsTarget,
+      changeOrigin: true
+    },
     '/api/v1/discovery': {
       target: assetsTarget,
+      changeOrigin: true
+    },
+    '/api/v1/software': {
+      target: softwareTarget,
       changeOrigin: true
     },
     '/software-api': {
@@ -55,6 +68,10 @@ export default defineConfig(({ mode }) => {
         }
       }
     },
+    https: {
+      key: readFileSync(resolve(__dirname, 'certs/zview-key.pem')),
+      cert: readFileSync(resolve(__dirname, 'certs/zview-cert.pem')),
+    },
     server: {
       host: '0.0.0.0',
       port: 5173,
@@ -62,6 +79,10 @@ export default defineConfig(({ mode }) => {
       proxy
     },
     preview: {
+      https: {
+        key: readFileSync(resolve(__dirname, 'certs/zview-key.pem')),
+        cert: readFileSync(resolve(__dirname, 'certs/zview-cert.pem')),
+      },
       host: '0.0.0.0',
       port: 5173,
       strictPort: true,

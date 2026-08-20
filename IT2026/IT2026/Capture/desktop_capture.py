@@ -325,6 +325,10 @@ class DesktopFrameCapturer:
     但真正的远控主链路应当优先由 Service 管理的 session helper 调用。
     """
 
+    # RustDesk 式回退（参考 libs/scrap "No image, fall back to gdi"）：
+    # substrate 缺持久表面时不再封锁，降级到 GDI 系后端继续出帧。
+    FALLBACK_BACKEND_ORDER = ("mss", "gdi", "imagegrab", "pyautogui")
+
     def __init__(self, backend_order: tuple[str, ...] | None = None):
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -332,6 +336,8 @@ class DesktopFrameCapturer:
         self.capture_backend = None
         self.failure_count = 0
         self.last_failure_reason = None
+        self._fallback_capture_active = False
+        self._fallback_capture_reason = ""
         self._default_backend_order = tuple(
             backend_order or ("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui")
         )
@@ -382,6 +388,27 @@ class DesktopFrameCapturer:
     def capture_blocker_reason(self) -> str:
         return self._capture_blocker_reason
 
+    @staticmethod
+    def fallback_capture_allowed() -> bool:
+        """缺持久表面时是否允许 GDI 系回退采集（默认允许）。
+
+        ZVIEW_ALLOW_FALLBACK_CAPTURE=0 可恢复旧的封锁行为。
+        """
+        import os as _os
+        return str(_os.environ.get("ZVIEW_ALLOW_FALLBACK_CAPTURE", "1")).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
+    @property
+    def fallback_capture_active(self) -> bool:
+        return bool(self._fallback_capture_active)
+
+    @property
+    def fallback_capture_reason(self) -> str:
+        return str(self._fallback_capture_reason or "")
+
     def describe_backend_state(self) -> dict:
         now = time.monotonic()
         backends: list[dict] = []
@@ -431,6 +458,9 @@ class DesktopFrameCapturer:
             "failure_count": int(self.failure_count or 0),
             "last_failure_reason": str(self.last_failure_reason or ""),
             "blocker_reason": str(self._capture_blocker_reason or ""),
+            "fallback_capture_active": bool(self._fallback_capture_active),
+            "fallback_capture_reason": str(self._fallback_capture_reason or ""),
+            "fallback_capture_allowed": bool(self.fallback_capture_allowed()),
             "context_label": str(self._capture_context_label or ""),
             "recovery_hint": dict(self._last_recovery_hint or {}),
             "last_prepare_reason": str(self._last_prepare_reason or ""),
@@ -477,22 +507,67 @@ class DesktopFrameCapturer:
         self.kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
         self.kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
 
+        # GDI handles are pointer-sized on 64-bit Windows. Without these
+        # signatures ctypes truncates them to C ints before BitBlt/GetDIBits.
+        self.gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        self.gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        self.gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, wintypes.INT, wintypes.INT]
+        self.gdi32.CreateCompatibleBitmap.restype = wintypes.HANDLE
+        self.gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        self.gdi32.SelectObject.restype = wintypes.HANDLE
+        self.gdi32.BitBlt.argtypes = [
+            wintypes.HDC,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.HDC,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.DWORD,
+        ]
+        self.gdi32.BitBlt.restype = wintypes.BOOL
+        self.gdi32.GetDIBits.argtypes = [
+            wintypes.HDC,
+            wintypes.HANDLE,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        self.gdi32.GetDIBits.restype = wintypes.INT
+        self.gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        self.gdi32.DeleteObject.restype = wintypes.BOOL
+        self.gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        self.gdi32.DeleteDC.restype = wintypes.BOOL
+
     def capture_raw(self):
         """捕获原始屏幕图像。"""
         capture_attempt = self._begin_capture_attempt()
+        effective_order = tuple(self.backend_order)
         if self._capture_blocker_reason:
-            self._finalize_capture_attempt(
-                capture_attempt,
-                outcome="blocked",
-                blocker_reason=self._capture_blocker_reason,
-                final_failure=self._capture_blocker_reason,
+            if not self.fallback_capture_allowed():
+                # 旧行为：substrate 缺持久表面时直接封锁
+                self._finalize_capture_attempt(
+                    capture_attempt,
+                    outcome="blocked",
+                    blocker_reason=self._capture_blocker_reason,
+                    final_failure=self._capture_blocker_reason,
+                )
+                self._record_capture_failure([self._capture_blocker_reason])
+                return None
+            # RustDesk 式回退：封锁只封锁合成器依赖型后端（dxgi/wgc/dwm），
+            # 继续用 GDI 系后端（mss/gdi/imagegrab）读取桌面表面出帧。
+            effective_order = tuple(
+                name for name in self.backend_order if name in self.FALLBACK_BACKEND_ORDER
             )
-            self._record_capture_failure([self._capture_blocker_reason])
-            return None
+            capture_attempt["fallback_mode"] = True
+            capture_attempt["backend_order"] = list(effective_order)
 
         errors: list[str] = []
 
-        for backend_name in self.backend_order:
+        for backend_name in effective_order:
             backend_step = {
                 "backend": backend_name,
                 "transient_mode": backend_name in self._transient_backends,
@@ -578,11 +653,23 @@ class DesktopFrameCapturer:
                 backend_step["recovery_hint"] = {}
                 capture_attempt["steps"].append(backend_step)
                 self._last_recovery_hint = {}
-                self._finalize_capture_attempt(
-                    capture_attempt,
-                    outcome="captured",
-                    selected_backend=backend_name,
-                )
+                if self._capture_blocker_reason:
+                    # 回退模式出帧成功：记录回退状态，供状态上报与 UI 展示
+                    self._fallback_capture_active = True
+                    self._fallback_capture_reason = str(self._capture_blocker_reason)
+                    self._finalize_capture_attempt(
+                        capture_attempt,
+                        outcome="captured_fallback",
+                        selected_backend=backend_name,
+                    )
+                else:
+                    self._fallback_capture_active = False
+                    self._fallback_capture_reason = ""
+                    self._finalize_capture_attempt(
+                        capture_attempt,
+                        outcome="captured",
+                        selected_backend=backend_name,
+                    )
                 return screenshot
 
         self._finalize_capture_attempt(
@@ -680,11 +767,13 @@ class DesktopFrameCapturer:
             if scale != 1.0:
                 new_width = max(1, int(working.width * scale))
                 new_height = max(1, int(working.height * scale))
-                resized = working.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                # BILINEAR 比 LANCZOS 快 2 倍以上，远控场景画质差异可忽略
+                resized = working.resize((new_width, new_height), Image.Resampling.BILINEAR)
                 working = resized
 
             buffer = io.BytesIO()
-            working.save(buffer, format="JPEG", quality=quality, optimize=True)
+            # optimize=True 是慢速优化模式（2-5倍耗时），远控低延迟场景关闭
+            working.save(buffer, format="JPEG", quality=quality, optimize=False)
             jpeg_data = buffer.getvalue()
 
             return {
@@ -873,7 +962,12 @@ class DesktopFrameCapturer:
     def _grab_with_pyautogui(self):
         if pyautogui is None:
             raise RuntimeError("pyautogui unavailable")
-        screenshot = pyautogui.screenshot()
+        # 输入注入按整个虚拟桌面解算坐标，兜底抓屏必须覆盖同一区域，
+        # 否则多显示器场景下画面与鼠标位置会系统性错位。
+        try:
+            screenshot = ImageGrab.grab(all_screens=True)
+        except Exception:
+            screenshot = pyautogui.screenshot()
         self._note_backend("PyAutoGUI")
         return screenshot
 

@@ -1,0 +1,29 @@
+{
+  "preferred_install_method": "auto",
+  "hardware_ids": [
+    "ROOT\\DISPLAY\\0001",
+    "ROOT\\Parsec\\VDA"
+  ],
+  "friendly_name_keywords": [
+    "Parsec Virtual Display Adapter",
+    "Parsec"
+  ],
+  "instance_id_keywords": [
+    "Parsec",
+    "Root\\Parsec\\VDA"
+  ],
+  "attach_keywords": [
+    "OK",
+    "active"
+  ],
+  "remote_adapter_keywords": [
+    "RDPIDD"
+  ],
+  "inf_relative_path": "mm.inf",
+  "catalog_relative_path": "mm.cat",
+  "binary_relative_path": "mm.dll",
+  "devcon_relative_path": "nefconw.exe",
+  "installer_relative_path": "vddinstall.bat",
+  "vendor": "Parsec",
+  "version": "0.45"
+}

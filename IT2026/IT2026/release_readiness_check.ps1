@@ -57,27 +57,43 @@ function Get-ReadinessTempRoot {
 
 function Test-PythonVersion {
     Write-Host "==> Check Python version"
-    $Python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $Python) {
-        Add-CheckError "python command not found."
-        return
+    $VersionText = $null
+    $InterpreterLabel = ""
+    $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($PyLauncher) {
+        try {
+            $VersionText = (& $PyLauncher.Source -3.12 -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($VersionText)) {
+                $InterpreterLabel = "py -3.12"
+            }
+        } catch {
+        }
     }
 
-    $VersionText = (& python -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+    if (-not $VersionText) {
+        $Python = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $Python) {
+            Add-CheckError "python command not found."
+            return
+        }
+        $VersionText = (& $Python.Source -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+        $InterpreterLabel = $Python.Source
+    }
+
     Write-Host ("[INFO] Python version: {0}" -f $VersionText)
     $Parts = $VersionText.Split(".")
     $Major = [int]$Parts[0]
     $Minor = [int]$Parts[1]
     $Supported = ($Major -eq 3 -and $Minor -ge 10 -and $Minor -le 12)
     if (-not $Supported) {
-        $Message = "Python 3.10-3.12 required for release validation, current is $VersionText."
+        $Message = "Python 3.10-3.12 required for release validation, current is $InterpreterLabel = $VersionText."
         if ($RequireSupportedPython) {
             Add-CheckError $Message
         } else {
             Add-CheckWarning $Message
         }
     } else {
-        Write-Host "[PASS] Python version is in supported range."
+        Write-Host ("[PASS] Python version is in supported range: {0} = {1}" -f $InterpreterLabel, $VersionText)
     }
 }
 

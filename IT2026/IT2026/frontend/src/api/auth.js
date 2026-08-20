@@ -23,3 +23,41 @@ export function changePassword(data) {
     data
   })
 }
+
+export function listUsers() {
+  return request({
+    url: '/auth/users',
+    method: 'get'
+  })
+}
+
+export function createUser(data) {
+  return request({
+    url: '/auth/users',
+    method: 'post',
+    data
+  })
+}
+
+export function updateUser(username, data) {
+  return request({
+    url: `/auth/users/${encodeURIComponent(username)}`,
+    method: 'put',
+    data
+  })
+}
+
+export function resetUserPassword(username, data) {
+  return request({
+    url: `/auth/users/${encodeURIComponent(username)}/reset-password`,
+    method: 'put',
+    data
+  })
+}
+
+export function deleteUser(username) {
+  return request({
+    url: `/auth/users/${encodeURIComponent(username)}`,
+    method: 'delete'
+  })
+}

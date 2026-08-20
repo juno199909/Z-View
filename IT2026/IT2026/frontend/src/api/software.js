@@ -1,4 +1,12 @@
-import { softwareRequest } from './request'
+import request, { softwareRequest } from './request'
+
+export function getInstalledSoftware(assetId, params) {
+  return request({
+    url: '/software/all',
+    method: 'get',
+    params: { ...params, asset_id: assetId }
+  })
+}
 
 export function getSoftwarePackages(params) {
   return softwareRequest({

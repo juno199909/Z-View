@@ -19,6 +19,8 @@
             <el-tag :type="connectionStatus === 'connected' ? 'success' : 'info'">
               {{ getStatusText() }}
             </el-tag>
+            <el-tag size="small" type="warning" effect="plain">{{ transportType === 'udp' ? 'UDP' : 'TCP' }}</el-tag>
+            <el-tag v-if="h264Active" size="small" type="success" effect="plain">H.264 {{ fps }}FPS</el-tag>
             <span class="info">{{ targetInfo }}</span>
             <el-button-group>
               <el-button size="small" :icon="FullScreen" @click="toggleFullscreen">
@@ -67,6 +69,8 @@
               <el-tag size="small" :type="connectionStatus === 'connected' ? 'success' : 'info'">
                 {{ getStatusText() }}
               </el-tag>
+              <el-tag size="small" type="warning" effect="plain">{{ transportType === 'udp' ? 'UDP' : 'TCP' }}</el-tag>
+              <el-tag v-if="h264Active" size="small" type="success" effect="plain">H.264 {{ fps }}FPS</el-tag>
               <span class="fullscreen-info">{{ targetInfo }}</span>
               <span class="fullscreen-field">桌面</span>
               <el-select
@@ -105,6 +109,7 @@
                 :model-value="sessionSettings.scalePercent"
                 size="small"
                 style="width: 170px"
+                :disabled="h264Active"
                 :teleported="false"
                 popper-class="remote-fullscreen-select-popper"
                 @change="handleFullscreenResolutionChange"
@@ -585,6 +590,7 @@ import {
   DocumentCopy, FolderOpened, UploadFilled, Download
 } from '@element-plus/icons-vue'
 import { getAuthToken } from '@/api/auth-session'
+import { createRemoteSession, deleteRemoteSession } from '@/api/remote'
 
 const props = defineProps({
   assetId: {
@@ -709,9 +715,9 @@ const latency = ref(0)
 const bandwidth = ref('0 KB/s')
 const sessionWarningText = ref('')
 const defaultSessionSettings = (overrides = {}) => ({
-  quality: 75,
-  fps: 18,
-  scalePercent: 90,
+  quality: 60,
+  fps: 60,
+  scalePercent: 60,
   adaptive: true,
   profile: 'interactive',
   wheelSpeed: 1,
@@ -838,6 +844,7 @@ const pointerState = {
 
 // WebSocket连接
 let ws = null
+let currentSessionId = null
 let ctx = null
 let heartbeatTimer = null
 let lastFrameTime = 0
@@ -845,7 +852,57 @@ let frameCounter = 0
 let lastPingSentAt = 0
 let latestFrameId = 0
 let lastRenderedFrameId = 0
+// H.264（WebCodecs）状态：与 JPEG 队列互不干扰
+let h264Mode = false
+let videoDecoder = null
+let h264DecodeFailStreak = 0
+let h264LastSeq = 0
 let isDecodingFrame = false
+let wsCandidates = []
+let wsCandidateIndex = 0
+// 能力声明：引擎的消息循环在会话建立后 ~10s 才就绪，onopen 立即发送会丢失。
+// 改为收到引擎第一条消息后再声明，并在直连静默时重发兜底。
+let capabilitiesSent = false
+let capabilitiesRetryTimer = null
+let silentCheckTimer = null
+// WebTransport (UDP/QUIC) 自适应：连续 2 次失败后 5 分钟内回落 WebSocket(TCP)
+let wtFailCount = 0
+let wtDisabledUntil = 0
+
+const clearSilentCheckTimer = () => {
+  if (silentCheckTimer) {
+    clearTimeout(silentCheckTimer)
+    silentCheckTimer = null
+  }
+}
+
+const clearCapabilitiesRetry = () => {
+  if (capabilitiesRetryTimer) {
+    clearInterval(capabilitiesRetryTimer)
+    capabilitiesRetryTimer = null
+  }
+}
+
+const announceCapabilities = (force = false) => {
+  if (capabilitiesSent && !force) {
+    return
+  }
+  const webcodecs = typeof window !== 'undefined' && typeof window.VideoDecoder === 'function'
+  capabilitiesSent = true
+  sendSocketMessage({ type: 'viewer_capabilities', webcodecs })
+  // 引擎消息循环未就绪时首条声明可能被丢弃：短暂间隔重发，收到 codec_switch/h264 帧即停
+  clearCapabilitiesRetry()
+  let retries = 0
+  capabilitiesRetryTimer = setInterval(() => {
+    retries += 1
+    if (h264Mode || retries >= 3 || wsCandidateIndex > 0 || !isSocketOpen()) {
+      clearCapabilitiesRetry()
+      return
+    }
+    sendSocketMessage({ type: 'viewer_capabilities', webcodecs })
+  }, 1500)
+}
+
 let pendingFrame = null
 let resizeObserver = null
 let reconnectTimer = null
@@ -903,6 +960,7 @@ const shouldSuppressReconnectOnSessionError = (message) => {
 }
 
 const markRemoteSessionInitialized = () => {
+  clearSilentCheckTimer()
   remoteSessionInitialized = true
 }
 
@@ -954,6 +1012,12 @@ onBeforeUnmount(() => {
   resetPointerState()
   disconnect({ suppressReconnect: true })
   cleanupRemoteDialogArtifacts()
+  teardownH264()
+  // 释放后端远控会话，避免会话只能等超时回收
+  if (currentSessionId) {
+    deleteRemoteSession(currentSessionId).catch(() => {})
+    currentSessionId = null
+  }
 })
 
 watch(() => props.visible, (visible) => {
@@ -1148,7 +1212,7 @@ const initCanvas = () => {
   console.log('✅ Canvas初始化完成，初始尺寸:', canvas.width, 'x', canvas.height)
 }
 
-const connect = () => {
+const connect = async () => {
   clearReconnectTimer()
   reconnectSuppressed = false
   connectionStatus.value = 'connecting'
@@ -1214,17 +1278,180 @@ const connect = () => {
       throw new Error('缺少终端资产标识，无法建立远程桌面代理连接')
     }
 
+    // 新流程：先创建会话拿 session_token + ws_url
+    const sessionInfo = await createRemoteSession({ asset_id: props.assetId, fps_limit: sessionSettings.value.fps || 60 })
+    currentSessionId = sessionInfo.session_id
     const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const query = new URLSearchParams({
-      token
-    })
-    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/assets/${props.assetId}/remote-desktop/ws?${query.toString()}`
+    const relayUrl = `${wsProtocol}://${window.location.host}${sessionInfo.ws_url}`
+    // 传输候选：WebTransport (UDP/QUIC) 优先，失败/超时自适应回落 WebSocket (TCP)。
+    // HTTPS 页面下 ws:// 直连属于混合内容会被浏览器拦截，自动走 wss 中继。
+    if (window.WebTransport && sessionInfo.wt_url && sessionInfo.wt_cert_hash && Date.now() > wtDisabledUntil) {
+      try {
+        const adapter = await openWebTransportAdapter(sessionInfo)
+        wtFailCount = 0
+        ws = adapter
+        return
+      } catch (e) {
+        wtFailCount += 1
+        if (wtFailCount >= 2) {
+          wtDisabledUntil = Date.now() + 5 * 60 * 1000
+          wtFailCount = 0
+        }
+        console.warn('WebTransport 不可用，回落 WebSocket(TCP):', e)
+      }
+    }
+    const isHttpsPage = window.location.protocol === 'https:'
+    wsCandidates = (!isHttpsPage && sessionInfo.direct_ws_url)
+      ? [sessionInfo.direct_ws_url, relayUrl]
+      : [relayUrl]
+    wsCandidateIndex = 0
+    openSocketFromCandidates(sessionInfo)
+    return
+  } catch (error) {
+    console.error('连接失败:', error)
+    connectionStatus.value = 'error'
+    errorMessage.value = error.message
+  }
+}
 
-    console.log('连接到平台代理远程桌面:', `/api/v1/assets/${props.assetId}/remote-desktop/ws`)
-    const socket = new WebSocket(wsUrl)
+// ============ WebTransport (UDP/QUIC) 传输适配 ============
+
+const hexToBytes = (hex) => {
+  const clean = (hex || '').replace(/[^0-9a-fA-F]/g, '')
+  const out = new Uint8Array(clean.length / 2)
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.substr(i * 2, 2), 16)
+  }
+  return out
+}
+
+const concatU8 = (a, b) => {
+  const out = new Uint8Array(a.length + b.length)
+  out.set(a, 0)
+  out.set(b, a.length)
+  return out
+}
+
+const openWebTransportAdapter = async (sessionInfo) => {
+  // 自签证书通过 serverCertificateHashes 信任（Chrome 97+，要求 ECDSA P-256、有效期 ≤14 天）
+  // 长期证书（3 年）不满足 serverCertificateHashes 的 14 天限制，
+  // 改走系统信任库校验：客户端机器导入 zview-root.cer（受信任的根证书颁发机构）一次即可
+  const wt = new WebTransport(sessionInfo.wt_url)
+  // 自适应切换的关键：4 秒内未就绪即放弃，快速回落 TCP
+  await Promise.race([
+    wt.ready,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('webtransport ready timeout')), 4000))
+  ])
+
+  const stream = await wt.createBidirectionalStream()
+  const writer = stream.writable.getWriter()
+  const reader = stream.readable.getReader()
+
+  // WT 流是无消息边界的字节流 → 与网关约定长度前缀帧：[4B len][1B type(0=text,1=binary)][payload]
+  let closed = false
+  let buffer = new Uint8Array(0)
+
+  const markOpen = () => {
+    ws = adapter
+    remoteSessionInitialized = false
+    reconnectSuppressed = false
+    connectionStatus.value = 'connecting'
+    awaitingConsent.value = true
+    reconnectAttempts = 0
+  }
+
+  const adapter = {
+    readyState: WebSocket.OPEN,
+    send: (data) => {
+      if (closed) return
+      let payload
+      let ftype
+      if (typeof data === 'string') {
+        payload = new TextEncoder().encode(data)
+        ftype = 0
+      } else {
+        payload = data instanceof Uint8Array ? data : new Uint8Array(data)
+        ftype = 1
+      }
+      const frame = new Uint8Array(5 + payload.length)
+      new DataView(frame.buffer).setUint32(0, payload.length)
+      frame[4] = ftype
+      frame.set(payload, 5)
+      writer.write(frame).catch(() => {})
+    },
+    close: () => {
+      closed = true
+      try {
+        wt.close()
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  markOpen()
+  markSessionConnected()
+
+  ;(async () => {
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer = concatU8(buffer, value)
+        while (buffer.length >= 5) {
+          const len = (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3]
+          if (buffer.length < 5 + len) break
+          const ftype = buffer[4]
+          const payload = buffer.slice(5, 5 + len)
+          buffer = buffer.slice(5 + len)
+          if (ftype === 0) {
+            handleMessage(new TextDecoder().decode(payload))
+          } else {
+            handleBinaryFrame(payload.buffer)
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('WebTransport 流读取结束:', e)
+    }
+    if (ws === adapter && !closed) {
+      // WT 断线：与 WS 断线一致走自适应重连（会再次尝试 WT，失败则 TCP）
+      ws = null
+      teardownH264()
+      if (!reconnectSuppressed && sessionSettings.value.autoReconnect) {
+        scheduleReconnect()
+      }
+    }
+  })()
+
+  return adapter
+}
+
+const openSocketFromCandidates = (sessionInfo) => {
+  try {
+    const token = getAuthToken()
+    if (!token) {
+      throw new Error('当前登录已失效，请重新登录后再发起远程桌面')
+    }
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const socket = new WebSocket(wsCandidates[wsCandidateIndex])
+    socket.binaryType = 'arraybuffer'
     ws = socket
     remoteSessionInitialized = false
     reconnectSuppressed = false
+    // 直连静默看门狗：必须在 socket 创建时设置（防火墙 DROP 时 onopen 永远不触发，
+    // WebSocket 会停在 CONNECTING 状态直到 TCP 超时）——4 秒未打开即回落下一候选
+    clearSilentCheckTimer()
+    silentCheckTimer = setTimeout(() => {
+      if (ws === socket && socket.readyState !== WebSocket.OPEN) {
+        console.warn('候选连接超时未打开，回落下一候选:', wsCandidates[wsCandidateIndex])
+        try {
+          socket.close()
+        } catch (e) {
+          // 触发 onclose/onerror 走候选回落
+        }
+      }
+    }, 4000)
 
     socket.onopen = () => {
       if (ws !== socket) return
@@ -1234,16 +1461,32 @@ const connect = () => {
       awaitingConsent.value = true
       reconnectAttempts = 0
       errorMessage.value = '等待被控端确认远程控制请求...'
+      // 能力声明延后到收到引擎首条消息（引擎消息循环建立需约 10s，提前发会丢失）
+      capabilitiesSent = false
+      clearCapabilitiesRetry()
     }
 
     socket.onmessage = (event) => {
       if (ws !== socket) return
 
-      handleMessage(event.data)
+      // 二进制帧协议：控制消息走 text(JSON)，屏幕帧走 binary(ArrayBuffer)
+      if (event.data instanceof ArrayBuffer) {
+        handleBinaryFrame(event.data)
+      } else {
+        handleMessage(event.data)
+      }
     }
 
     socket.onerror = (error) => {
       if (ws !== socket) return
+
+      // 直连候选失败且会话尚未初始化 → 尝试下一个候选（回落平台中继）
+      if (wsCandidateIndex < wsCandidates.length - 1 && !remoteSessionInitialized) {
+        console.warn('直连失败，回落平台中继:', wsCandidates[wsCandidateIndex])
+        wsCandidateIndex += 1
+        openSocketFromCandidates()
+        return
+      }
 
       console.error('WebSocket错误:', error)
       awaitingConsent.value = false
@@ -1259,11 +1502,24 @@ const connect = () => {
       if (ws !== socket) return
 
       console.log('WebSocket连接已关闭')
+      // 直连候选在初始化前断开且未报错 → 尝试下一个候选
+      if (
+        wsCandidateIndex < wsCandidates.length - 1 &&
+        !remoteSessionInitialized &&
+        event.code !== 1000 &&
+        !shouldSuppressReconnectOnClose(event)
+      ) {
+        console.warn('直连未完成初始化，回落平台中继:', wsCandidates[wsCandidateIndex])
+        wsCandidateIndex += 1
+        openSocketFromCandidates()
+        return
+      }
       if (shouldSuppressReconnectOnClose(event)) {
         reconnectSuppressed = true
       }
       awaitingConsent.value = false
       stopHeartbeat()
+      teardownH264()
       ws = null
       clearUploadStatusWaiters()
       const closeReason = String(event?.reason || '').trim()
@@ -1398,8 +1654,91 @@ const markSessionConnected = () => {
   }
 }
 
+const handleBinaryFrame = async (arrayBuffer) => {
+  announceCapabilities()
+  // 二进制帧协议：
+  // 0x02 JPEG：[1B type][4B frameId][4B width][4B height][4B payloadLen][jpeg bytes]
+  // 0x03 H264：[1B type][4B seq][4B width][4B height][4B payloadLen][1B keyframe][payload bytes]
+  try {
+    const view = new DataView(arrayBuffer)
+    if (arrayBuffer.byteLength < 17) return
+    const frameType = view.getUint8(0)
+    const frameId = view.getUint32(1)
+    const width = view.getUint32(5)
+    const height = view.getUint32(9)
+    const payloadLen = view.getUint32(13)
+    if (arrayBuffer.byteLength < 17 + payloadLen) return
+
+    if (frameType === 0x03) {
+      // H.264：Annex-B 裸流，解码后渲染并回 ACK（背压依据）
+      const keyframe = view.getUint8(17) === 1
+      const payload = new Uint8Array(arrayBuffer, 18, payloadLen)
+      markRemoteSessionInitialized()
+      markSessionConnected()
+      h264Mode = true
+      clearCapabilitiesRetry()
+      const decoder = ensureH264Decoder()
+      if (!decoder || decoder.state !== 'configured') {
+        // 解码器不可用：丢弃并要求关键帧/回退
+        sendFrameAck(frameId)
+        return
+      }
+      const now = Date.now()
+      if (lastFrameTime > 0) {
+        fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+      }
+      lastFrameTime = now
+      frameCounter++
+      streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+      if (frameCounter % 10 === 0) {
+        bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
+      }
+      const chunk = new EncodedVideoChunk({
+        type: keyframe ? 'key' : 'delta',
+        timestamp: frameId * 1000,
+        data: payload
+      })
+      decoder.decode(chunk)
+      sendFrameAck(frameId)
+      return
+    }
+
+    // JPEG (0x02)
+    const jpegBytes = new Uint8Array(arrayBuffer, 17, payloadLen)
+
+    markRemoteSessionInitialized()
+    markSessionConnected()
+    latestFrameId += 1
+
+    // 更新FPS
+    const now = Date.now()
+    if (lastFrameTime > 0) {
+      const delta = now - lastFrameTime
+      fps.value = Math.round(1000 / delta)
+    }
+    lastFrameTime = now
+    frameCounter++
+
+    // 更新推流分辨率
+    streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+    // 更新带宽
+    if (frameCounter % 10 === 0) {
+      const dataSize = payloadLen / 1024
+      bandwidth.value = `${Math.round(dataSize * fps.value)} KB/s`
+    }
+
+    // 用 createImageBitmap 解码（比 new Image + base64 快且无 base64 开销）
+    const blob = new Blob([jpegBytes], { type: 'image/jpeg' })
+    const bitmap = await createImageBitmap(blob)
+    drawBitmapFrame(bitmap, width, height, frameId)
+  } catch (e) {
+    console.warn('[remote-desktop] binary frame decode failed', e)
+  }
+}
+
 const handleMessage = (data) => {
   try {
+    announceCapabilities()
     const message = JSON.parse(data)
 
     if (message.type === 'frame') {
@@ -1425,6 +1764,24 @@ const handleMessage = (data) => {
         const dataSize = message.data.length * 0.75 / 1024 // Base64转KB
         bandwidth.value = `${Math.round(dataSize * fps.value)} KB/s`
       }
+    } else if (message.type === 'codec_switch') {
+      // 编解码切换通知：h264 → 初始化 WebCodecs；jpeg → 清理 H.264 状态
+      markRemoteSessionInitialized()
+      markSessionConnected()
+      if (message.codec === 'h264') {
+        h264Mode = true
+        h264LastSeq = 0
+        const decoder = ensureH264Decoder()
+        if (!decoder) {
+          // 浏览器不支持 WebCodecs：通知服务端回退 JPEG
+          sendSocketMessage({ type: 'viewer_capabilities', webcodecs: false })
+          h264Mode = false
+        }
+      } else {
+        teardownH264()
+      }
+    } else if (message.type === 'h264') {
+      handleH264Frame(message)
     } else if (message.type === 'screen_info') {
       markRemoteSessionInitialized()
       markSessionConnected()
@@ -2612,6 +2969,157 @@ const flushPendingFrame = () => {
   drawFrame(nextFrame.message, nextFrame.frameId)
 }
 
+// ============ H.264（WebCodecs）路径 ============
+
+const resetH264Decoder = () => {
+  try {
+    if (videoDecoder && videoDecoder.state !== 'closed') {
+      videoDecoder.close()
+    }
+  } catch (e) {
+    // ignore
+  }
+  videoDecoder = null
+}
+
+const teardownH264 = () => {
+  h264Mode = false
+  h264DecodeFailStreak = 0
+  h264LastSeq = 0
+  resetH264Decoder()
+  clearCapabilitiesRetry()
+  clearSilentCheckTimer()
+}
+
+const sendFrameAck = (seq) => {
+  if (seq > 0) {
+    sendSocketMessage({ type: 'frame_ack', seq })
+  }
+}
+
+const renderVideoFrame = (frame) => {
+  if (!ctx || !desktopCanvas.value) {
+    frame.close()
+    return
+  }
+  applyRemoteResolution(frame.displayWidth, frame.displayHeight)
+  ctx.drawImage(frame, 0, 0, frame.displayWidth, frame.displayHeight)
+  frame.close()
+}
+
+const handleH264Frame = (message) => {
+  markRemoteSessionInitialized()
+  markSessionConnected()
+  const seq = Number(message.seq) || 0
+  if (seq <= h264LastSeq) {
+    // 乱序/重复帧：直接确认丢弃
+    sendFrameAck(seq)
+    return
+  }
+  h264LastSeq = seq
+
+  // 更新分辨率与带宽显示
+  applyRemoteResolution(Number(message.width) || 0, Number(message.height) || 0)
+  streamResolution.value = formatResolutionText(message.width, message.height, streamResolution.value)
+  const now = Date.now()
+  if (lastFrameTime > 0) {
+    fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+  }
+  lastFrameTime = now
+  frameCounter++
+  if (frameCounter % 10 === 0) {
+    const dataSize = (message.data || '').length * 0.75 / 1024
+    bandwidth.value = `${Math.round(dataSize * Math.max(fps.value, 1))} KB/s`
+  }
+
+  try {
+    let decoder = videoDecoder
+    if (!decoder || decoder.state !== 'configured') {
+      sendFrameAck(seq)
+      return
+    }
+    // 解码积压（>2 帧）且收到关键帧 → 重置解码器直跳最新画面（旧帧链整体丢弃）
+    if (message.keyframe && decoder.decodeQueueSize > 2) {
+      decodeStats.dropped += decoder.decodeQueueSize
+      resetH264Decoder()
+      decoder = ensureH264Decoder()
+      if (!decoder || decoder.state !== 'configured') {
+        sendFrameAck(seq)
+        return
+      }
+    }
+    const binary = atob(message.data)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    const chunk = new EncodedVideoChunk({
+      type: message.keyframe ? 'key' : 'delta',
+      timestamp: seq * 1000,
+      data: bytes
+    })
+    decoder.decode(chunk)
+    // 渲染由 decoder output 回调完成，此处按帧确认（背压依据）
+    sendFrameAck(seq)
+  } catch (e) {
+    console.error('❌ H.264 解码失败:', e)
+    h264DecodeFailStreak += 1
+    sendFrameAck(seq)
+    if (h264DecodeFailStreak <= 2) {
+      // 请求关键帧重建参考链
+      sendSocketMessage({ type: 'request_keyframe' })
+    } else if (h264DecodeFailStreak >= 6) {
+      // 连续失败：整体回退 JPEG
+      sendSocketMessage({ type: 'viewer_capabilities', webcodecs: false })
+      teardownH264()
+    }
+  }
+}
+
+const ensureH264Decoder = () => {
+  if (videoDecoder && videoDecoder.state === 'configured') return videoDecoder
+  if (typeof window === 'undefined' || typeof window.VideoDecoder !== 'function') {
+    return null
+  }
+  if (videoDecoder && videoDecoder.state === 'closed') {
+    videoDecoder = null
+  }
+  if (!videoDecoder) {
+    try {
+      videoDecoder = new VideoDecoder({
+        output: (frame) => renderVideoFrame(frame),
+        error: (e) => {
+          console.error('❌ VideoDecoder error:', e)
+          h264DecodeFailStreak += 1
+          if (h264DecodeFailStreak >= 6) {
+            sendSocketMessage({ type: 'viewer_capabilities', webcodecs: false })
+            teardownH264()
+          }
+        }
+      })
+      // Annex-B 裸流（无 description），x264 默认 High Profile
+      videoDecoder.configure({ codec: 'avc1.640028' })
+      h264DecodeFailStreak = 0
+    } catch (e) {
+      console.error('❌ VideoDecoder 初始化失败:', e)
+      return null
+    }
+  }
+  return videoDecoder
+}
+
+
+const drawBitmapFrame = (bitmap, width, height, frameId) => {
+  if (!ctx || !desktopCanvas.value) return
+  if (frameId < lastRenderedFrameId) return
+  const canvas = desktopCanvas.value
+  applyRemoteResolution(width, height)
+  ctx.clearRect(0, 0, width, height)
+  ctx.drawImage(bitmap, 0, 0, width, height)
+  lastRenderedFrameId = frameId
+  if (bitmap && bitmap.close) bitmap.close()
+}
+
 const drawFrame = (message, frameId) => {
   if (!ctx || !desktopCanvas.value) {
     console.error('❌ Canvas未初始化')
@@ -3139,8 +3647,10 @@ const resolveCanvasPosition = (event, options = {}) => {
   const rawCanvasY = (offsetY / usableHeight) * canvasHeight
   const canvasX = Math.max(0, Math.min(rawCanvasX, maxCanvasX))
   const canvasY = Math.max(0, Math.min(rawCanvasY, maxCanvasY))
-  const normalized_x = maxCanvasX > 0 ? Math.max(0, Math.min(canvasX / maxCanvasX, 1)) : 0
-  const normalized_y = maxCanvasY > 0 ? Math.max(0, Math.min(canvasY / maxCanvasY, 1)) : 0
+  // 归一化必须按位图全宽/全高换算：按 (size-1) 会放大约 size/(size-1)，
+  // 在被控端放大回屏幕尺寸时产生最高约 2px 的系统性右/下偏移。
+  const normalized_x = canvasWidth > 0 ? Math.max(0, Math.min(canvasX / canvasWidth, 1)) : 0
+  const normalized_y = canvasHeight > 0 ? Math.max(0, Math.min(canvasY / canvasHeight, 1)) : 0
 
   const position = {
     canvasX,

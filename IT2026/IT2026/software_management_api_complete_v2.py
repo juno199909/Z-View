@@ -28,6 +28,7 @@ from auth_utils import (
     verify_access_token,
 )
 from config_utils import get_cors_middleware_options, get_db_config, get_env
+from console_utils import safe_console_print
 
 # 数据库配置
 DB_CONFIG = get_db_config()
@@ -212,7 +213,7 @@ def serialize_package_record(package: Dict[str, Any]) -> Dict[str, Any]:
 @app.get("/api/v1/software/packages")
 def get_packages(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=500),
     category: Optional[str] = None,
     status: Optional[str] = None,
     keyword: Optional[str] = None
@@ -272,7 +273,7 @@ def get_packages(
 def get_packages_legacy(
     request: Request,
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=500),
     category: Optional[str] = None,
     status: Optional[str] = None,
     keyword: Optional[str] = None,
@@ -362,6 +363,120 @@ async def upload_package(
     except Error as e:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/software/packages/categories")
+def get_package_categories():
+    """获取软件包分类汇总。"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT COALESCE(category, 'other') AS category, COUNT(*) AS package_count
+            FROM software_packages
+            WHERE deleted_at IS NULL
+            GROUP BY COALESCE(category, 'other')
+            ORDER BY package_count DESC, category ASC
+            """
+        )
+        category_rows = cursor.fetchall()
+        category_counts = {row["category"]: int(row["package_count"] or 0) for row in category_rows}
+
+        default_categories = [
+            {"value": "office", "label": "办公软件"},
+            {"value": "dev", "label": "开发工具"},
+            {"value": "security", "label": "安全软件"},
+            {"value": "other", "label": "其他"},
+        ]
+
+        data = []
+        seen_categories = set()
+        for item in default_categories:
+            category_value = item["value"]
+            data.append({
+                "value": category_value,
+                "label": item["label"],
+                "count": category_counts.get(category_value, 0),
+            })
+            seen_categories.add(category_value)
+
+        for category_value, count in category_counts.items():
+            if category_value in seen_categories:
+                continue
+            data.append({
+                "value": category_value,
+                "label": category_value,
+                "count": count,
+            })
+
+        return {"data": data}
+
+    except Error as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/v1/software/packages/stats")
+def get_package_stats():
+    """获取软件包统计信息。"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_count,
+                SUM(CASE WHEN status = 'deprecated' THEN 1 ELSE 0 END) AS deprecated_count,
+                COALESCE(SUM(download_count), 0) AS total_download_count,
+                COALESCE(SUM(install_count), 0) AS total_install_count,
+                COALESCE(SUM(file_size), 0) AS total_file_size
+            FROM software_packages
+            WHERE deleted_at IS NULL
+            """
+        )
+        stats = cursor.fetchone() or {}
+
+        cursor.execute(
+            """
+            SELECT COALESCE(category, 'other') AS category, COUNT(*) AS package_count
+            FROM software_packages
+            WHERE deleted_at IS NULL
+            GROUP BY COALESCE(category, 'other')
+            """
+        )
+        category_rows = cursor.fetchall()
+
+        return {
+            "total": int(stats.get("total") or 0),
+            "available_count": int(stats.get("available_count") or 0),
+            "deprecated_count": int(stats.get("deprecated_count") or 0),
+            "total_download_count": int(stats.get("total_download_count") or 0),
+            "total_install_count": int(stats.get("total_install_count") or 0),
+            "total_file_size": int(stats.get("total_file_size") or 0),
+            "category_stats": [
+                {
+                    "category": row["category"],
+                    "count": int(row["package_count"] or 0),
+                }
+                for row in category_rows
+            ],
+        }
+
+    except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
@@ -547,119 +662,6 @@ def download_package(package_id: int, request: Request):
         conn.close()
 
 
-@app.get("/api/v1/software/packages/categories")
-def get_package_categories():
-    """获取软件包分类汇总。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT COALESCE(category, 'other') AS category, COUNT(*) AS package_count
-            FROM software_packages
-            WHERE deleted_at IS NULL
-            GROUP BY COALESCE(category, 'other')
-            ORDER BY package_count DESC, category ASC
-            """
-        )
-        category_rows = cursor.fetchall()
-        category_counts = {row["category"]: int(row["package_count"] or 0) for row in category_rows}
-
-        default_categories = [
-            {"value": "office", "label": "办公软件"},
-            {"value": "dev", "label": "开发工具"},
-            {"value": "security", "label": "安全软件"},
-            {"value": "other", "label": "其他"},
-        ]
-
-        data = []
-        seen_categories = set()
-        for item in default_categories:
-            category_value = item["value"]
-            data.append({
-                "value": category_value,
-                "label": item["label"],
-                "count": category_counts.get(category_value, 0),
-            })
-            seen_categories.add(category_value)
-
-        for category_value, count in category_counts.items():
-            if category_value in seen_categories:
-                continue
-            data.append({
-                "value": category_value,
-                "label": category_value,
-                "count": count,
-            })
-
-        return {"data": data}
-
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.get("/api/v1/software/packages/stats")
-def get_package_stats():
-    """获取软件包统计信息。"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_count,
-                SUM(CASE WHEN status = 'deprecated' THEN 1 ELSE 0 END) AS deprecated_count,
-                COALESCE(SUM(download_count), 0) AS total_download_count,
-                COALESCE(SUM(install_count), 0) AS total_install_count,
-                COALESCE(SUM(file_size), 0) AS total_file_size
-            FROM software_packages
-            WHERE deleted_at IS NULL
-            """
-        )
-        stats = cursor.fetchone() or {}
-
-        cursor.execute(
-            """
-            SELECT COALESCE(category, 'other') AS category, COUNT(*) AS package_count
-            FROM software_packages
-            WHERE deleted_at IS NULL
-            GROUP BY COALESCE(category, 'other')
-            """
-        )
-        category_rows = cursor.fetchall()
-
-        return {
-            "total": int(stats.get("total") or 0),
-            "available_count": int(stats.get("available_count") or 0),
-            "deprecated_count": int(stats.get("deprecated_count") or 0),
-            "total_download_count": int(stats.get("total_download_count") or 0),
-            "total_install_count": int(stats.get("total_install_count") or 0),
-            "total_file_size": int(stats.get("total_file_size") or 0),
-            "category_stats": [
-                {
-                    "category": row["category"],
-                    "count": int(row["package_count"] or 0),
-                }
-                for row in category_rows
-            ],
-        }
-
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
 # ============================================================
 # 任务管理API
 # ============================================================
@@ -772,7 +774,7 @@ def create_task(task: SoftwareTask, request: Request):
 @app.get("/api/v1/software/tasks")
 def get_tasks(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=500),
     task_type: Optional[str] = None,
     software_name: Optional[str] = None,
     status: Optional[str] = None,
@@ -1271,6 +1273,15 @@ def poll_tasks(data: dict, request: Request):
         cursor = conn.cursor(dictionary=True)
         asset_id = get_agent_asset_info(cursor, data.get('asset_id'))['id']
 
+        # 强制安装策略持续收敛：领任务前检查该终端是否缺策略要求的软件，缺则补建任务
+        try:
+            from software_policy_api import enforce_force_install_convergence
+            if enforce_force_install_convergence(cursor, asset_id) > 0:
+                conn.commit()
+        except Exception as conv_exc:
+            # 收敛失败不影响正常领任务
+            safe_console_print(f"[SoftwareTasks] force_install convergence failed for asset {asset_id}: {conv_exc}")
+
         cursor.execute("""
             SELECT
                 t.id as task_id, t.task_type, t.package_id, t.software_name,
@@ -1632,6 +1643,18 @@ class WhitelistRule(BaseModel):
     apply_to_groups: Optional[List[int]] = None
     apply_to_assets: Optional[List[int]] = None
 
+class WhitelistRuleUpdate(BaseModel):
+    rule_name: Optional[str] = None
+    match_type: Optional[str] = None
+    software_name: Optional[str] = None
+    version_range: Optional[str] = None
+    vendor: Optional[str] = None
+    file_hash: Optional[str] = None
+    description: Optional[str] = None
+    enabled: Optional[bool] = None
+    apply_to_groups: Optional[List[int]] = None
+    apply_to_assets: Optional[List[int]] = None
+
 class InstallPolicy(BaseModel):
     policy_name: str
     package_id: int
@@ -1640,6 +1663,18 @@ class InstallPolicy(BaseModel):
     install_deadline: Optional[datetime] = None
     auto_upgrade: bool = False
     check_interval: int = 3600
+    apply_to_groups: Optional[List[int]] = None
+    apply_to_assets: Optional[List[int]] = None
+
+class InstallPolicyUpdate(BaseModel):
+    policy_name: Optional[str] = None
+    package_id: Optional[int] = None
+    target_version: Optional[str] = None
+    enforce_type: Optional[str] = None
+    install_deadline: Optional[datetime] = None
+    auto_upgrade: Optional[bool] = None
+    check_interval: Optional[int] = None
+    enabled: Optional[bool] = None
     apply_to_groups: Optional[List[int]] = None
     apply_to_assets: Optional[List[int]] = None
 
@@ -2040,7 +2075,7 @@ def evaluate_compliance_result(
 @app.get("/api/v1/software/whitelist")
 def get_whitelist(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100)
+    page_size: int = Query(20, ge=1, le=500)
 ):
     """获取白名单列表"""
     conn = get_db_connection()
@@ -2117,7 +2152,7 @@ def create_whitelist(rule: WhitelistRule, request: Request):
         conn.close()
 
 @app.put("/api/v1/software/whitelist/{rule_id}")
-def update_whitelist(rule_id: int, rule: WhitelistRule):
+def update_whitelist(rule_id: int, rule: WhitelistRuleUpdate):
     """更新白名单规则"""
     conn = get_db_connection()
     if not conn:
@@ -2130,20 +2165,38 @@ def update_whitelist(rule_id: int, rule: WhitelistRule):
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="规则不存在")
 
-        apply_to_groups = json.dumps(rule.apply_to_groups) if rule.apply_to_groups else None
-        apply_to_assets = json.dumps(rule.apply_to_assets) if rule.apply_to_assets else None
+        update_fields = []
+        values = []
+        field_map = {
+            "rule_name": rule.rule_name,
+            "match_type": rule.match_type,
+            "software_name": rule.software_name,
+            "version_range": rule.version_range,
+            "vendor": rule.vendor,
+            "file_hash": rule.file_hash,
+            "description": rule.description,
+            "enabled": rule.enabled,
+        }
+        for key, value in field_map.items():
+            if value is not None:
+                update_fields.append(f"{key} = %s")
+                values.append(value)
 
-        cursor.execute("""
-            UPDATE software_whitelist SET
-                rule_name = %s, match_type = %s, software_name = %s,
-                version_range = %s, vendor = %s, file_hash = %s,
-                description = %s, apply_to_groups = %s, apply_to_assets = %s
-            WHERE id = %s
-        """, (
-            rule.rule_name, rule.match_type, rule.software_name, rule.version_range,
-            rule.vendor, rule.file_hash, rule.description,
-            apply_to_groups, apply_to_assets, rule_id
-        ))
+        if rule.apply_to_groups is not None:
+            update_fields.append("apply_to_groups = %s")
+            values.append(json.dumps(rule.apply_to_groups))
+        if rule.apply_to_assets is not None:
+            update_fields.append("apply_to_assets = %s")
+            values.append(json.dumps(rule.apply_to_assets))
+
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
+
+        update_fields.append("updated_at = NOW()")
+        values.append(rule_id)
+
+        sql = f"UPDATE software_whitelist SET {', '.join(update_fields)} WHERE id = %s"
+        cursor.execute(sql, values)
 
         conn.commit()
 
@@ -2187,7 +2240,7 @@ def delete_whitelist(rule_id: int):
 @app.get("/api/v1/software/policies")
 def get_install_policies(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100)
+    page_size: int = Query(20, ge=1, le=500)
 ):
     """获取安装策略列表"""
     conn = get_db_connection()
@@ -2271,7 +2324,7 @@ def create_install_policy(policy: InstallPolicy, request: Request):
         conn.close()
 
 @app.put("/api/v1/software/policies/{policy_id}")
-def update_install_policy(policy_id: int, policy: InstallPolicy):
+def update_install_policy(policy_id: int, policy: InstallPolicyUpdate):
     """更新安装策略"""
     conn = get_db_connection()
     if not conn:
@@ -2284,20 +2337,38 @@ def update_install_policy(policy_id: int, policy: InstallPolicy):
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="策略不存在")
 
-        apply_to_groups = json.dumps(policy.apply_to_groups) if policy.apply_to_groups else None
-        apply_to_assets = json.dumps(policy.apply_to_assets) if policy.apply_to_assets else None
+        update_fields = []
+        values = []
+        field_map = {
+            "policy_name": policy.policy_name,
+            "package_id": policy.package_id,
+            "target_version": policy.target_version,
+            "enforce_type": policy.enforce_type,
+            "install_deadline": policy.install_deadline,
+            "auto_upgrade": policy.auto_upgrade,
+            "check_interval": policy.check_interval,
+            "enabled": policy.enabled,
+        }
+        for key, value in field_map.items():
+            if value is not None:
+                update_fields.append(f"{key} = %s")
+                values.append(value)
 
-        cursor.execute("""
-            UPDATE software_install_policies SET
-                policy_name = %s, package_id = %s, target_version = %s,
-                enforce_type = %s, install_deadline = %s, auto_upgrade = %s,
-                check_interval = %s, apply_to_groups = %s, apply_to_assets = %s
-            WHERE id = %s
-        """, (
-            policy.policy_name, policy.package_id, policy.target_version,
-            policy.enforce_type, policy.install_deadline, policy.auto_upgrade,
-            policy.check_interval, apply_to_groups, apply_to_assets, policy_id
-        ))
+        if policy.apply_to_groups is not None:
+            update_fields.append("apply_to_groups = %s")
+            values.append(json.dumps(policy.apply_to_groups))
+        if policy.apply_to_assets is not None:
+            update_fields.append("apply_to_assets = %s")
+            values.append(json.dumps(policy.apply_to_assets))
+
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
+
+        update_fields.append("updated_at = NOW()")
+        values.append(policy_id)
+
+        sql = f"UPDATE software_install_policies SET {', '.join(update_fields)} WHERE id = %s"
+        cursor.execute(sql, values)
 
         conn.commit()
 
@@ -2341,7 +2412,7 @@ def delete_install_policy(policy_id: int):
 @app.get("/api/v1/software/compliance/checks")
 def get_compliance_checks(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100)
+    page_size: int = Query(20, ge=1, le=500)
 ):
     """获取合规检查规则列表"""
     conn = get_db_connection()
@@ -2495,7 +2566,7 @@ def delete_compliance_check(check_id: int):
 @app.get("/api/v1/software/compliance/results")
 def get_compliance_results(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=500),
     check_id: Optional[int] = None,
     is_compliant: Optional[bool] = None,
     severity: Optional[str] = None

@@ -1,0 +1,35 @@
+- generic [active] [ref=f2e1]:
+  - generic [ref=f2e4]:
+    - generic [ref=f2e5]:
+      - generic [ref=f2e6]:
+        - heading "Z-View" [level=1] [ref=f2e11]
+        - paragraph [ref=f2e12]: 企业级终端运维平台
+        - list [ref=f2e13]:
+          - listitem [ref=f2e14]:
+            - generic [ref=f2e18]: 资产全生命周期管理
+          - listitem [ref=f2e19]:
+            - generic [ref=f2e23]: 实时远程桌面与运维
+          - listitem [ref=f2e24]:
+            - generic [ref=f2e28]: 软件仓库 + 黑白名单
+          - listitem [ref=f2e29]:
+            - generic [ref=f2e33]: 告警 + 批量 + 策略下发
+      - generic [ref=f2e34]: © 2026 Z-View · 让运维更轻松
+    - generic [ref=f2e36]:
+      - generic [ref=f2e37]:
+        - heading "欢迎回来 👋" [level=2] [ref=f2e38]
+        - paragraph [ref=f2e39]: 请使用您的账号登录
+      - generic [ref=f2e40]:
+        - textbox "请输入用户名" [ref=f2e46]: admin
+        - generic [ref=f2e50]:
+          - textbox "请输入密码" [ref=f2e52]: admin123
+          - generic [ref=f2e63] [cursor=pointer]
+        - generic [ref=f2e53]:
+          - generic [ref=f2e54] [cursor=pointer]:
+            - generic [ref=f2e55]:
+              - checkbox "记住我"
+            - generic [ref=f2e57]: 记住我
+          - generic [ref=f2e58] [cursor=pointer]: 忘记密码？
+        - button "登 录" [ref=f2e59] [cursor=pointer]
+      - generic [ref=f2e61]: 登录即表示同意 《服务协议》 与 《隐私政策》
+  - alert [ref=f2e67]:
+    - paragraph [ref=f2e71]: 用户名或密码错误

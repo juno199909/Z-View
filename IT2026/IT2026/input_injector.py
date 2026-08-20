@@ -345,8 +345,10 @@ class InputInjector:
         clamped_normalized_x = max(0.0, min(float(normalized_x), 1.0))
         clamped_normalized_y = max(0.0, min(float(normalized_y), 1.0))
 
-        target_x = int(round(clamped_normalized_x * (virtual_width - 1) + virtual_left))
-        target_y = int(round(clamped_normalized_y * (virtual_height - 1) + virtual_top))
+        # 与 CoordinateMapper.denormalize_coordinate / 前端归一化约定一致：
+        # 按全尺寸比例四舍五入，右/下边界由钳制兜底。
+        target_x = int(round(clamped_normalized_x * virtual_width)) + virtual_left
+        target_y = int(round(clamped_normalized_y * virtual_height)) + virtual_top
         return self._clamp_to_virtual_desktop(target_x, target_y)
 
     def _clamp_to_virtual_desktop(self, x, y):

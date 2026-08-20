@@ -38,3 +38,14 @@ IT2026/IT2026/**/__pycache__/
 IT2026/IT2026/**/*.py[cod]
 IT2026/IT2026/**/*.log
 IT2026/IT2026/**/*.err.log
+
+# P0-1 整改：运行时密钥与部署配置不入库（原规则路径多一层未匹配）
+IT2026/.env
+IT2026/.env.local
+IT2026/config.json
+IT2026/config.local.json
+IT2026/IT2026/.env
+IT2026/IT2026/config.json
+IT2026/GPO部署包/config.json
+*.secret
+IT2026/IT2026/agent_upgrade/

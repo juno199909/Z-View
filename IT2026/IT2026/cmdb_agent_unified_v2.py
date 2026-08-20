@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import ctypes
 import csv
+import importlib
 from ctypes import wintypes
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
@@ -126,6 +127,18 @@ WTS_DOMAIN_NAME = 7
 
 @lru_cache(maxsize=1)
 def load_core_module():
+    bundled_import_error = None
+    try:
+        bundled_module = importlib.import_module("cmdb_agent_core")
+        if hasattr(bundled_module, "CONFIG") and hasattr(bundled_module, "SOFTWARE_CONFIG"):
+            return bundled_module
+        bundled_import_error = ImportError("Bundled cmdb_agent_core is missing required configuration attributes")
+    except Exception as exc:
+        bundled_import_error = exc
+
+    if getattr(sys, "frozen", False):
+        raise ImportError("Unable to load bundled cmdb_agent_core") from bundled_import_error
+
     core_module_path = next((candidate for candidate in _CORE_MODULE_CANDIDATES if candidate.exists()), None)
     if core_module_path is None:
         candidate_text = ", ".join(str(candidate) for candidate in _CORE_MODULE_CANDIDATES)
@@ -437,34 +450,70 @@ def list_frozen_executable_processes() -> list[dict[str, int | str]]:
     return processes
 
 
+_ZVIEW_CMDLINE_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _get_zview_process_command_lines() -> dict[int, tuple[int, str]]:
+    """返回 {pid: (session_id, command_line)}，带短 TTL 缓存。"""
+    now = time.time()
+    if now - float(_ZVIEW_CMDLINE_CACHE.get("at") or 0.0) < 5.0:
+        cached = _ZVIEW_CMDLINE_CACHE.get("data") or {}
+        return dict(cached)
+
+    data: dict[int, tuple[int, str]] = {}
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='Z-View.exe'\" | "
+                "ForEach-Object { Write-Output ('{0}|{1}|{2}' -f $_.ProcessId, $_.SessionId, $_.CommandLine) }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        for line in (completed.stdout or "").splitlines():
+            parts = line.split("|", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0].strip())
+                process_session_id = int(parts[1].strip())
+            except ValueError:
+                continue
+            data[pid] = (process_session_id, parts[2])
+    except Exception:
+        pass
+
+    _ZVIEW_CMDLINE_CACHE["at"] = now
+    _ZVIEW_CMDLINE_CACHE["data"] = dict(data)
+    return dict(data)
+
+
 def list_user_session_agent_pids(session_id: int | None, exclude_pid: int | None = None) -> list[int]:
+    """按 --user-session-agent 命令行参数精确识别用户态代理进程。
+
+    不能按镜像名+会话枚举：helper/consent-ui 是同 exe 同会话的不同角色，
+    心跳文件又存在启动初期的空窗，误判会让 supervisor 认为代理已在运行
+    而永远不拉起（重启后 user-session-agent 缺失的直接原因）。
+    """
     if session_id is None:
         return []
 
-    pid_set: set[int] = set()
-    for item in list_frozen_executable_processes():
-        pid = int(item.get("pid") or 0)
-        process_session_id = int(item.get("session_id") or -1)
-        if pid <= 0 or process_session_id != int(session_id):
+    pids: set[int] = set()
+    for pid, (process_session_id, command_line) in _get_zview_process_command_lines().items():
+        if process_session_id != int(session_id):
             continue
-        if exclude_pid is not None and pid == exclude_pid:
-            continue
-        pid_set.add(pid)
+        if "--user-session-agent" in (command_line or ""):
+            pids.add(pid)
 
-    consent_ui_payload = read_role_runtime_state(
-        "consent-ui",
-        session_bound=True,
-        session_id=session_id,
-    ) or {}
-    consent_ui_pid = int(consent_ui_payload.get("pid") or 0)
-    if consent_ui_pid > 0 and has_recent_role_runtime_state(
-        "consent-ui",
-        session_bound=True,
-        session_id=session_id,
-    ):
-        pid_set.discard(consent_ui_pid)
+    if exclude_pid is not None:
+        pids.discard(int(exclude_pid))
 
-    return sorted(pid_set)
+    return sorted(pids)
 
 
 def list_role_runtime_pids(
@@ -816,17 +865,27 @@ def get_interactive_session_ids() -> list[int]:
                 continue
 
             session_id = int(session_info.SessionId)
+            identity = _query_session_identity(session_id)
+            if not identity:
+                # No user identity — skip (Services / headless console etc.)
+                continue
             if session_info.State == WTS_ACTIVE:
-                if _query_session_identity(session_id):
-                    active_sessions_with_user.append(session_id)
-                else:
-                    active_sessions_without_user.append(session_id)
+                active_sessions_with_user.append(session_id)
             elif session_info.State == WTS_CONNECTED:
-                if _query_session_identity(session_id):
-                    connected_sessions_with_user.append(session_id)
+                connected_sessions_with_user.append(session_id)
+            else:
+                # Disconnected / Idle / etc. — keep the session as long as it
+                # has a user identity, so RDP-target consoles still have a
+                # place to host the user-session agent.
+                connected_sessions_with_user.append(session_id)
 
         ordered_sessions: list[int] = []
-        if preferred_console is not None and preferred_console in active_sessions_with_user:
+        # On Windows server / headless / VMware console, the console session
+        # often has no logged-on user identity (e.g. RDP-target console).
+        # Always try the active console first regardless of identity, so the
+        # supervisor can still launch the user-session agent there. Fall
+        # back to sessions with a real interactive user afterwards.
+        if preferred_console is not None:
             ordered_sessions.append(preferred_console)
 
         for session_id in active_sessions_with_user + connected_sessions_with_user:
@@ -1266,7 +1325,33 @@ def start_user_session_supervisor():
                         if primary_session_id is None:
                             continue
 
-                        if session_id != primary_session_id:
+                        # Only treat a session as "stray" if the primary has a
+                        # confirmed, recently-beating user-session agent.
+                        # Otherwise the primary is probably a headless / no-user
+                        # console (VMware, RDP-target console) and the RDP
+                        # session with a real interactive user is the
+                        # authoritative host. Letting it run avoids killing
+                        # the only working session.
+                        primary_alive = False
+                        primary_hb = read_role_runtime_state(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        ) or {}
+                        primary_pids = list_user_session_agent_pids(primary_session_id)
+                        primary_heartbeat_recent = has_recent_role_runtime_state(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        )
+                        primary_mutex = is_role_mutex_active(
+                            "user-session-agent",
+                            session_bound=True,
+                            session_id=primary_session_id,
+                        )
+                        primary_alive = bool(primary_heartbeat_recent and (primary_mutex or primary_pids))
+
+                        if session_id != primary_session_id and primary_alive:
                             stray_pids: list[int] = []
                             candidate_pids = {
                                 int(pid)
@@ -1324,7 +1409,11 @@ def start_user_session_supervisor():
     thread.start()
 
 
-def run_agent_service(enable_remote_desktop: bool = True, disable_session_supervisor: bool = False):
+def run_agent_service(
+    enable_remote_desktop: bool = True,
+    disable_session_supervisor: bool = False,
+    start_consent_ui: bool = False,
+):
     module = load_core_module()
     config = module.CONFIG
     software_config = module.SOFTWARE_CONFIG
@@ -1348,7 +1437,8 @@ def run_agent_service(enable_remote_desktop: bool = True, disable_session_superv
         if asset_id:
             print(f"[Software] Step 3: Starting software management with asset_id={asset_id}")
             module.start_software_management(asset_id)
-            print("[Software] Step 4: Software management started successfully")
+            module.start_security_policy_sync(asset_id)
+            print("[Software] Step 4: Software management + security policy sync started")
         else:
             print("[Software] ERROR: Failed to get asset_id, software management disabled")
     except Exception as exc:
@@ -1359,9 +1449,14 @@ def run_agent_service(enable_remote_desktop: bool = True, disable_session_superv
     print("[Agent] Startup handoff to remote desktop server")
     if enable_remote_desktop:
         module.start_remote_desktop_server()
-        return
+        if start_consent_ui:
+            if launch_consent_ui_background():
+                log_runtime_event("ConsentUI", "background tray helper launched for direct agent startup")
+            else:
+                log_runtime_event("ConsentUI", "background tray helper failed to launch for direct agent startup")
+    else:
+        print("[Agent] Remote desktop server disabled for this role")
 
-    print("[Agent] Remote desktop server disabled for this role")
     if disable_session_supervisor:
         print("[Agent] Session supervisor delegated to service runtime")
     else:
@@ -1424,6 +1519,7 @@ def launch_consent_ui_background() -> bool:
             creation_flags = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
 
         process = subprocess.Popen(
@@ -1509,7 +1605,7 @@ def run_user_session_agent():
 
     runtime = RemoteDesktopUserAgentRuntime(
         session_id=session_id,
-        start_remote_desktop_server=module.start_remote_desktop_server,
+        start_remote_desktop_server=lambda: module.start_remote_desktop_server(wait=True),
         launch_consent_ui_background=launch_consent_ui_background,
         keepalive=keep_worker_alive,
         log_runtime_event=log_runtime_event,
@@ -1711,7 +1807,33 @@ def run_service_host():
     servicemanager.StartServiceCtrlDispatcher()
 
 
+def ensure_windows_dpi_awareness() -> bool:
+    """尽早将进程标记为 Per-Monitor DPI 感知。
+
+    远控的 screen_info 上报、坐标换算与抓屏区域全部依赖屏幕度量；进程若处于
+    DPI 不感知状态，在 125%/150% 缩放的会话里会读到 1536x864 一类虚拟化值，
+    造成远控画面被裁剪、画面内容与点击映射错位。必须在任何窗口或抓屏库
+    （tkinter、dxcam、pyautogui 等）初始化之前调用；若感知已被其他组件抢先
+    设置，本函数会静默失败并保持现有状态。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return True
+    except Exception:
+        pass
+    try:
+        user32 = getattr(ctypes.windll, "user32", None)
+        if user32 is not None and hasattr(user32, "SetProcessDPIAware"):
+            return bool(user32.SetProcessDPIAware())
+    except Exception:
+        pass
+    return False
+
+
 def main(argv: list[str] | None = None):
+    ensure_windows_dpi_awareness()
     raw_args = list(sys.argv[1:] if argv is None else argv)
 
     if should_handle_service_command(raw_args):
@@ -1753,7 +1875,8 @@ def main(argv: list[str] | None = None):
 
     run_agent_service(
         enable_remote_desktop=not args.no_remote_desktop,
-        disable_session_supervisor=args.disable_session_supervisor,
+        disable_session_supervisor=True,
+        start_consent_ui=not args.no_remote_desktop,
     )
 
 

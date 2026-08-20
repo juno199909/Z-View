@@ -33,8 +33,8 @@ const routes = [
           {
             path: 'detail/:id',
             name: 'AssetDetail',
-            component: () => import('@/views/asset/Detail.vue'),
-            meta: { title: '资产详情' }
+            // 资产详情与终端详情合并：直接重定向到终端详情页（实时监控+资产档案同页）
+            redirect: (to) => ({ path: `/terminal/detail/${to.params.id}`, query: to.query })
           },
           {
             path: 'create',
@@ -48,13 +48,25 @@ const routes = [
         path: '/alert',
         name: 'Alert',
         component: () => import('@/views/alert/Alert.vue'),
-        meta: { title: '告警中心', icon: 'Bell' }
+        meta: { title: '终端日志', icon: 'Bell' }
       },
       {
         path: '/log',
         name: 'LogCenter',
         component: () => import('@/views/log/Index.vue'),
-        meta: { title: '日志中心', icon: 'Tickets' }
+        meta: { title: '日志总览', icon: 'Tickets' }
+      },
+      {
+        path: '/log/operations',
+        name: 'OperationLogs',
+        component: () => import('@/views/log/Operations.vue'),
+        meta: { title: '操作日志' }
+      },
+      {
+        path: '/system/users',
+        name: 'SystemUsers',
+        component: () => import('@/views/system/Users.vue'),
+        meta: { title: '用户管理' }
       },
       {
         path: '/automation',
@@ -84,6 +96,12 @@ const routes = [
             name: 'SoftwareCenter',
             component: () => import('@/views/terminal/SoftwareCenter.vue'),
             meta: { title: '软件管理' }
+          },
+          {
+            path: 'agent-upgrade',
+            name: 'AgentUpgrade',
+            component: () => import('@/views/terminal/AgentUpgrade.vue'),
+            meta: { title: 'Agent升级' }
           }
         ]
       },
@@ -92,6 +110,49 @@ const routes = [
         name: 'Discovery',
         component: () => import('@/views/discovery/Index.vue'),
         meta: { title: '资产发现', icon: 'Search' }
+      },
+      {
+        path: '/security',
+        name: 'Security',
+        meta: { title: '安全管理', icon: 'Lock' },
+        children: [
+          {
+            path: 'overview',
+            name: 'SecurityOverview',
+            component: () => import('@/views/security/Overview.vue'),
+            meta: { title: '安全总览' }
+          },
+          {
+            path: 'terminals',
+            name: 'SecurityTerminals',
+            component: () => import('@/views/security/Terminals.vue'),
+            meta: { title: '终端安全' }
+          },
+          {
+            path: 'firewall',
+            name: 'SecurityFirewall',
+            component: () => import('@/views/security/Firewall.vue'),
+            meta: { title: '防火墙' }
+          },
+          {
+            path: 'usb',
+            name: 'SecurityUsb',
+            component: () => import('@/views/security/Usb.vue'),
+            meta: { title: 'USB管控' }
+          },
+          {
+            path: 'policies',
+            name: 'SecurityPolicies',
+            component: () => import('@/views/security/Policies.vue'),
+            meta: { title: '策略中心' }
+          }
+        ]
+      },
+      {
+        path: '/settings/agent-policy',
+        name: 'AgentPolicy',
+        component: () => import('@/views/settings/AgentPolicy.vue'),
+        meta: { title: '终端策略', icon: 'Setting' }
       }
     ]
   },

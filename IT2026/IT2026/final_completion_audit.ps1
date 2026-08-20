@@ -65,19 +65,35 @@ function Get-RepoRoot {
 }
 
 function Test-PythonReleaseVersion {
-    $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $PythonCommand) {
-        Add-AuditItem "生产环境" "Python 版本" "FAIL" "未找到 python 命令。" "安装 Python 3.10、3.11 或 3.12 后复验。"
-        return
+    $Version = $null
+    $InterpreterLabel = ""
+    $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($PyLauncher) {
+        try {
+            $Version = (& $PyLauncher.Source -3.12 -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($Version)) {
+                $InterpreterLabel = "py -3.12"
+            }
+        } catch {
+        }
     }
 
-    $Version = (& python -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+    if (-not $Version) {
+        $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $PythonCommand) {
+            Add-AuditItem "生产环境" "Python 版本" "FAIL" "未找到 python 命令。" "安装 Python 3.10、3.11 或 3.12 后复验。"
+            return
+        }
+        $Version = (& $PythonCommand.Source -B -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')").Trim()
+        $InterpreterLabel = $PythonCommand.Source
+    }
+
     $Parts = $Version.Split(".")
     $Supported = ([int]$Parts[0] -eq 3 -and [int]$Parts[1] -ge 10 -and [int]$Parts[1] -le 12)
     if ($Supported) {
-        Add-AuditItem "生产环境" "Python 版本" "PASS" ("当前 Python {0} 在 3.10-3.12 范围内。" -f $Version) "无。"
+        Add-AuditItem "生产环境" "Python 版本" "PASS" ("当前发布验证解释器 {0} = {1}，在 3.10-3.12 范围内。" -f $InterpreterLabel, $Version) "无。"
     } else {
-        Add-AuditItem "生产环境" "Python 版本" "BLOCKED" ("当前 Python {0} 不在 3.10-3.12 发布验证范围内。" -f $Version) "切换到 Python 3.10-3.12 后运行 release_readiness_check.ps1 -RequireSupportedPython。"
+        Add-AuditItem "生产环境" "Python 版本" "BLOCKED" ("当前发布验证解释器 {0} = {1} 不在 3.10-3.12 发布验证范围内。" -f $InterpreterLabel, $Version) "切换到 Python 3.10-3.12 后运行 release_readiness_check.ps1 -RequireSupportedPython。"
     }
 }
 

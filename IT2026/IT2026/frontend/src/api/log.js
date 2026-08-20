@@ -15,3 +15,12 @@ export function getLogList(params) {
     params
   })
 }
+
+export function exportLogs(params) {
+  return request({
+    url: '/logs/export',
+    method: 'get',
+    params,
+    responseType: 'blob'
+  })
+}

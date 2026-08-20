@@ -118,6 +118,7 @@ hiddenimports = sorted(
         + _safe_collect_submodules("PIL")
         + _safe_collect_submodules("dxcam")
         + _safe_collect_submodules("mss")
+        + _safe_collect_submodules("av")
         + _safe_collect_submodules("comtypes")
         + _safe_collect_submodules("numpy")
         + _safe_collect_submodules("Common")
@@ -132,6 +133,7 @@ hiddenimports = sorted(
         + [
             "agent_consent_ipc",
             "auth_utils",
+            "cmdb_agent_core",
             "cmdb_agent_consent_ui",
             "comtypes",
             "console_utils",
@@ -150,6 +152,7 @@ hiddenimports = sorted(
             "pyrect",
             "remote_desktop_engine_v2",
             "remote_desktop_protocol",
+            "security_manager",
             "requests",
             "psutil",
             "servicemanager",
@@ -164,9 +167,11 @@ hiddenimports = sorted(
             "win32security",
             "win32service",
             "win32serviceutil",
+            "pythoncom",
             "win32timezone",
             "win32ts",
             "winreg",
+            "websockets",
         ]
         + sum((_safe_collect_importable_module(module_name) for module_name in _WGC_OPTIONAL_MODULES), [])
     )

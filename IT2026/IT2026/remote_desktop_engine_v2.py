@@ -15,6 +15,7 @@ import contextlib
 import zlib
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from multiprocessing.connection import Client
 from ctypes import wintypes
@@ -24,6 +25,7 @@ from fastapi import WebSocket
 
 from Capture.desktop_capture import DesktopFrameCapturer, create_capture_stack
 from Codec.video_encoder import VideoEncoderProfile
+from typing import Any
 from agent_consent_ipc import (
     APP_BASE_DIR,
     build_consent_authkey,
@@ -390,6 +392,11 @@ class RemoteAccessConsentManager:
                 return False, "rejected"
             if response.value == self.IDTIMEOUT:
                 return False, "timeout"
+            if response.value == 0:
+                # 部分 Windows 版本（含本机 RDP 会话）在等待超时或对话框未能展示时
+                # 返回 TRUE 且 response=0，而非 IDTIMEOUT；按超时拒绝并保留原始值供排查。
+                print(f"[Consent] WTS dialog returned response=0 after {self.timeout_seconds}s; treating as timeout")
+                return False, "timeout"
 
             return False, f"unknown_response:{response.value}"
 
@@ -499,6 +506,15 @@ class RemoteAccessConsentManager:
 
 
 CONSENT_MANAGER = RemoteAccessConsentManager()
+
+# 启动时用 agent 配置初始化同意策略；此前 configure() 从未被调用，
+# config.json 的 require_consent/consent_timeout_seconds 等键实际不生效。
+try:
+    from agent_consent_ipc import load_agent_config
+
+    CONSENT_MANAGER.configure((load_agent_config() or {}).get("remote_desktop") or {})
+except Exception as _consent_config_exc:  # pragma: no cover - 配置缺失时保持默认
+    print(f"[Consent] Failed to apply consent settings from config: {_consent_config_exc}")
 
 
 class RemoteClipboardManager:
@@ -898,11 +914,23 @@ class DisabledRemoteFileTransferManager:
 
 
 class ScreenCapturer(DesktopFrameCapturer):
-    """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。"""
+    """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
+
+    后端优先级：mss(GDI) 优先——它在 headless/VMware/无显示基底场景下仍能稳定抓到
+    桌面最后合成图（兼容 Win9x 时代的 GDI BitBlt 路径），不像 dxgi 那样依赖 DWM
+    持续产出新帧。dxgi 仅在物理显示器正常附着时作为备选（更高刷新率时质量更好）。
+    """
 
     def __init__(self):
-        super().__init__(backend_order=("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui"))
-        print("[RemoteDesktop] Screen capturer initialized")
+        super().__init__(backend_order=("mss", "gdi", "dxgi", "wgc", "dwm", "imagegrab", "pyautogui"))
+        try:
+            # CAPTUREBLT 标志为捕获分层窗口而设，BitBlt 慢 3-5 倍；
+            # 远控 60fps 场景去掉它（分层窗口脉冲窗口 1px 透明，无需捕获）
+            import mss.windows as _mss_win
+            _mss_win.CAPTUREBLT = 0
+        except Exception:
+            pass
+        print("[RemoteDesktop] Screen capturer initialized (headless-safe: mss first, fast-bitblt)")
 
 
 class DisplayResolutionManager:
@@ -1154,11 +1182,11 @@ class RemoteDesktopSession:
         self.capture_runtime_mode = (
             "service_capture_pending"
             if self.service_client is not None
-            else "service_capture_unavailable"
+            else "legacy_local_capture"
         )
         self.capture_host_backend = ""
         self.capture_host_session_id: int | None = None
-        self.service_managed_session_routing = True
+        self.service_managed_session_routing = self.service_client is not None
         self.capture_stack = create_capture_stack(
             runtime_mode=self.capture_runtime_mode,
             helper_available=bool(self.service_client),
@@ -1168,15 +1196,18 @@ class RemoteDesktopSession:
         self.runtime_stack: dict = {}
         self._last_capture_runtime_signature: tuple[str, str, int | None] | None = None
 
-        # 配置
-        # 当前链路仍是 JPEG over WebSocket，默认值偏向低延迟而非满分辨率。
-        self.quality = 75
-        self.fps = 18
-        self.scale = 0.9
+        # 配置：内网环境不限帧率，60fps 流畅优先
+        self.quality = 60
+        self.fps = 60
+        self.scale = 0.6
         self.adaptive_streaming = True
         self.wheel_speed = 1.0
         self.mouse_sensitivity = 1.0
         self.color_preset = "balanced"
+        # 轻量 DWM 唤醒窗口（替代重绘全桌面的 RedrawWindow）
+        self._redraw_hwnd = None
+        self._redraw_thread_lock = threading.Lock()
+        self._redraw_executor = None
 
         # 初始化模块
         self.display_manager = self._initialize_required_component(
@@ -1196,6 +1227,16 @@ class RemoteDesktopSession:
                 follow_service_session=self.service_managed_session_routing,
             ),
         )
+        # 输入处理专用单线程执行器：委托 helper 的命名管道调用可能阻塞，
+        # 必须移出 asyncio 事件循环，否则会冻结帧推送并造成"无法操作"；
+        # max_workers=1 同时保证键盘/鼠标事件按到达顺序执行。
+        self._input_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"rd-input-{self.session_id}"
+        )
+        # move 合并状态：队列中至多一个待处理 move（始终最新位置）
+        self._pending_move_message: dict | None = None
+        self._move_task_scheduled = False
+        self._pending_move_lock = threading.Lock()
         self.capturer = self._initialize_required_component(
             "screen_capturer",
             ScreenCapturer,
@@ -1238,6 +1279,7 @@ class RemoteDesktopSession:
         self.skipped_frame_count = 0
         self.capture_pressure = 0.0
         self.capture_profile_name = "interactive"
+        self._last_sent_frame: dict | None = None  # 用于 unchanged 期间的心跳重发
         self.force_keyframe_interval = 1.0
         self.stale_frame_after_input_threshold = 3.0
         self.stale_frame_rotation_cooldown = 5.0
@@ -1254,6 +1296,30 @@ class RemoteDesktopSession:
         self.persistent_substrate_recovery_cooldown = 15.0
         self.last_persistent_substrate_recovery_at = 0.0
         self.last_persistent_substrate_recovery_signature = ""
+
+        # H.264 流式编码（RustDesk 阶段二）：观看端声明 WebCodecs 后启用
+        self.viewer_h264_capable = False
+        self.h264_active = False
+        self.h264_encoder = None
+        self.h264_encode_fail_streak = 0
+        self._h264_sent_seq = 0
+        self._h264_acked_seq = 0
+        self._h264_keyframe_requested = False
+        self._h264_stats = {"frames": 0, "bytes": 0, "drops_backpressure": 0}
+        self._h264_last_pil = None  # 上一帧 RGB 缓存：助手报画面未变时用其编码微小增量，保持恒定帧率
+        self.h264_activated_at = 0.0  # H.264 激活时间：用于检测观看端是否真的在消费（旧版前端兼容降级）
+        self._h264_scale = 1.0  # 动态分辨率：弱机自动降采样保帧率
+        self._h264_encode_ms_avg = 0.0  # 编码耗时 EMA
+
+        # QoS 动态码率：ACK 速率滑动窗口 + 迟滞升降档
+        from collections import deque
+        self._h264_ack_times = deque()
+        self._h264_qos_level = 1  # 0=high 1=medium 2=low
+        self._h264_qos_bad_streak = 0
+        self._h264_qos_good_streak = 0
+        self._h264_qos_last_eval = 0.0
+        # 输入唤醒：收到键鼠输入立即唤醒采集循环，消除"等下一节拍"的反馈延迟
+        self._capture_wakeup = asyncio.Event()
 
         # 获取屏幕信息
         self.screen_info = self._load_screen_info()
@@ -1346,16 +1412,40 @@ class RemoteDesktopSession:
             return None
 
         try:
-            response = await asyncio.to_thread(
-                self.service_client.capture_frame,
-                {
-                    "quality": profile["quality"],
-                    "scale": profile["scale"],
-                    "previous_signature": self.last_frame_signature,
-                    "include_desktop_state": True,
-                    "include_backend_diagnostics": True,
-                },
-            )
+            # 深度诊断仅按需采集：每帧携带 desktop_state/backend_diagnostics 会让
+            # 响应膨胀数十 KB，经两跳命名管道传输后把帧率拖到亚秒级。
+            include_diagnostics = self.capture_empty_count >= 3
+            service_payload = {
+                "quality": profile["quality"],
+                "scale": self._h264_scale if self.h264_active else profile["scale"],
+                "previous_signature": self.last_frame_signature,
+                "include_desktop_state": include_diagnostics,
+                "include_backend_diagnostics": include_diagnostics,
+            }
+            if self.h264_active:
+                # 助手侧直接 H.264 编码（省 JPEG 往返）；观看端请求关键帧时透传
+                service_payload["codec"] = "h264"
+                if self._h264_keyframe_requested:
+                    service_payload["force_keyframe"] = True
+            call_started_at = time.perf_counter()
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.service_client.capture_frame,
+                        service_payload,
+                    ),
+                    timeout=6.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                self._log_session_event("capture_service_helper", "timeout after 6s")
+                return None
+            call_elapsed = time.perf_counter() - call_started_at
+            if call_elapsed > 0.25:
+                self._log_session_event(
+                    "capture_service_call",
+                    f"slow round-trip elapsed={call_elapsed:.3f}s "
+                    f"mode={self.capture_runtime_mode}",
+                )
         except Exception as exc:
             self._log_session_event("capture_service_helper", f"unavailable error={exc}")
             return None
@@ -1396,6 +1486,73 @@ class RemoteDesktopSession:
                 "capture_context": capture_context,
             }
 
+        frame = helper_response.get("frame") or {}
+        if self.h264_active:
+            helper_h264 = helper_response.get("h264_packets")
+            if helper_h264:
+                # 助手已直接输出 H.264 包（零转码，最优路径）
+                if helper_response.get("codec") == "h264":
+                    self._h264_keyframe_requested = False
+                    self.h264_encode_fail_streak = 0
+                results = []
+                for pkt in helper_h264:
+                    results.append({
+                        "type": "h264",
+                        "data": str(pkt.get("data") or ""),
+                        "keyframe": bool(pkt.get("keyframe")),
+                        "width": int(pkt.get("width") or helper_response.get("h264_width") or 0),
+                        "height": int(pkt.get("height") or helper_response.get("h264_height") or 0),
+                    })
+                self._h264_stats["frames"] += len(results)
+                self._h264_stats["bytes"] += sum(
+                    len(str(p["data"])) * 3 // 4 for p in results
+                )
+                return {
+                    "transport": "service_helper",
+                    "empty": False,
+                    "h264_packets": results,
+                    "captured_at": float(helper_response.get("captured_at") or time.time()),
+                    "signature": helper_response.get("signature"),
+                    "frame_size": sum(len(str(p["data"])) * 3 // 4 for p in results),
+                    "capture_context": capture_context,
+                }
+            if frame.get("data"):
+                # 助手帧为 JPEG（旧助手或编码失败回落），服务侧转码为 H.264
+                t0 = time.perf_counter()
+                try:
+                    packets = await asyncio.to_thread(self._h264_transcode_jpeg, frame)
+                    self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
+                    if packets is not None:
+                        return {
+                            "transport": "service_helper",
+                            "empty": False,
+                            "h264_packets": packets,
+                            "captured_at": float(helper_response.get("captured_at") or time.time()),
+                            "signature": helper_response.get("signature"),
+                            "frame_size": sum(len(p["data"]) for p in packets),
+                            "capture_context": capture_context,
+                        }
+                except Exception as exc:
+                    self._h264_handle_encode_failure(exc)
+                    # 转码失败回落 JPEG 返回
+            elif helper_response.get("unchanged", False) and self._h264_last_pil is not None:
+                # 恒定帧率：画面未变时用缓存的上帧继续编码微小增量
+                try:
+                    packets = await asyncio.to_thread(
+                        self._h264_encode_pil, self._h264_last_pil, keyframe=False)
+                    self.h264_encode_fail_streak = 0
+                    return {
+                        "transport": "service_helper",
+                        "empty": False,
+                        "h264_packets": self._h264_results_from(packets, self._h264_last_pil.width, self._h264_last_pil.height),
+                        "captured_at": float(helper_response.get("captured_at") or time.time()),
+                        "signature": helper_response.get("signature"),
+                        "frame_size": sum(len(p["data"]) for p in packets),
+                        "capture_context": capture_context,
+                    }
+                except Exception as exc:
+                    self._h264_handle_encode_failure(exc)
+
         return {
             "transport": "service_helper",
             "empty": False,
@@ -1406,6 +1563,142 @@ class RemoteDesktopSession:
             "session_id": helper_session_id,
             "backend": helper_backend,
             "capture_context": capture_context,
+        }
+
+    def _ensure_redraw_executor(self):
+        """重绘/脉冲专用单线程 executor，与捕获线程池隔离。"""
+        if self._redraw_executor is None:
+            with self._redraw_thread_lock:
+                if self._redraw_executor is None:
+                    self._redraw_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix=f"rd-dwm-{self.session_id}"
+                    )
+
+    def _trigger_dwm_redraw(self) -> None:
+        """强制应用重绘产出新像素：RedrawWindow 全桌面（后台线程调用，勿阻塞事件循环）。
+
+        headless/VM 场景下 DWM 不主动合成新像素，RedrawWindow 让所有窗口
+        立即重绘（时钟/动画/悬停效果等产生真实像素变化）。耗时 70-100ms，
+        必须由 capture_loop 通过 run_in_executor 后台调用。
+        """
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            HWND_DESKTOP = 0
+            RDW_INVALIDATE = 0x0001
+            RDW_UPDATENOW = 0x0100
+            RDW_ALLCHILDREN = 0x0080
+            user32.RedrawWindow(
+                HWND_DESKTOP, None, None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            )
+        except Exception:
+            pass
+
+    def _pulse_layered_window(self) -> None:
+        """轻量 DWM 合成脉冲：1px 透明分层窗口 alpha 微调（微秒级），强制 DWM 重新合成。
+
+        不产出新像素，但让 DWM 尽快把已变化的内容合成到屏幕（配合 RedrawWindow 用）。
+        """
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            hwnd = self._redraw_hwnd
+            if not hwnd:
+                with self._redraw_thread_lock:
+                    if self._redraw_hwnd:
+                        hwnd = self._redraw_hwnd
+                    else:
+                        WS_POPUP = 0x80000000
+                        WS_VISIBLE = 0x10000000
+                        WS_EX_LAYERED = 0x00080000
+                        WS_EX_TRANSPARENT = 0x00000020
+                        WS_EX_NOACTIVATE = 0x08000000
+                        WS_EX_TOOLWINDOW = 0x00000080
+                        HWND_TOPMOST = -1
+                        SWP_NOMOVE = 0x0002
+                        SWP_NOSIZE = 0x0001
+                        SWP_NOACTIVATE = 0x0010
+                        SWP_SHOWWINDOW = 0x0040
+                        LWA_ALPHA = 0x00000002
+                        hwnd = user32.CreateWindowExW(
+                            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                            "STATIC", None, WS_POPUP | WS_VISIBLE,
+                            0, 0, 1, 1, None, None, None, None,
+                        )
+                        if hwnd:
+                            user32.SetWindowPos(
+                                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            )
+                            user32.SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA)
+                            self._redraw_hwnd = hwnd
+            if not hwnd:
+                return
+            LWA_ALPHA = 0x00000002
+            # alpha 在 1/2 间微调：每次分层属性更新都强制 DWM 重新合成
+            self._redraw_alpha = 2 if not getattr(self, "_redraw_alpha", 0) == 2 else 1
+            user32.SetLayeredWindowAttributes(hwnd, 0, self._redraw_alpha, LWA_ALPHA)
+        except Exception:
+            pass
+
+    async def _capture_frame_locally(self, profile: dict) -> dict:
+        """Use the interactive Agent process when the optional service is absent."""
+        self._set_active_capture_source("legacy_local_capture")
+        if self.h264_active:
+            try:
+                return await self._capture_frame_h264(profile)
+            except Exception as exc:
+                self._h264_handle_encode_failure(exc)
+                return {"empty": True, "captured_at": time.time(), "capture_context": {}}
+        local_started_at = time.perf_counter()
+        try:
+            frame = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.capturer.capture,
+                    quality=profile["quality"],
+                    scale=profile["scale"],
+                ),
+                timeout=2.0,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            return {"empty": True, "captured_at": time.time(), "capture_context": {}}
+        local_elapsed = time.perf_counter() - local_started_at
+        if local_elapsed > 0.25:
+            self._log_session_event(
+                "local_capture_timing",
+                f"slow grab+encode elapsed={local_elapsed:.3f}s "
+                f"backend={getattr(self.capturer, 'capture_backend', '')}",
+            )
+        if not frame:
+            return {
+                "empty": True,
+                "captured_at": time.time(),
+                "capture_context": {},
+            }
+
+        signature = zlib.adler32(frame["data"].encode("ascii"))
+        profile_key = (
+            profile["quality"],
+            round(profile["scale"], 4),
+            profile["fps"],
+            self.capture_profile_name,
+        )
+        if signature == self.last_frame_signature and profile_key == self.last_frame_profile_key:
+            return {
+                "unchanged": True,
+                "signature": signature,
+                "captured_at": time.time(),
+                "capture_context": {},
+            }
+
+        return {
+            "frame": frame,
+            "signature": signature,
+            "captured_at": time.time(),
+            "capture_context": {},
         }
 
     def _log_session_event(self, stage: str, detail: str):
@@ -1516,6 +1809,39 @@ class RemoteDesktopSession:
         self.running = True
 
         try:
+            requester = "未知管理员"
+            remote_address = getattr(self.websocket, "remote_address", None)
+            if remote_address:
+                requester = str(remote_address)
+            target = os.environ.get("COMPUTERNAME") or "当前终端"
+            await self._send_json({
+                "type": "consent_required",
+                "target": target,
+            })
+            approved, reason = await CONSENT_MANAGER.request_permission({
+                "requester": requester,
+                "origin": requester,
+                "target": target,
+            })
+            if not approved:
+                self._log_session_event("consent", f"rejected reason={reason}")
+                await self._send_json({
+                    "type": "consent_result",
+                    "approved": False,
+                    "reason": reason,
+                    "message": "被控端拒绝或未响应远程控制请求",
+                })
+                await self.websocket.close(code=4003, reason="consent_denied")
+                return
+
+            self._log_session_event("consent", f"approved reason={reason}")
+            await self._send_json({
+                "type": "consent_result",
+                "approved": True,
+                "reason": reason,
+                "message": "被控端已允许远程控制",
+            })
+
             # 发送屏幕信息给控制端
             self._log_session_event("start", "send_screen_info")
             await self._send_screen_info()
@@ -1610,6 +1936,15 @@ class RemoteDesktopSession:
             'runtime_stack': self.runtime_stack,
         })
 
+    async def _sleep_until_next_tick(self, sleep_time: float):
+        """按帧间隔休眠，但收到键鼠输入时立即唤醒（消除输入反馈的节拍等待）。"""
+        if sleep_time > 0:
+            try:
+                await asyncio.wait_for(self._capture_wakeup.wait(), timeout=sleep_time)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+        self._capture_wakeup.clear()
+
     async def capture_loop(self):
         """屏幕捕获循环"""
         self._log_session_event("capture_loop", "started")
@@ -1617,7 +1952,49 @@ class RemoteDesktopSession:
             try:
                 loop_started_at = time.perf_counter()
                 profile = self._select_capture_profile()
-                helper_result = await self._capture_frame_via_service(profile)
+
+                # 主路径：同会话进程内直抓（毫秒级），避免每帧两跳服务管道往返；
+                # 本地抓不到（锁屏/桌面不可见）时降级 SYSTEM 助手处理特殊桌面。
+                helper_result = await self._capture_frame_locally(profile)
+                if helper_result.get("empty"):
+                    service_fallback = await self._capture_frame_via_service(profile)
+                    if service_fallback is not None:
+                        helper_result = {**service_fallback, "via_service": True}
+
+                # H.264 路径：本地直抓或服务助手帧转码后的包，统一在此入队
+                if self.h264_active and time.monotonic() - self._h264_qos_last_eval > 1.5:
+                    self._h264_qos_last_eval = time.monotonic()
+                    self._evaluate_h264_qos(profile)
+                if (
+                    self.h264_active
+                    and self._h264_sent_seq > 0
+                    and self._h264_acked_seq == 0
+                    and time.time() - self.h264_activated_at > 12.0
+                ):
+                    # 观看端 5 秒内未确认任何 H.264 帧（旧版前端不认识 0x03 帧）
+                    # → 自动回退 JPEG，保证旧缓存浏览器也能看到画面
+                    self.h264_active = False
+                    self._close_h264_encoder()
+                    self._log_session_event("codec", "switch to jpeg (no h264 ack from viewer)")
+                    asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "jpeg"}))
+                if helper_result.get("h264_packets") is not None:
+                    for h264_msg in helper_result["h264_packets"]:
+                        self._enqueue_frame(h264_msg)
+                    self.frame_count += len(helper_result["h264_packets"])
+                    self.last_frame_sent_at = time.time()
+                    frame_size = int(helper_result.get("frame_size") or 0)
+                    self._update_capture_pressure(0.0, frame_size)
+                    elapsed = time.perf_counter() - loop_started_at
+                    frame_interval = 1.0 / profile["fps"]
+                    await self._sleep_until_next_tick(max(0, frame_interval - elapsed))
+                    continue
+
+                if helper_result is None:
+                    helper_result = {
+                        "empty": True,
+                        "captured_at": time.time(),
+                        "capture_context": {},
+                    }
 
                 if helper_result is not None:
                     frame_observed_at = float(helper_result.get("captured_at") or time.time())
@@ -1628,7 +2005,11 @@ class RemoteDesktopSession:
                     if helper_result.get("empty"):
                         await self._handle_capture_empty(
                             profile,
-                            capture_source="service_helper_empty",
+                            capture_source=(
+                                "legacy_local_capture_empty"
+                                if self.service_client is None
+                                else "service_helper_empty"
+                            ),
                             capture_context=helper_result.get("capture_context") or {},
                         )
                     elif helper_result.get("unchanged"):
@@ -1643,6 +2024,31 @@ class RemoteDesktopSession:
                             and frame_observed_at - self.last_input_at >= self.stale_frame_after_input_threshold
                         ):
                             await self._handle_stale_frame(unchanged_for)
+                        # 【已移除 DWM 唤醒 hack（RedrawWindow@80ms + 分层窗口 pulse@33ms）】
+                        # 该 hack 在无用户会话的机器（如登录屏/VM 无显示基底）上会高频
+                        # 轰炸 explorer.exe 导致其挂起（AppHangB1），桌面卡死、采集归零——
+                        # 84 号终端 0 帧率的根因。H.264 恒定帧率下静止画面由微小增量帧
+                        # 覆盖，此 hack 已无必要。
+                        # 定期心跳重发：即使像素未变，每隔一定帧数强制推一帧，
+                        # 避免前端画面"看起来卡死"（与鼠标操作无关的静止场景）。
+                        heartbeat_interval = max(0.5, profile.get("fps_heartbeat_seconds", 2.0))
+                        if (
+                            self.last_frame_sent_at == 0.0
+                            or (time.time() - self.last_frame_sent_at) >= heartbeat_interval
+                        ):
+                            stale_frame = (
+                                self._last_sent_frame
+                                if self._last_sent_frame
+                                else (helper_result.get("frame") or {})
+                            )
+                            if stale_frame:
+                                self._enqueue_frame({
+                                    "type": "frame",
+                                    "data": stale_frame["data"],
+                                    "width": stale_frame["width"],
+                                    "height": stale_frame["height"],
+                                })
+                                self.last_frame_sent_at = time.time()
                     else:
                         frame = helper_result.get("frame") or {}
                         self.capture_empty_count = 0
@@ -1656,15 +2062,16 @@ class RemoteDesktopSession:
                         )
                         self.last_visual_change_at = frame_observed_at
                         self.skipped_frame_count = 0
+                        self._last_sent_frame = frame
 
-                        send_started_at = time.perf_counter()
-                        await self._send_json({
+                        # 异步发送：不再 await（避免 110KB 帧/网络慢时卡循环）
+                        self._enqueue_frame({
                             "type": "frame",
                             "data": frame["data"],
                             "width": frame["width"],
                             "height": frame["height"],
                         })
-                        send_elapsed = time.perf_counter() - send_started_at
+                        send_elapsed = 0.0
                         self._update_capture_pressure(send_elapsed, int(frame.get("size") or 0))
 
                         self.frame_count += 1
@@ -1672,7 +2079,7 @@ class RemoteDesktopSession:
                     elapsed = time.perf_counter() - loop_started_at
                     frame_interval = 1.0 / profile["fps"]
                     sleep_time = max(0, frame_interval - elapsed)
-                    await asyncio.sleep(sleep_time)
+                    await self._sleep_until_next_tick(sleep_time)
                     continue
 
                 self._set_active_capture_source(
@@ -1689,44 +2096,30 @@ class RemoteDesktopSession:
                 elapsed = time.perf_counter() - loop_started_at
                 frame_interval = 1.0 / profile['fps']
                 sleep_time = max(0, frame_interval - elapsed)
-                await asyncio.sleep(sleep_time)
+                await self._sleep_until_next_tick(sleep_time)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                self._log_session_event(
+                    "capture_loop",
+                    f"fatal type={type(e).__name__} error={e}",
+                )
                 print(f"[RemoteDesktop] Capture loop error: {e}")
                 break
         self._log_session_event("capture_loop", "stopped")
 
     def _select_capture_profile(self):
-        if not self.adaptive_streaming:
-            self.capture_profile_name = "manual"
-            return {
-                "fps": self.fps,
-                "quality": self.quality,
-                "scale": self.scale,
-            }
+        """恒定帧率模式：不做空闲降档/压力降档，始终保持用户设定的帧率与画质。
 
-        idle_seconds = time.time() - self.last_input_at
-        profile_name = "interactive"
-        profile = {
+        H.264 流下静止画面的增量帧极小（百字节级），无需为省流量降帧率。
+        """
+        self.capture_profile_name = "fixed"
+        return {
             "fps": self.fps,
             "quality": self.quality,
             "scale": self.scale,
         }
-
-        if idle_seconds >= 15:
-            profile_name = "idle"
-            profile = {"fps": 4, "quality": 55, "scale": min(self.scale, 0.65)}
-        elif idle_seconds >= 5 or self.capture_pressure > 0.8:
-            profile_name = "balanced"
-            profile = {"fps": min(self.fps, 8), "quality": 62, "scale": min(self.scale, 0.75)}
-        elif self.capture_pressure > 0.45:
-            profile_name = "interactive-lite"
-            profile = {"fps": min(self.fps, 12), "quality": 68, "scale": min(self.scale, 0.85)}
-
-        self.capture_profile_name = profile_name
-        return profile
 
     def _update_capture_pressure(self, send_elapsed, frame_size):
         target_interval = 1.0 / max(self.fps, 1)
@@ -2196,15 +2589,12 @@ class RemoteDesktopSession:
 
         self._log_session_event(
             "capture-recreate",
-            "local_fallback_blocked service_managed_capture_required",
+            "recreating local capture backend",
         )
-        self._set_active_capture_source(
-            "service_capture_unavailable",
-            backend=self.capture_host_backend,
-            session_id=self.capture_host_session_id,
-        )
+        self.capturer = ScreenCapturer()
+        self._set_active_capture_source("legacy_local_capture")
         self._refresh_runtime_stack(refresh_service=False)
-        return False
+        return True
 
     async def _handle_capture_empty(
         self,
@@ -2385,12 +2775,362 @@ class RemoteDesktopSession:
             substrate_recovery=substrate_recovery,
         )
 
+    def _handle_viewer_capabilities(self, webcodecs: bool):
+        """处理观看端能力声明，决定是否启用 H.264 流。"""
+        self.viewer_h264_capable = bool(webcodecs)
+        if not webcodecs:
+            if self.h264_active:
+                self.h264_active = False
+                self._close_h264_encoder()
+                self._log_session_event("codec", "switch to jpeg (viewer no webcodecs)")
+            return
+        if self.h264_active:
+            # 已激活：忽略重复声明（观看端重试机制会重发多次），
+            # 重复重建编码器会造成 IDR 风暴与画质/颜色状态突变
+            return
+        try:
+            from Codec.h264_encoder import h264_available
+            if h264_available():
+                from Codec.h264_encoder import get_h264_backend_name
+                backend_name = get_h264_backend_name()
+                self.h264_active = True
+                self._h264_keyframe_requested = True
+                self.h264_activated_at = time.time()
+                self._log_session_event(
+                    "codec_backend",
+                    f"backend={backend_name} hw={'yes' if backend_name != 'libx264' else 'no'} "
+                    f"resolution={self.screen_info.get('width')}x{self.screen_info.get('height')} "
+                    f"target_fps={self.fps}",
+                )
+                self.last_frame_signature = None  # 强制首帧立即编码
+                self._log_session_event("codec", "h264 stream enabled (viewer webcodecs)")
+                # codec_switch 是控制消息，必须走 JSON 通道（_enqueue_frame 是二进制帧路径）
+                asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "h264"}))
+            else:
+                self.h264_active = False
+                self._log_session_event("codec", "h264 unavailable on host, keep jpeg")
+                asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "jpeg"}))
+        except Exception as exc:
+            self.h264_active = False
+            self._log_session_event("codec", f"h264 enable failed: {exc}")
+
+    def _close_h264_encoder(self):
+        try:
+            if self.h264_encoder is not None:
+                self.h264_encoder.close()
+        except Exception:
+            pass
+        self.h264_encoder = None
+
+    def _request_h264_keyframe(self):
+        self._h264_keyframe_requested = True
+
+    def _h264_handle_encode_failure(self, exc: Exception) -> None:
+        self.h264_encode_fail_streak += 1
+        self._log_session_event(
+            "h264", f"encode failed streak={self.h264_encode_fail_streak} error={exc}"
+        )
+        if self.h264_encode_fail_streak >= 5:
+            # 连续失败自动回退 JPEG（RustDesk 同款降级思想）
+            self.h264_active = False
+            self._close_h264_encoder()
+            self._log_session_event("codec", "switch to jpeg (h264 encode failures)")
+            try:
+                asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "jpeg"}))
+            except Exception:
+                pass
+
+    def _h264_encode_pil(self, pil_image, keyframe: bool) -> list[dict[str, Any]]:
+        """把 PIL RGB 帧送入 H.264 编码器（自动处理分辨率变化）。"""
+        width = int(pil_image.width)
+        height = int(pil_image.height)
+        if (
+            self.h264_encoder is None
+            or self.h264_encoder.width != width
+            or self.h264_encoder.height != height
+        ):
+            self._close_h264_encoder()
+            from Codec.h264_encoder import H264StreamEncoder
+            self.h264_encoder = H264StreamEncoder(width, height, fps=max(self.fps, 15), crf=self.QOS_LEVELS[int(self._h264_qos_level)]["crf"])
+        return self.h264_encoder.encode(pil_image, keyframe=keyframe)
+
+    def _h264_results_from(self, packets, width: int, height: int) -> list[dict[str, Any]]:
+        """编码包 → 入队消息列表（统一 seq/背压计数）。"""
+        results = []
+        for pkt in packets:
+            self._h264_sent_seq += 1
+            results.append({
+                "type": "h264",
+                "data": base64.b64encode(pkt["data"]).decode("ascii"),
+                "keyframe": bool(pkt["keyframe"]),
+                "seq": self._h264_sent_seq,
+                "width": width,
+                "height": height,
+            })
+        self._h264_stats["frames"] += len(results)
+        self._h264_stats["bytes"] += sum(len(p["data"]) for p in packets)
+        return results
+
+    def _h264_transcode_jpeg(self, frame: dict) -> list[dict[str, Any]] | None:
+        """助手 JPEG 帧 → PIL → H.264 包列表。失败返回 None（回落 JPEG）。"""
+        import io as _io
+        from PIL import Image as _PILImage
+        data = base64.b64decode(frame.get("data", ""))
+        if not data:
+            return None
+        pil = _PILImage.open(_io.BytesIO(data)).convert("RGB")
+        self._h264_last_pil = pil  # RGB 缓存（编码器对 RGB 输入不会关闭它）
+        keyframe = self._h264_keyframe_requested
+        self._h264_keyframe_requested = False
+        packets = self._h264_encode_pil(pil, keyframe=keyframe)
+        self.h264_encode_fail_streak = 0
+        return self._h264_results_from(packets, pil.width, pil.height)
+
+    QOS_LEVELS = (
+        {"name": "high", "crf": 21},
+        {"name": "medium", "crf": 24},
+        {"name": "low", "crf": 28},
+    )
+
+    def _apply_h264_scale(self, pil_image):
+        """按动态分辨率缩放抓帧（弱机降采样保帧率，偶数尺寸适配 yuv420p）。"""
+        scale = float(getattr(self, "_h264_scale", 1.0) or 1.0)
+        if scale >= 0.99:
+            return pil_image
+        try:
+            w = max(2, int(pil_image.width * scale) // 2 * 2)
+            h = max(2, int(pil_image.height * scale) // 2 * 2)
+            if w == pil_image.width and h == pil_image.height:
+                return pil_image
+            from PIL import Image as _PILImage
+            return pil_image.resize((w, h), _PILImage.BILINEAR)
+        except Exception:
+            return pil_image
+
+    def _note_h264_encode_ms(self, ms: float) -> None:
+        """编码耗时 EMA（指数滑动平均），供 QoS 分辨率决策。"""
+        prev = float(getattr(self, "_h264_encode_ms_avg", 0.0) or 0.0)
+        self._h264_encode_ms_avg = round(prev * 0.7 + ms * 0.3, 1) if prev else round(ms, 1)
+
+    def _evaluate_h264_qos(self, profile: dict) -> None:
+        """QoS 动态质量：仅由真实背压（inflight 积压）驱动降档。
+
+        注意不能用 ACK 速率低于请求帧率来判断网络差——被控端 CPU 产能
+        不足时帧率本来就低，降画质只会更模糊且无法提升帧率。
+        升档：积压消除且 ACK 速率 ≥ 实际发送帧率的八成（网络有余量）。
+        """
+        # 会话刚建立/帧数太少时不评估（避免统计噪声导致误降档）
+        if self.h264_activated_at == 0 or time.time() - self.h264_activated_at < 3.0:
+            return
+        if self._h264_sent_seq < 10:
+            return
+        now = time.monotonic()
+        while self._h264_ack_times and now - self._h264_ack_times[0] > 3.0:
+            self._h264_ack_times.popleft()
+        ack_rate = len(self._h264_ack_times) / 3.0
+        inflight = self._h264_sent_seq - self._h264_acked_seq
+
+        sent_delta = self._h264_sent_seq - int(getattr(self, "_qos_last_sent_seq", self._h264_sent_seq))
+        eval_gap = max(0.001, now - float(getattr(self, "_qos_last_eval_ts", now)))
+        actual_fps = sent_delta / eval_gap
+        self._qos_last_sent_seq = self._h264_sent_seq
+        self._qos_last_eval_ts = now
+
+        congested = inflight > 12
+        healthy = inflight < 4 and (actual_fps < 1 or ack_rate >= actual_fps * 0.8)
+        if congested:
+            self._h264_qos_bad_streak += 1
+            self._h264_qos_good_streak = 0
+        elif healthy:
+            self._h264_qos_good_streak += 1
+            self._h264_qos_bad_streak = 0
+        else:
+            self._h264_qos_bad_streak = 0
+            self._h264_qos_good_streak = 0
+            return
+
+        level = int(self._h264_qos_level)
+        if congested and self._h264_qos_bad_streak >= 2 and level < len(self.QOS_LEVELS) - 1:
+            level += 1
+        elif healthy and self._h264_qos_good_streak >= 3 and level > 0:
+            level -= 1
+        else:
+            return
+
+        self._h264_qos_level = level
+        lvl = self.QOS_LEVELS[level]
+        try:
+            if self.h264_encoder is not None:
+                self.h264_encoder.set_crf(lvl["crf"])
+            self._log_session_event(
+                "qos",
+                f"level={lvl['name']} crf={lvl['crf']} actual_fps={actual_fps:.1f} ack_rate={ack_rate:.1f} inflight={inflight} scale={self._h264_scale} enc_ms={self._h264_encode_ms_avg}",
+            )
+        except Exception as exc:
+            self._log_session_event("qos", f"apply failed: {exc}")
+
+        # 流畅度：编码耗时过高（弱机 CPU 瓶颈）→ 降采样保帧率；有余量 → 恢复原分辨率
+        try:
+            if self._h264_encode_ms_avg > 30 and self._h264_scale > 0.74:
+                self._h264_scale = round(max(0.75, self._h264_scale - 0.1), 2)
+                self.last_frame_signature = None
+                self._log_session_event("qos", f"scale down to {self._h264_scale} (enc_ms={self._h264_encode_ms_avg})")
+            elif self._h264_encode_ms_avg < 15 and self._h264_scale < 1.0 and inflight < 4:
+                self._h264_scale = round(min(1.0, self._h264_scale + 0.1), 2)
+                self.last_frame_signature = None
+                self._log_session_event("qos", f"scale up to {self._h264_scale} (enc_ms={self._h264_encode_ms_avg})")
+        except Exception:
+            pass
+
+    async def _capture_frame_h264(self, profile: dict) -> dict:
+        """H.264 路径：capture_raw → PyAV 编码 → 入队（含背压丢帧）。"""
+        # 抓帧带超时：session 0 无头桌面上 mss/GDI 可能永久阻塞（84 号 0 帧率根因），
+        # 超时即回退服务助手路径
+        try:
+            screenshot = await asyncio.wait_for(
+                asyncio.to_thread(self.capturer.capture_raw), timeout=2.0
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            return {"empty": True, "captured_at": time.time(), "capture_context": {}}
+        if screenshot is None:
+            return {"empty": True, "captured_at": time.time(), "capture_context": {}}
+        try:
+            signature = self.capturer.build_signature(screenshot)
+            profile_key = (
+                profile["quality"],
+                round(profile["scale"], 4),
+                profile["fps"],
+                self.capture_profile_name,
+            )
+            # 恒定帧率：画面未变也照常编码发送（H.264 静止增量帧仅百字节级）
+            width = int(getattr(screenshot, "width", 0) or 0)
+            height = int(getattr(screenshot, "height", 0) or 0)
+            if not width or not height:
+                width, height = self.screen_info.get("width") or 1280, self.screen_info.get("height") or 720
+
+            keyframe_needed = self._h264_keyframe_requested
+            self._h264_keyframe_requested = False
+
+            # 背压：观看端确认滞后超过阈值时丢非关键帧
+            inflight = self._h264_sent_seq - self._h264_acked_seq
+            if inflight > 30 and not keyframe_needed:
+                self._h264_stats["drops_backpressure"] += 1
+                return {
+                    "unchanged": True,
+                    "signature": signature,
+                    "captured_at": time.time(),
+                    "capture_context": {},
+                    "h264_dropped": True,
+                }
+
+            def _encode_job():
+                scaled = self._apply_h264_scale(screenshot)
+                t0 = time.perf_counter()
+                pkts = self._h264_encode_pil(scaled, keyframe=keyframe_needed)
+                self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
+                return pkts
+
+            packets = await asyncio.to_thread(_encode_job)
+            self.h264_encode_fail_streak = 0
+            results = self._h264_results_from(packets, width, height)
+            return {
+                "h264_packets": results,
+                "signature": signature,
+                "captured_at": time.time(),
+                "capture_context": {},
+                "frame_size": sum(len(p["data"]) for p in packets),
+            }
+        finally:
+            with contextlib.suppress(Exception):
+                screenshot.close()
+
+    def handle_mouse_in_executor(self, message: dict):
+        """把鼠标处理调度到输入专用线程，避免阻塞事件循环。"""
+        loop = asyncio.get_running_loop()
+
+        # 高频 move 合并（coalescing）：单线程输入队列若被每秒数十个 move 淹没，
+        # 后续 click/drag 会延迟数十秒才执行（表现为"点不动/拖不动"）。
+        # 这里始终只保留最新位置，队列中同时至多存在一个待处理 move。
+        action_name = str(message.get("action") or "").strip().lower()
+        if action_name in ("move", "mousemove"):
+            with self._pending_move_lock:
+                self._pending_move_message = message
+                if self._move_task_scheduled:
+                    return
+                self._move_task_scheduled = True
+
+            def _drain_moves():
+                while True:
+                    with self._pending_move_lock:
+                        pending = self._pending_move_message
+                        self._pending_move_message = None
+                        if pending is None:
+                            self._move_task_scheduled = False
+                            # 注入队列清空：唤醒采集循环抓取注入后的画面
+                            loop.call_soon_threadsafe(self._capture_wakeup.set)
+                            return
+                    try:
+                        self.handle_mouse(pending)
+                    except Exception as exc:
+                        self._log_session_event(
+                            "input_executor",
+                            f"mouse failed type={type(exc).__name__} error={exc}",
+                        )
+
+            loop.run_in_executor(self._input_executor, _drain_moves)
+            return
+
+        def _safe_mouse():
+            try:
+                self.handle_mouse(message)
+            except Exception as exc:
+                self._log_session_event(
+                    "input_executor",
+                    f"mouse failed type={type(exc).__name__} error={exc}",
+                )
+            finally:
+                loop.call_soon_threadsafe(self._capture_wakeup.set)
+
+        loop.run_in_executor(self._input_executor, _safe_mouse)
+
+    def handle_keyboard_in_executor(self, message: dict):
+        """把键盘处理调度到输入专用线程，避免阻塞事件循环。"""
+        loop = asyncio.get_running_loop()
+
+        def _safe_keyboard():
+            try:
+                self.handle_keyboard(message)
+            except Exception as exc:
+                self._log_session_event(
+                    "input_executor",
+                    f"keyboard failed type={type(exc).__name__} error={exc}",
+                )
+            finally:
+                # 键入完成：唤醒采集循环抓取注入后的画面
+                loop.call_soon_threadsafe(self._capture_wakeup.set)
+
+        loop.run_in_executor(self._input_executor, _safe_keyboard)
+
     async def message_loop(self):
         """消息处理循环"""
         try:
             while self.running:
-                message = await self.websocket.receive_text()
-                data = json.loads(message)
+                try:
+                    message = await self.websocket.receive_text()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # 连接关闭或传输错误：正常结束会话
+                    break
+                try:
+                    data = json.loads(message)
+                except Exception as exc:
+                    # 单条损坏消息只跳过，不允许终止整个会话
+                    self._log_session_event(
+                        "message_loop",
+                        f"bad message skipped type={type(exc).__name__} error={exc}",
+                    )
+                    continue
                 await self.handle_control(data)
 
         except Exception as e:
@@ -2405,6 +3145,8 @@ class RemoteDesktopSession:
         try:
             if msg_type == 'mouse':
                 self.last_input_at = time.time()
+                # 输入唤醒：立即抓帧反馈，不等下一节拍
+                self._capture_wakeup.set()
                 log_remote_desktop_flow(
                     self.session_id,
                     "handle_control_mouse",
@@ -2416,10 +3158,26 @@ class RemoteDesktopSession:
                         f"wheel={message.get('wheel_steps')}"
                     ),
                 )
-                self.handle_mouse(message)
+                self.handle_mouse_in_executor(message)
             elif msg_type == 'keyboard':
                 self.last_input_at = time.time()
-                self.handle_keyboard(message)
+                # 输入唤醒：立即抓帧反馈
+                self._capture_wakeup.set()
+                self.handle_keyboard_in_executor(message)
+            elif msg_type == 'viewer_capabilities':
+                # 观看端能力声明：WebCodecs 可用则切换 H.264 流
+                webcodecs = bool(message.get('webcodecs'))
+                self.last_input_at = time.time()
+                self._handle_viewer_capabilities(webcodecs)
+            elif msg_type == 'frame_ack':
+                # 观看端已解码确认，用于背压计算与 QoS 统计
+                acked = int(message.get('seq') or 0)
+                if acked > self._h264_acked_seq:
+                    self._h264_acked_seq = acked
+                self._h264_ack_times.append(time.monotonic())
+            elif msg_type == 'request_keyframe':
+                self.last_input_at = time.time()
+                self._h264_keyframe_requested = True
             elif msg_type == 'settings':
                 self.last_input_at = time.time()
                 await self.handle_settings(message)
@@ -3110,7 +3868,14 @@ class RemoteDesktopSession:
                 pyautogui.press(key)
         elif action == 'type':
             if text:
-                pyautogui.typewrite(text, interval=0.01)
+                try:
+                    from Input.input_controller import send_unicode_text
+
+                    # 逐键模拟会被终端输入法拦截成拼音组合，必须走 UNICODE 注入
+                    if not send_unicode_text(text):
+                        pyautogui.typewrite(text, interval=0.01)
+                except ImportError:
+                    pyautogui.typewrite(text, interval=0.01)
 
     def _invoke_service_input_action(self, action: str, payload: dict | None = None) -> dict:
         if self.service_client is None:
@@ -3187,8 +3952,56 @@ class RemoteDesktopSession:
                 pass
             self.modifier_states[key] = False
 
+    def _enqueue_frame(self, frame_payload: dict) -> bool:
+        """异步发送帧：fire-and-forget，不阻塞 capture_loop。
+        二进制帧协议：
+        - 0x02 JPEG：[1B type][4B frameId][4B width][4B height][4B jpegLen][jpeg bytes]
+        - 0x03 H264：[1B type][4B seq][4B width][4B height][4B payloadLen][1B keyframe][payload bytes]
+        替代旧 base64-in-JSON，节省 ~33% 带宽 + 解码更快。
+        """
+        # 远程桌面核心原则：视频可以丢帧，绝不积压排队。
+        # 只保留最新帧：发送慢时旧帧被新帧直接覆盖（而非排队等待）。
+        self._latest_frame_payload = frame_payload
+        if getattr(self, "_frame_sender_task", None) is None or self._frame_sender_task.done():
+            self._frame_sender_task = asyncio.ensure_future(self._frame_sender_loop())
+        return True
+
+    async def _frame_sender_loop(self):
+        """帧发送循环：每次取最新帧发送（Frame Queue = 1）。"""
+        while self.running:
+            payload = getattr(self, "_latest_frame_payload", None)
+            self._latest_frame_payload = None
+            if payload is None:
+                break
+            try:
+                await self._send_binary_frame(payload)
+            except Exception as exc:
+                self._log_session_event("send_binary_frame", f"error: {exc}")
+
+    async def _send_binary_frame(self, frame_payload: dict):
+        """串行化 WebSocket 发送二进制帧。"""
+        import struct
+        async with self.send_lock:
+            try:
+                data_b64 = frame_payload.get("data", "")
+                width = int(frame_payload.get("width") or 0)
+                height = int(frame_payload.get("height") or 0)
+                payload_bytes = base64.b64decode(data_b64)
+                if frame_payload.get("type") == "h264":
+                    # H.264：seq 发送时分配（被丢帧不占号），观看端 ack 回传同一 seq
+                    self._h264_sent_seq = int(getattr(self, "_h264_sent_seq", 0)) + 1
+                    frame_id = self._h264_sent_seq
+                    keyframe_flag = 1 if frame_payload.get("keyframe") else 0
+                    header = struct.pack(">BIIIIB", 0x03, frame_id, width, height, len(payload_bytes), keyframe_flag)
+                else:
+                    frame_id = self._binary_frame_seq = getattr(self, "_binary_frame_seq", 0) + 1
+                    header = struct.pack(">BIIII", 0x02, frame_id, width, height, len(payload_bytes))
+                await self.websocket.send_bytes(header + payload_bytes)
+            except Exception as exc:
+                self._log_session_event("send_binary_frame", f"error: {exc}")
+
     async def _send_json(self, payload: dict):
-        """串行化 WebSocket 发送，避免帧流与心跳并发写入。"""
+        """串行化 WebSocket 发送控制消息（text JSON）。屏幕帧用 _send_binary_frame。"""
         async with self.send_lock:
             await self.websocket.send_json(payload)
 
@@ -3246,6 +4059,10 @@ class RemoteDesktopSession:
         self._release_pressed_inputs()
         self._restore_original_resolution()
         self.input_injector.stop()
+        try:
+            self._input_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         with contextlib.suppress(Exception):
             if self.capturer is not None:
                 self.capturer.close()

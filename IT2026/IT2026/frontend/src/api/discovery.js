@@ -41,3 +41,21 @@ export function startSnmpScan(data) {
     data
   })
 }
+
+// 获取最近扫描记录
+export function getRecentScans(params) {
+  return request({
+    url: '/discovery/recent',
+    method: 'get',
+    params
+  })
+}
+
+// 导入扫描结果为资产
+export function importDiscoveredAsset(data) {
+  return request({
+    url: '/discovery/import',
+    method: 'post',
+    data
+  })
+}

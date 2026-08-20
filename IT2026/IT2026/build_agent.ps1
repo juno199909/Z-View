@@ -31,6 +31,26 @@ $PackageDir = Get-ChildItem -LiteralPath $ProjectRoot -Directory |
     Select-Object -ExpandProperty FullName -First 1
 $DriverSourceDir = Join-Path $ProjectRoot "Drivers"
 
+function Resolve-BuildPython {
+    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyCommand) {
+        try {
+            & $pyCommand.Source -3.12 --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return @($pyCommand.Source, "-3.12")
+            }
+        } catch {
+        }
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        return @($pythonCommand.Source)
+    }
+
+    throw "No usable Python runtime found for packaging."
+}
+
 if (-not $PackageDir) {
     throw "Deployment package directory not found."
 }
@@ -53,7 +73,15 @@ if (Test-Path $BuildDir) {
 
 Write-Host "==> Run PyInstaller"
 Set-Location $ProjectRoot
-& pyinstaller --noconfirm --clean --distpath $DistDir --workpath $BuildDir $SpecPath
+$BuildPython = Resolve-BuildPython
+Write-Host ("==> Packaging with: {0}" -f ($BuildPython -join " "))
+$BuildPythonExe = $BuildPython[0]
+$BuildPythonArgs = @()
+if ($BuildPython.Count -gt 1) {
+    $BuildPythonArgs += $BuildPython[1..($BuildPython.Count - 1)]
+}
+$BuildPythonArgs += @("-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", $DistDir, "--workpath", $BuildDir, $SpecPath)
+& $BuildPythonExe $BuildPythonArgs
 
 if (-not (Test-Path $ExePath)) {
     throw "Build output not found: $ExePath"

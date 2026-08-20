@@ -1,0 +1,30 @@
+- generic [ref=f4e4]:
+  - generic [ref=f4e5]:
+    - generic [ref=f4e6]:
+      - heading "Z-View" [level=1] [ref=f4e11]
+      - paragraph [ref=f4e12]: 企业级终端运维平台
+      - list [ref=f4e13]:
+        - listitem [ref=f4e14]:
+          - generic [ref=f4e18]: 资产全生命周期管理
+        - listitem [ref=f4e19]:
+          - generic [ref=f4e23]: 实时远程桌面与运维
+        - listitem [ref=f4e24]:
+          - generic [ref=f4e28]: 软件仓库 + 黑白名单
+        - listitem [ref=f4e29]:
+          - generic [ref=f4e33]: 告警 + 批量 + 策略下发
+    - generic [ref=f4e34]: © 2026 Z-View · 让运维更轻松
+  - generic [ref=f4e36]:
+    - generic [ref=f4e37]:
+      - heading "欢迎回来 👋" [level=2] [ref=f4e38]
+      - paragraph [ref=f4e39]: 请使用您的账号登录
+    - generic [ref=f4e40]:
+      - textbox "请输入用户名" [ref=f4e46]
+      - textbox "请输入密码" [ref=f4e52]
+      - generic [ref=f4e53]:
+        - generic [ref=f4e54] [cursor=pointer]:
+          - generic [ref=f4e55]:
+            - checkbox "记住我"
+          - generic [ref=f4e57]: 记住我
+        - generic [ref=f4e58] [cursor=pointer]: 忘记密码？
+      - button "登 录" [ref=f4e59] [cursor=pointer]
+    - generic [ref=f4e61]: 登录即表示同意 《服务协议》 与 《隐私政策》

@@ -89,6 +89,17 @@ class InventoryDisplaySubstrateProvider(DisplaySubstrateProvider):
             inventory_force_refresh = self.probe.update_virtual_display_hints(virtual_display_status)
 
         inventory = self.probe.get_display_inventory(force_refresh=inventory_force_refresh)
+        # ZVIEW_DISABLE_VIRTUAL_DISPLAY=1：信任现有物理显示器可捕获。
+        # 服务进程(Session 0)枚举的 DISPLAY_DEVICE_ACTIVE 对 console 显示器可能为 False，
+        # 导致 substrate 误判 headless 而阻塞捕获/反复 recycle helper。
+        import os as _os
+        if _os.environ.get("ZVIEW_DISABLE_VIRTUAL_DISPLAY", "").strip() in ("1", "true", "True"):
+            if not inventory.get("physical_display_attached"):
+                inventory = dict(inventory)
+                inventory["physical_display_attached"] = True
+                inventory["skipped_by_env"] = True
+                if not int(inventory.get("attached_display_count") or 0):
+                    inventory["attached_display_count"] = 1
         preferred = preferred_assessment or self.probe.assess(
             preferred_descriptor,
             inventory=inventory,
