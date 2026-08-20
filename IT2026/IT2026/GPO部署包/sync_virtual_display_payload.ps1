@@ -68,7 +68,22 @@ function Get-PayloadState {
     $state.has_manifest_example = Test-Path -LiteralPath (Join-Path $Root "driver_manifest.json.example") -PathType Leaf
     $state.has_inf = [bool](@($files | Where-Object { $_.Extension -ieq ".inf" }).Count)
     $state.has_cat = [bool](@($files | Where-Object { $_.Extension -ieq ".cat" }).Count)
-    $state.has_sys = [bool](@($files | Where-Object { $_.Extension -ieq ".sys" }).Count)
+    # Driver binary may be .sys (WDM) or .dll (IDD/UMDF). Also accept whatever
+    # binary_relative_path from the manifest points at, so IDD payloads (.dll) are
+    # recognised as a complete real package instead of "partial_payload".
+    $has_native_sys = [bool](@($files | Where-Object { $_.Extension -ieq ".sys" }).Count)
+    $has_manifest_binary = $false
+    try {
+        $manifestObj = $null
+        if (Test-Path -LiteralPath (Join-Path $Root "driver_manifest.json") -PathType Leaf) {
+            $manifestObj = Get-Content -LiteralPath (Join-Path $Root "driver_manifest.json") -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $manifestBinary = [string]$manifestObj.binary_relative_path
+            if (-not [string]::IsNullOrWhiteSpace($manifestBinary)) {
+                $has_manifest_binary = Test-Path -LiteralPath (Join-Path $Root $manifestBinary) -PathType Leaf
+            }
+        }
+    } catch {}
+    $state.has_sys = [bool]($has_native_sys -or $has_manifest_binary)
     $state.has_complete_payload = [bool]($state.has_inf -and $state.has_cat -and $state.has_sys)
     $state.catalog_signature_status = Get-CatalogSignatureStatus -Root $Root
     $state.has_trusted_signature = [bool]($state.catalog_signature_status -eq "Valid")

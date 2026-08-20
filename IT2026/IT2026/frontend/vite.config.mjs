@@ -14,8 +14,20 @@ export default defineConfig(({ mode }) => {
   const softwareTarget = env.VITE_PROXY_SOFTWARE_TARGET || 'http://127.0.0.1:8081'
   const policyTarget = env.VITE_PROXY_POLICY_TARGET || 'http://127.0.0.1:8082'
   const proxy = {
+    '/api/v1/software/all': {
+      target: assetsTarget,
+      changeOrigin: true
+    },
+    '/api/v1/software/stats': {
+      target: assetsTarget,
+      changeOrigin: true
+    },
     '/api/v1/discovery': {
       target: assetsTarget,
+      changeOrigin: true
+    },
+    '/api/v1/software': {
+      target: softwareTarget,
       changeOrigin: true
     },
     '/software-api': {

@@ -1,692 +1,352 @@
 <template>
-  <div class="terminal-detail">
-    <el-page-header @back="goBack" title="返回">
-      <template #content>
-        <span class="page-title">终端详情</span>
-      </template>
-    </el-page-header>
+  <div class="zv-page">
+    <div class="zv-page-header">
+      <div>
+        <h2 class="zv-page-title">终端详情</h2>
+        <div class="zv-page-subtitle">{{ detail.asset?.hostname || '-' }} · {{ detail.asset?.ip_address || '-' }}</div>
+      </div>
+      <div class="zv-page-actions">
+        <el-button :icon="ArrowLeft" @click="$router.back()">返回</el-button>
+        <el-button type="primary" :icon="VideoPlay" @click="openRemoteDesktop">远程控制</el-button>
+      </div>
+    </div>
 
-    <!-- Web远程桌面组件 -->
-    <WebRemoteDesktop
-      :key="remoteDesktopKey"
-      v-if="remoteDesktopMounted"
-      :visible="showRemoteDesktop"
-      :asset-id="route.params.id"
-      :ip-address="detail.asset?.ip_address"
-      :hostname="detail.asset?.hostname"
-      @update:visible="handleRemoteDesktopVisibleChange"
-      @close="handleRemoteDesktopClosed"
-    />
-
-    <!-- 远程Shell组件 -->
-    <RemoteShell
-      v-model="showShell"
-      :asset-id="route.params.id"
-      :ip-address="detail.asset?.ip_address"
-      :hostname="detail.asset?.hostname"
-    />
-
-    <el-card class="box-card" v-loading="loading">
-      <!-- 基本信息 -->
-      <template #header>
-        <div class="card-header">
-          <span>
-            <el-icon><Monitor /></el-icon>
-            {{ detail.asset?.hostname || '未知设备' }}
+    <!-- 终端概览 -->
+    <div class="zv-card zv-overview">
+      <div class="zv-overview-avatar" :style="{ background: getTypeGradient(detail.asset?.asset_type) }">
+        <el-icon :size="32"><component :is="getTypeIcon(detail.asset?.asset_type)" /></el-icon>
+      </div>
+      <div class="zv-overview-info">
+        <div class="zv-overview-name">
+          {{ detail.asset?.hostname || '加载中' }}
+          <span v-if="detail.asset?.status" class="zv-status-chip" :class="`is-${detail.asset.status}`">
+            <span class="zv-status-dot" :class="`is-${detail.asset.status}`" />
+            {{ getStatusText(detail.asset.status) }}
           </span>
-          <el-tag :type="getStatusType(detail.asset?.status)">
-            {{ getStatusText(detail.asset?.status) }}
-          </el-tag>
         </div>
-      </template>
+        <div class="zv-overview-meta">
+          <span class="zv-mono">{{ detail.asset?.ip_address || '-' }}</span>
+          <span>{{ detail.asset?.os_type }} {{ detail.asset?.os_version }}</span>
+          <span>CPU {{ detail.asset?.cpu_cores }} 核</span>
+          <span>{{ detail.asset?.memory_mb ? (detail.asset.memory_mb / 1024).toFixed(1) + ' GB' : '-' }} 内存</span>
+          <span v-if="detail.asset?.agent_version">Agent v{{ detail.asset.agent_version }}</span>
+        </div>
+      </div>
+      <div class="zv-overview-actions">
+        <el-button :icon="RefreshRight" @click="rebootTerminalCmd" plain>重启</el-button>
+        <el-button :icon="SwitchButton" @click="shutdownTerminal" plain type="danger">关机</el-button>
+        <el-button :icon="Search" @click="runSecurityScan" plain :loading="scanLoading">安全体检</el-button>
+      </div>
+    </div>
 
-      <!-- 系统信息 -->
-      <el-row :gutter="20" style="margin-bottom: 20px;">
-        <el-col :span="12">
-          <div class="info-section">
-            <h3><el-icon><Platform /></el-icon> 系统信息</h3>
-            <el-descriptions :column="1" border>
-              <el-descriptions-item label="主机名">
-                {{ detail.asset?.hostname || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="IP地址">
-                {{ detail.asset?.ip_address || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="MAC地址">
-                {{ detail.asset?.mac_address || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="操作系统">
-                {{ detail.asset?.os_type || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="系统版本">
-                {{ detail.asset?.os_version || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="默认网关">
-                {{ detail.asset?.gateway || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="DNS服务器" :span="2">
-                <div v-if="parseDnsServers(detail.asset?.dns_servers).length > 0">
-                  <el-tag v-for="(dns, index) in parseDnsServers(detail.asset?.dns_servers)" :key="index" size="small" style="margin-right: 5px;">
-                    {{ dns }}
-                  </el-tag>
-                </div>
-                <span v-else>-</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="最后在线">
-                {{ detail.asset?.last_seen || '-' }}
-              </el-descriptions-item>
-            </el-descriptions>
+    <!-- 实时状态 -->
+    <div v-if="heartbeat" class="zv-card zv-card-pad">
+      <h3 class="zv-section-title">
+        <el-icon><Monitor /></el-icon>
+        实时状态
+      </h3>
+      <div class="zv-metric-grid">
+        <div class="zv-metric-box">
+          <div class="zv-metric-ring" :style="metricRing(heartbeat.cpu_usage, $brand-primary)">
+            <svg viewBox="0 0 60 60" class="zv-ring-svg">
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#e2e8f0" stroke-width="5" />
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#3b82f6" stroke-width="5" stroke-linecap="round"
+                :stroke-dasharray="`${(heartbeat.cpu_usage || 0) * 1.63} 163`" transform="rotate(-90 30 30)" />
+            </svg>
+            <div class="zv-ring-num">{{ heartbeat.cpu_usage || 0 }}%</div>
           </div>
-        </el-col>
-
-        <el-col :span="12">
-          <div class="info-section">
-            <h3><el-icon><Cpu /></el-icon> 硬件信息</h3>
-            <el-descriptions :column="1" border>
-              <el-descriptions-item label="CPU核心">
-                {{ detail.asset?.cpu_cores || '-' }} 核
-              </el-descriptions-item>
-              <el-descriptions-item label="内存容量">
-                {{ detail.asset?.memory_mb ? (detail.asset.memory_mb / 1024).toFixed(2) + ' GB' : '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="磁盘容量">
-                {{ detail.asset?.disk_gb || '-' }} GB
-              </el-descriptions-item>
-              <el-descriptions-item label="制造商">
-                {{ detail.asset?.manufacturer || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="型号">
-                {{ detail.asset?.model || '-' }}
-              </el-descriptions-item>
-              <el-descriptions-item label="序列号">
-                {{ detail.asset?.serial_number || '-' }}
-              </el-descriptions-item>
-            </el-descriptions>
+          <div class="zv-metric-label">CPU</div>
+        </div>
+        <div class="zv-metric-box">
+          <div class="zv-metric-ring" :style="metricRing(heartbeat.memory_usage, $success)">
+            <svg viewBox="0 0 60 60" class="zv-ring-svg">
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#e2e8f0" stroke-width="5" />
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#10b981" stroke-width="5" stroke-linecap="round"
+                :stroke-dasharray="`${(heartbeat.memory_usage || 0) * 1.63} 163`" transform="rotate(-90 30 30)" />
+            </svg>
+            <div class="zv-ring-num">{{ heartbeat.memory_usage || 0 }}%</div>
           </div>
-        </el-col>
-      </el-row>
-
-      <!-- 实时状态 - 只在设备在线且有心跳数据时显示 -->
-      <div class="info-section" v-if="detail.asset?.status === 'online' && detail.heartbeat">
-        <h3><el-icon><DataLine /></el-icon> 实时状态</h3>
-        <el-row :gutter="20">
-          <el-col :span="8">
-            <div class="stat-card">
-              <div class="stat-label">CPU使用率</div>
-              <el-progress
-                :percentage="detail.heartbeat.cpu_usage || 0"
-                :color="getProgressColor(detail.heartbeat.cpu_usage)"
-              />
-            </div>
-          </el-col>
-          <el-col :span="8">
-            <div class="stat-card">
-              <div class="stat-label">内存使用率</div>
-              <el-progress
-                :percentage="detail.heartbeat.memory_usage || 0"
-                :color="getProgressColor(detail.heartbeat.memory_usage)"
-              />
-            </div>
-          </el-col>
-          <el-col :span="8">
-            <div class="stat-card">
-              <div class="stat-label">磁盘使用率</div>
-              <el-progress
-                :percentage="detail.heartbeat.disk_usage || 0"
-                :color="getProgressColor(detail.heartbeat.disk_usage)"
-              />
-            </div>
-          </el-col>
-        </el-row>
-
-        <!-- 分盘符磁盘信息 -->
-        <div v-if="detail.heartbeat.disk_info && detail.heartbeat.disk_info.length > 0" style="margin-top: 20px;">
-          <h4 style="margin-bottom: 10px; color: #606266;">磁盘分区详情</h4>
-          <el-table :data="detail.heartbeat.disk_info" stripe size="small">
-            <el-table-column prop="drive" label="盘符" width="100" />
-            <el-table-column prop="fstype" label="文件系统" width="120" />
-            <el-table-column label="总容量" width="120">
-              <template #default="scope">
-                {{ scope.row.total }} GB
-              </template>
-            </el-table-column>
-            <el-table-column label="已使用" width="120">
-              <template #default="scope">
-                {{ scope.row.used }} GB
-              </template>
-            </el-table-column>
-            <el-table-column label="可用" width="120">
-              <template #default="scope">
-                {{ scope.row.free }} GB
-              </template>
-            </el-table-column>
-            <el-table-column label="使用率" width="200">
-              <template #default="scope">
-                <el-progress
-                  :percentage="scope.row.percent"
-                  :color="getProgressColor(scope.row.percent)"
-                />
-              </template>
-            </el-table-column>
-          </el-table>
+          <div class="zv-metric-label">内存</div>
         </div>
-
-        <el-row :gutter="20" style="margin-top: 15px;">
-          <el-col :span="12">
-            <div class="info-item">
-              <span class="label">登录用户:</span>
-              <span class="value">{{ detail.heartbeat.logged_users || '-' }}</span>
-            </div>
-          </el-col>
-          <el-col :span="12">
-            <div class="info-item">
-              <span class="label">进程数:</span>
-              <span class="value">{{ detail.heartbeat.process_count || '-' }}</span>
-            </div>
-          </el-col>
-        </el-row>
-      </div>
-
-      <!-- 软件清单 -->
-      <div class="info-section">
-        <h3>
-          <el-icon><List /></el-icon>
-          已安装软件 ({{ detail.software_list?.length || 0 }})
-        </h3>
-
-        <!-- 搜索框 -->
-        <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
-          <el-input
-            v-model="softwareKeyword"
-            placeholder="搜索软件名称、厂商、版本..."
-            clearable
-            style="width: 400px;"
-            @clear="softwareKeyword = ''"
-          >
-            <template #prefix>
-              <el-icon><Search /></el-icon>
-            </template>
-          </el-input>
-
-          <el-tag v-if="softwareKeyword" type="info">
-            找到 {{ filteredSoftwareList.length }} 个结果
-          </el-tag>
-        </div>
-
-        <!-- 软件表格 -->
-        <el-table
-          :data="filteredSoftwareList"
-          stripe
-          style="width: 100%"
-          max-height="500"
-          :default-sort="{ prop: 'software_name', order: 'ascending' }"
-        >
-          <el-table-column
-            prop="software_name"
-            label="软件名称"
-            min-width="250"
-            sortable
-          >
-            <template #default="scope">
-              <span v-html="highlightKeyword(scope.row.software_name)"></span>
-            </template>
-          </el-table-column>
-          <el-table-column
-            prop="version"
-            label="版本"
-            width="150"
-            sortable
-          >
-            <template #default="scope">
-              <span v-html="highlightKeyword(scope.row.version)"></span>
-            </template>
-          </el-table-column>
-          <el-table-column
-            prop="vendor"
-            label="厂商"
-            width="180"
-            show-overflow-tooltip
-            sortable
-          >
-            <template #default="scope">
-              <span v-html="highlightKeyword(scope.row.vendor)"></span>
-            </template>
-          </el-table-column>
-          <el-table-column
-            prop="install_date"
-            label="安装日期"
-            width="120"
-            sortable
-          />
-        </el-table>
-
-        <!-- 无结果提示 -->
-        <el-empty
-          v-if="softwareKeyword && filteredSoftwareList.length === 0"
-          description="未找到匹配的软件"
-          :image-size="80"
-        />
-      </div>
-
-      <!-- 远程控制 -->
-      <div class="info-section">
-        <h3><el-icon><Operation /></el-icon> 远程控制</h3>
-
-        <el-alert
-          title="Web远程桌面"
-          type="success"
-          :closable="false"
-          style="margin-bottom: 15px;"
-        >
-          <template #default>
-            <div style="line-height: 1.8;">
-              <p>✅ 基于WebSocket的实时远程桌面</p>
-              <p>• 在浏览器中直接远程控制终端</p>
-              <p>• 对方不锁屏，可以看到你的操作</p>
-              <p>• 实时传输屏幕画面</p>
-              <p style="color: #E6A23C; margin-top: 10px;">
-                ⚠️ 连接会先经过平台代理，再转发到目标终端当前用户会话的远控组件
-              </p>
-            </div>
-          </template>
-        </el-alert>
-
-        <el-row :gutter="15">
-          <el-col :span="24">
-            <el-card shadow="hover" class="remote-card">
-              <template #header>
-                <div class="card-title">
-                  <el-icon color="#409EFF"><Monitor /></el-icon>
-                  <span>Web远程桌面</span>
-                </div>
-              </template>
-              <div class="card-content">
-                <p>浏览器内直接远程控制，无需安装客户端</p>
-                <p>目标: {{ detail.asset?.ip_address }}（经平台代理转发）</p>
-                <p class="status" style="color: #67C23A;">⚡ 支持鼠标键盘控制，高清流畅</p>
-              </div>
-              <template #footer>
-                <el-button type="primary" size="small" @click="openWebRemote" :icon="Monitor">
-                  启动远程桌面
-                </el-button>
-              </template>
-            </el-card>
-          </el-col>
-        </el-row>
-
-        <el-divider />
-
-        <div style="margin-top: 20px;">
-          <h4 style="margin-bottom: 15px; color: #606266;">终端操作</h4>
-          <el-space wrap>
-            <el-button type="success" :icon="Setting" @click="remoteShell">
-              远程Shell
-            </el-button>
-            <el-button type="info" :icon="Download" @click="collectInfo">
-              收集信息
-            </el-button>
-          </el-space>
+        <div class="zv-metric-box">
+          <div class="zv-metric-ring" :style="metricRing(heartbeat.disk_usage, $warning)">
+            <svg viewBox="0 0 60 60" class="zv-ring-svg">
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#e2e8f0" stroke-width="5" />
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#f59e0b" stroke-width="5" stroke-linecap="round"
+                :stroke-dasharray="`${(heartbeat.disk_usage || 0) * 1.63} 163`" transform="rotate(-90 30 30)" />
+            </svg>
+            <div class="zv-ring-num">{{ heartbeat.disk_usage || 0 }}%</div>
+          </div>
+          <div class="zv-metric-label">磁盘</div>
         </div>
       </div>
+    </div>
 
-      <!-- 心跳历史 -->
-      <div class="info-section" v-if="detail.heartbeat_history && detail.heartbeat_history.length > 0">
-        <h3><el-icon><Timer /></el-icon> 心跳历史</h3>
-        <el-table :data="detail.heartbeat_history" stripe>
-          <el-table-column prop="heartbeat_time" label="时间" width="180" />
-          <el-table-column label="CPU使用率" width="150">
-            <template #default="scope">
-              {{ scope.row.cpu_usage?.toFixed(1) || '-' }}%
-            </template>
-          </el-table-column>
-          <el-table-column label="内存使用率" width="150">
-            <template #default="scope">
-              {{ scope.row.memory_usage?.toFixed(1) || '-' }}%
-            </template>
-          </el-table-column>
-          <el-table-column label="磁盘使用率" width="150">
-            <template #default="scope">
-              {{ scope.row.disk_usage?.toFixed(1) || '-' }}%
-            </template>
-          </el-table-column>
-        </el-table>
+    <!-- 已安装软件 -->
+    <div class="zv-card zv-card-pad" v-loading="softwareLoading">
+      <h3 class="zv-section-title">
+        <el-icon><Goods /></el-icon>
+        已安装软件 <span class="zv-soft-count">({{ softwareList.length }})</span>
+      </h3>
+      <el-table :data="softwareList" :show-header="true" empty-text="暂无软件数据">
+        <el-table-column prop="software_name" label="软件" min-width="200" />
+        <el-table-column prop="version" label="版本" width="160" />
+        <el-table-column prop="vendor" label="厂商" min-width="160" show-overflow-tooltip />
+        <el-table-column prop="install_date" label="安装日期" width="140" />
+        <el-table-column label="大小" width="100">
+          <template #default="{ row }">{{ row.size_mb ? row.size_mb + ' MB' : '-' }}</template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <el-drawer v-model="showRemoteDesktop" size="80%" :with-header="false" destroy-on-close>
+      <WebRemoteDesktop
+        v-if="showRemoteDesktop"
+        :asset-id="currentAssetId"
+        :ip-address="currentIpAddress"
+        :hostname="currentHostname"
+        @close="showRemoteDesktop = false"
+      />
+    </el-drawer>
+
+    <!-- 安全体检结果 -->
+    <el-dialog v-model="scanVisible" title="安全体检结果" width="640px" destroy-on-close>
+      <div v-if="scanResult" class="zv-scan-result">
+        <div v-if="scanResult.success === false" class="zv-scan-error">{{ scanResult.error || '扫描失败' }}</div>
+        <template v-else>
+          <div class="zv-scan-meta">扫描时间：{{ scanResult.scan_time || '-' }} · 进程数：{{ scanResult.process_count ?? '-' }}</div>
+          <div class="zv-scan-section">
+            <div class="zv-scan-title">防火墙状态</div>
+            <pre class="zv-scan-pre">{{ formatScanSection(scanResult.firewall) }}</pre>
+          </div>
+          <div class="zv-scan-section">
+            <div class="zv-scan-title">USB 存储策略</div>
+            <pre class="zv-scan-pre">{{ formatScanSection(scanResult.usb) }}</pre>
+          </div>
+          <div class="zv-scan-section">
+            <div class="zv-scan-title">启动项</div>
+            <pre class="zv-scan-pre">{{ formatScanSection(scanResult.startup) }}</pre>
+          </div>
+          <div class="zv-scan-section">
+            <div class="zv-scan-title">网络连接</div>
+            <pre class="zv-scan-pre">{{ formatScanSection(scanResult.network) }}</pre>
+          </div>
+        </template>
       </div>
-    </el-card>
+      <el-empty v-else description="暂无结果" :image-size="70" />
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Monitor, Platform, Cpu, DataLine, List, Search,
-  Operation, Setting, Download, Timer
+  ArrowLeft, VideoPlay, RefreshRight, SwitchButton, Monitor, Goods,
+  Box, Cpu, Share, Connection, Search
 } from '@element-plus/icons-vue'
-import { getAssetDetail, triggerAssetReport } from '@/api/asset'
+import { getAssetDetail } from '@/api/asset'
+import { getInstalledSoftware } from '@/api/software'
+import { rebootTerminal, shutdownTerminal as shutdownCmd } from '@/api/terminal'
+import { remoteScan } from '@/api/security'
 import WebRemoteDesktop from '@/components/WebRemoteDesktop.vue'
-import RemoteShell from '@/components/RemoteShell.vue'
 
 const route = useRoute()
 const router = useRouter()
-
-const loading = ref(false)
 const detail = ref({})
-const softwareKeyword = ref('')
-const remoteDesktopMounted = ref(false)
+const heartbeat = ref(null)
+const softwareList = ref([])
+const softwareLoading = ref(false)
 const showRemoteDesktop = ref(false)
-const remoteDesktopKey = ref(0)
-const showShell = ref(false)
-let remoteDesktopUnmountTimer = null
-let pendingRemoteDesktopOpen = false
+const scanLoading = ref(false)
+const scanVisible = ref(false)
+const scanResult = ref(null)
 
-const clearRemoteDesktopUnmountTimer = () => {
-  if (remoteDesktopUnmountTimer) {
-    clearTimeout(remoteDesktopUnmountTimer)
-    remoteDesktopUnmountTimer = null
-  }
+const TYPE_META = {
+  server: { icon: Cpu,        gradient: 'linear-gradient(135deg, #3b82f6, #2563eb)' },
+  pc:     { icon: Monitor,    gradient: 'linear-gradient(135deg, #10b981, #059669)' },
+  switch: { icon: Connection, gradient: 'linear-gradient(135deg, #f59e0b, #d97706)' },
+  router: { icon: Share,      gradient: 'linear-gradient(135deg, #8b5cf6, #7c3aed)' }
 }
+const getTypeIcon = (t) => TYPE_META[t]?.icon || Box
+const getTypeGradient = (t) => TYPE_META[t]?.gradient || 'linear-gradient(135deg, #94a3b8, #64748b)'
 
-const scheduleRemoteDesktopUnmount = () => {
-  clearRemoteDesktopUnmountTimer()
-  remoteDesktopUnmountTimer = setTimeout(() => {
-    if (!showRemoteDesktop.value && !pendingRemoteDesktopOpen) {
-      console.info('[remote-desktop][detail] force unmount fallback')
-      remoteDesktopMounted.value = false
-    }
-  }, 600)
-}
+const getStatusText = (s) => ({ online: '在线', offline: '离线', degraded: '降级', unknown: '未知' }[s] || s)
+const metricRing = (val, color) => ({})
 
-const mountRemoteDesktop = () => {
-  console.info('[remote-desktop][detail] mount instance:', route.params.id, detail.value.asset?.ip_address)
-  remoteDesktopKey.value += 1
-  remoteDesktopMounted.value = true
-  showRemoteDesktop.value = true
-}
+const openRemoteDesktop = () => { showRemoteDesktop.value = true }
 
-const handleRemoteDesktopVisibleChange = (visible) => {
-  console.info('[remote-desktop][detail] visible change:', visible)
-  showRemoteDesktop.value = visible
-  if (visible) {
-    clearRemoteDesktopUnmountTimer()
-    return
-  }
-  if (!remoteDesktopMounted.value) {
-    return
-  }
-  scheduleRemoteDesktopUnmount()
-}
-
-const handleRemoteDesktopClosed = () => {
-  console.info('[remote-desktop][detail] closed event')
-  clearRemoteDesktopUnmountTimer()
-  showRemoteDesktop.value = false
-  const shouldReopen = pendingRemoteDesktopOpen
-  pendingRemoteDesktopOpen = false
-  if (shouldReopen) {
-    mountRemoteDesktop()
-    return
-  }
-  remoteDesktopMounted.value = false
-}
-
-// 过滤软件列表（增强搜索）
-const filteredSoftwareList = computed(() => {
-  if (!detail.value.software_list) return []
-  if (!softwareKeyword.value) return detail.value.software_list
-
-  const keyword = softwareKeyword.value.toLowerCase()
-
-  return detail.value.software_list.filter(software => {
-    const name = (software.software_name || '').toLowerCase()
-    const version = (software.version || '').toLowerCase()
-    const vendor = (software.vendor || '').toLowerCase()
-
-    // 搜索名称、版本、厂商
-    return name.includes(keyword) ||
-           version.includes(keyword) ||
-           vendor.includes(keyword)
-  })
-})
-
-// 高亮关键词
-const highlightKeyword = (text) => {
-  if (!text || !softwareKeyword.value) return text
-
-  const keyword = softwareKeyword.value
-  const regex = new RegExp(`(${keyword})`, 'gi')
-
-  return text.replace(regex, '<span style="background: #ffe58f; color: #d48806; padding: 0 2px;">$1</span>')
-}
-
-// 加载终端详情
-const loadDetail = async () => {
-  loading.value = true
+// 安全体检：下发 security_scan，采集防火墙/USB/启动项/网络连接/进程态势（非病毒扫描）
+const runSecurityScan = async () => {
+  scanLoading.value = true
   try {
-    const assetId = route.params.id
-    const res = await getAssetDetail(assetId)
-    detail.value = res
+    const res = await remoteScan(route.params.id)
+    scanResult.value = res?.result || res?.data || res || null
+    scanVisible.value = true
   } catch (error) {
-    console.error('加载失败:', error)
-    ElMessage.error('加载终端详情失败')
+    ElMessage.error('安全体检下发失败（终端需在线）')
   } finally {
-    loading.value = false
+    scanLoading.value = false
   }
 }
 
-// 返回
-const goBack = () => {
-  router.back()
+const formatScanSection = (section) => {
+  if (section === null || section === undefined) return '-'
+  if (typeof section === 'string') return section
+  return JSON.stringify(section, null, 2)
 }
 
-// 状态显示
-const getStatusType = (status) => {
-  const map = {
-    online: 'success',
-    offline: 'danger',
-    unknown: 'info'
-  }
-  return map[status] || 'info'
-}
-
-const getStatusText = (status) => {
-  const map = {
-    online: '在线',
-    offline: '离线',
-    unknown: '未知'
-  }
-  return map[status] || '未知'
-}
-
-// 进度条颜色
-const getProgressColor = (percentage) => {
-  if (percentage >= 90) return '#F56C6C'
-  if (percentage >= 70) return '#E6A23C'
-  return '#67C23A'
-}
-
-// 远程控制功能
-const openWebRemote = () => {
-  if (!detail.value.asset?.ip_address) {
-    ElMessage.error('IP地址不可用')
-    return
-  }
-  console.info('[remote-desktop][detail] open request:', route.params.id, detail.value.asset?.ip_address)
-  clearRemoteDesktopUnmountTimer()
-  pendingRemoteDesktopOpen = true
-
-  if (remoteDesktopMounted.value || showRemoteDesktop.value) {
-    console.info('[remote-desktop][detail] queue reopen after close:', route.params.id, detail.value.asset?.ip_address)
-    showRemoteDesktop.value = false
-    return
-  }
-
-  pendingRemoteDesktopOpen = false
-  mountRemoteDesktop()
-}
-
-const parseDnsServers = (dnsServers) => {
-  if (!dnsServers) return []
+const loadDetail = async () => {
   try {
-    return typeof dnsServers === 'string' ? JSON.parse(dnsServers) : dnsServers
-  } catch {
-    return []
-  }
-}
-
-const remoteDesktop = () => {
-  // RDP功能已移除，仅保留Web远程桌面
-  ElMessage.info('请使用Web远程桌面功能')
-}
-
-const remoteShell = () => {
-  console.log('打开远程Shell')
-  showShell.value = true
-}
-
-const collectInfo = async () => {
-  const assetId = route.params.id
-  if (!assetId) {
-    ElMessage.error('资产ID不可用')
-    return
-  }
-
-  try {
-    ElMessage({
-      message: '正在触发Agent收集信息...',
-      type: 'info',
-      duration: 2000
-    })
-
-    const response = await triggerAssetReport(assetId)
-
-    if (response?.success || response?.message || response?.asset_id) {
-      ElMessage.success('信息收集完成！Agent已上报最新数据')
-      setTimeout(() => {
-        loadDetail()
-      }, 2000)
-    } else {
-      ElMessage.warning('触发收集成功，但Agent响应异常')
-    }
+    const data = await getAssetDetail(route.params.id)
+    detail.value = data || {}
+    heartbeat.value = data.heartbeat || null
   } catch (error) {
-    console.error('触发收集失败:', error)
-    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-      ElMessage.error('连接Agent超时，请确认设备在线且Agent正在运行')
-    } else if (error.response?.status === 404) {
-      ElMessage.error('Agent版本过旧，不支持立即收集功能')
-    } else if (error.response?.status === 409) {
-      ElMessage.error(error.response?.data?.detail || '目标终端当前不可执行该操作')
-    } else {
-      ElMessage.error('触发失败：平台代理无法连接到Agent')
-    }
+    ElMessage.error('加载终端详情失败')
   }
 }
 
-onMounted(() => {
-  loadDetail()
-})
+const loadSoftware = async () => {
+  softwareLoading.value = true
+  try {
+    const res = await getInstalledSoftware(route.params.id, { limit: 200 })
+    softwareList.value = res.data || []
+  } catch (error) {
+    console.error('加载软件列表失败', error)
+  } finally {
+    softwareLoading.value = false
+  }
+}
+
+const rebootTerminalCmd = async () => {
+  try {
+    await ElMessageBox.confirm('确定要重启该终端吗？', '警告', { type: 'warning' })
+    await rebootTerminal(route.params.id)
+    ElMessage.success('重启指令已下发')
+  } catch (e) { if (e !== 'cancel') ElMessage.error('下发失败') }
+}
+
+const shutdownTerminal = async () => {
+  try {
+    await ElMessageBox.confirm('确定要关闭该终端吗？', '警告', { type: 'warning' })
+    await shutdownCmd(route.params.id)
+    ElMessage.success('关机指令已下发')
+  } catch (e) { if (e !== 'cancel') ElMessage.error('下发失败') }
+}
+
+onMounted(() => { loadDetail(); loadSoftware() })
 </script>
 
-<style scoped>
-.terminal-detail {
-  padding: 20px;
-}
+<style lang="scss" scoped>
+@use '@/assets/styles/variables.scss' as *;
 
-.page-title {
-  font-size: 18px;
-  font-weight: bold;
-}
+.zv-page { padding: $content-padding; max-width: 1400px; margin: 0 auto; }
+.zv-page-actions { display: flex; gap: 10px; }
 
-.box-card {
-  margin-top: 20px;
-}
-
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 16px;
-  font-weight: bold;
-}
-
-.info-section {
-  margin-bottom: 30px;
-}
-
-.info-section h3 {
-  font-size: 16px;
-  margin-bottom: 15px;
-  color: #409EFF;
+.zv-overview {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 20px;
+  padding: 24px;
+  margin-bottom: 16px;
+  background: linear-gradient(135deg, $bg-card 0%, $slate-50 100%);
 }
 
-.stat-card {
-  padding: 15px;
-  background: #f5f7fa;
-  border-radius: 4px;
+.zv-overview-avatar {
+  width: 64px; height: 64px; border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.10);
+  flex-shrink: 0;
 }
 
-.stat-label {
-  margin-bottom: 10px;
-  color: #606266;
-  font-size: 14px;
+.zv-overview-info { flex: 1; min-width: 0; }
+
+.zv-overview-name {
+  font-size: 22px; font-weight: 700; color: $text-primary;
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 8px;
 }
 
-.info-item {
-  padding: 10px;
-  background: #f5f7fa;
-  border-radius: 4px;
+.zv-overview-meta {
+  display: flex; gap: 18px; font-size: 13px; color: $text-secondary;
+  flex-wrap: wrap;
+  > span { display: flex; align-items: center; }
 }
 
-.info-item .label {
-  color: #909399;
-  margin-right: 10px;
+.zv-overview-actions { display: flex; gap: 8px; }
+
+.zv-card-pad { padding: 24px 26px; margin-bottom: 16px; }
+
+.zv-section-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 15px; font-weight: 600; color: $text-primary;
+  margin: 0 0 18px 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid $border-color-light;
+  .el-icon { color: $brand-primary; }
 }
 
-.info-item .value {
-  color: #303133;
-  font-weight: bold;
+.zv-soft-count { font-size: 13px; color: $text-tertiary; font-weight: 400; margin-left: 4px; }
+
+.zv-metric-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  @media (max-width: 800px) { grid-template-columns: 1fr; }
 }
 
-.remote-card {
-  height: 100%;
-  cursor: pointer;
-  transition: transform 0.3s;
+.zv-metric-box {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 20px; background: $slate-50; border-radius: $border-radius;
 }
 
-.remote-card:hover {
-  transform: translateY(-5px);
+.zv-metric-ring { position: relative; width: 100px; height: 100px; }
+.zv-ring-svg { width: 100%; height: 100%; }
+.zv-ring-num {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; font-weight: 700; color: $text-primary; font-family: $font-mono;
 }
 
-.remote-card .card-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
-  font-weight: bold;
-}
+.zv-metric-label { font-size: 13px; color: $text-secondary; }
 
-.remote-card .card-content {
-  min-height: 80px;
-  padding: 10px 0;
+.zv-status-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 10px; border-radius: $radius-pill;
+  font-size: 12px; font-weight: 500;
+  background: $slate-50; color: $text-secondary;
+  &.is-online  { background: rgba(16, 185, 129, 0.10); color: $success-color; }
+  &.is-offline { background: rgba(239, 68, 68, 0.10); color: $danger-color; }
 }
+.zv-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
-.remote-card .card-content p {
-  margin: 5px 0;
-  color: #606266;
-  font-size: 13px;
-}
+.zv-mono { font-family: $font-mono; font-size: 13px; }
 
-.remote-card .status {
-  color: #909399;
+.zv-scan-result { padding: 0 4px; }
+.zv-scan-error { color: $danger-color; font-size: 13px; padding: 8px 0; }
+.zv-scan-meta { font-size: 12px; color: $text-tertiary; margin-bottom: 12px; }
+.zv-scan-section { margin-bottom: 14px; }
+.zv-scan-title { font-size: 13px; font-weight: 600; color: $text-primary; margin-bottom: 6px; }
+.zv-scan-pre {
+  background: $slate-50;
+  border-radius: $border-radius;
+  padding: 10px 12px;
+  font-family: $font-mono;
   font-size: 12px;
+  color: $text-primary;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
 }
 
-.remote-card .device-code {
-  color: #409EFF;
-  font-size: 12px;
-  font-weight: bold;
+:deep(.el-table) {
+  --el-table-header-bg-color: #fafbfc;
+  th.el-table__cell { background: #fafbfc; color: $text-secondary; font-weight: 600; font-size: 12px; }
+  tr:hover > td.el-table__cell { background: rgba(37, 99, 235, 0.03) !important; }
+  td.el-table__cell { border-bottom: 1px solid $slate-100 !important; }
+  .el-table__inner-wrapper::before { height: 0; }
 }
 </style>

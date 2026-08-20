@@ -477,6 +477,41 @@ class DesktopFrameCapturer:
         self.kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
         self.kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
 
+        # GDI handles are pointer-sized on 64-bit Windows. Without these
+        # signatures ctypes truncates them to C ints before BitBlt/GetDIBits.
+        self.gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        self.gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        self.gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, wintypes.INT, wintypes.INT]
+        self.gdi32.CreateCompatibleBitmap.restype = wintypes.HANDLE
+        self.gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        self.gdi32.SelectObject.restype = wintypes.HANDLE
+        self.gdi32.BitBlt.argtypes = [
+            wintypes.HDC,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.HDC,
+            wintypes.INT,
+            wintypes.INT,
+            wintypes.DWORD,
+        ]
+        self.gdi32.BitBlt.restype = wintypes.BOOL
+        self.gdi32.GetDIBits.argtypes = [
+            wintypes.HDC,
+            wintypes.HANDLE,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        self.gdi32.GetDIBits.restype = wintypes.INT
+        self.gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        self.gdi32.DeleteObject.restype = wintypes.BOOL
+        self.gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        self.gdi32.DeleteDC.restype = wintypes.BOOL
+
     def capture_raw(self):
         """捕获原始屏幕图像。"""
         capture_attempt = self._begin_capture_attempt()
@@ -680,11 +715,13 @@ class DesktopFrameCapturer:
             if scale != 1.0:
                 new_width = max(1, int(working.width * scale))
                 new_height = max(1, int(working.height * scale))
-                resized = working.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                # BILINEAR 比 LANCZOS 快 2 倍以上，远控场景画质差异可忽略
+                resized = working.resize((new_width, new_height), Image.Resampling.BILINEAR)
                 working = resized
 
             buffer = io.BytesIO()
-            working.save(buffer, format="JPEG", quality=quality, optimize=True)
+            # optimize=True 是慢速优化模式（2-5倍耗时），远控低延迟场景关闭
+            working.save(buffer, format="JPEG", quality=quality, optimize=False)
             jpeg_data = buffer.getvalue()
 
             return {
@@ -873,7 +910,12 @@ class DesktopFrameCapturer:
     def _grab_with_pyautogui(self):
         if pyautogui is None:
             raise RuntimeError("pyautogui unavailable")
-        screenshot = pyautogui.screenshot()
+        # 输入注入按整个虚拟桌面解算坐标，兜底抓屏必须覆盖同一区域，
+        # 否则多显示器场景下画面与鼠标位置会系统性错位。
+        try:
+            screenshot = ImageGrab.grab(all_screens=True)
+        except Exception:
+            screenshot = pyautogui.screenshot()
         self._note_backend("PyAutoGUI")
         return screenshot
 

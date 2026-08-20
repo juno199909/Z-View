@@ -1,11 +1,91 @@
 from __future__ import annotations
 
+import ctypes
 import json
+import os
 
 from Common.logging_utils import make_component_logger
 from agent_consent_ipc import get_current_process_session_id
 from input_injector import InputInjector as LegacyInputInjector
 from input_injector import MouseButton, MouseEvent, MouseEventType
+
+_KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_KEYUP = 0x0002
+_INPUT_KEYBOARD = 1
+
+
+class _KeybdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_uint),
+        ("time", ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_uint),
+        ("dwFlags", ctypes.c_uint),
+        ("time", ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_uint),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = [
+        ("ki", _KeybdInput),
+        ("mi", _MouseInput),
+        ("hi", _HardwareInput),
+    ]
+
+
+class _SendInputRecord(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", ctypes.c_uint),
+        ("u", _InputUnion),
+    ]
+
+
+def send_unicode_text(text: str) -> bool:
+    """以 KEYEVENTF_UNICODE 注入文本。
+
+    逐字符 SendInput 直接投递 Unicode 码点，绕过键盘布局与输入法——
+    pyautogui 的逐键模拟会被中文输入法拦截成拼音组合（如 cmd -> c'm'd）。
+    """
+    if os.name != "nt" or not text:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.SendInput.restype = ctypes.c_uint
+        sent = 0
+        for ch in text:
+            code = ord(ch)
+            if code > 0xFFFF:
+                continue
+            down = _SendInputRecord(type=_INPUT_KEYBOARD)
+            down.ki = _KeybdInput(0, code, _KEYEVENTF_UNICODE, 0, None)
+            up = _SendInputRecord(type=_INPUT_KEYBOARD)
+            up.ki = _KeybdInput(
+                0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, None
+            )
+            batch = (_SendInputRecord * 2)(down, up)
+            sent += user32.SendInput(2, batch, ctypes.sizeof(_SendInputRecord))
+        return sent >= len(text) * 2 and sent > 0
+    except Exception:
+        return False
 
 
 class InputInjector(LegacyInputInjector):

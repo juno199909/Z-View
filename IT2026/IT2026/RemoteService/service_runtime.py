@@ -24,7 +24,21 @@ class ServiceRuntime:
             self.pipe_name,
             self._dispatch_request,
             logger=self.logger,
+            allow_all_users=True,
+            # R4：客户端会话必须属于当前已知的交互会话集合
+            # （阻断同机无关进程/其他会话连接服务控制管道）
+            client_validator=self._validate_pipe_client_session,
         )
+
+    def _validate_pipe_client_session(self, client_session_id: int) -> bool:
+        """管道客户端会话必须在活跃交互会话集合中（Session 0 服务视角的访问控制）。"""
+        try:
+            sessions = self.session_manager.list_interactive_sessions()
+            known = {int(d.session_id) for d in sessions}
+            return int(client_session_id) in known
+        except Exception as exc:
+            self.logger(f"pipe client session validation error (fail-open): {exc}")
+            return True
 
     def register_handler(self, command: str, handler: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         self._extra_handlers[command] = handler

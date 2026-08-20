@@ -15,6 +15,7 @@ import contextlib
 import zlib
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from multiprocessing.connection import Client
 from ctypes import wintypes
@@ -390,6 +391,11 @@ class RemoteAccessConsentManager:
                 return False, "rejected"
             if response.value == self.IDTIMEOUT:
                 return False, "timeout"
+            if response.value == 0:
+                # 部分 Windows 版本（含本机 RDP 会话）在等待超时或对话框未能展示时
+                # 返回 TRUE 且 response=0，而非 IDTIMEOUT；按超时拒绝并保留原始值供排查。
+                print(f"[Consent] WTS dialog returned response=0 after {self.timeout_seconds}s; treating as timeout")
+                return False, "timeout"
 
             return False, f"unknown_response:{response.value}"
 
@@ -499,6 +505,15 @@ class RemoteAccessConsentManager:
 
 
 CONSENT_MANAGER = RemoteAccessConsentManager()
+
+# 启动时用 agent 配置初始化同意策略；此前 configure() 从未被调用，
+# config.json 的 require_consent/consent_timeout_seconds 等键实际不生效。
+try:
+    from agent_consent_ipc import load_agent_config
+
+    CONSENT_MANAGER.configure((load_agent_config() or {}).get("remote_desktop") or {})
+except Exception as _consent_config_exc:  # pragma: no cover - 配置缺失时保持默认
+    print(f"[Consent] Failed to apply consent settings from config: {_consent_config_exc}")
 
 
 class RemoteClipboardManager:
@@ -898,11 +913,23 @@ class DisabledRemoteFileTransferManager:
 
 
 class ScreenCapturer(DesktopFrameCapturer):
-    """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。"""
+    """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
+
+    后端优先级：mss(GDI) 优先——它在 headless/VMware/无显示基底场景下仍能稳定抓到
+    桌面最后合成图（兼容 Win9x 时代的 GDI BitBlt 路径），不像 dxgi 那样依赖 DWM
+    持续产出新帧。dxgi 仅在物理显示器正常附着时作为备选（更高刷新率时质量更好）。
+    """
 
     def __init__(self):
-        super().__init__(backend_order=("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui"))
-        print("[RemoteDesktop] Screen capturer initialized")
+        super().__init__(backend_order=("mss", "gdi", "dxgi", "wgc", "dwm", "imagegrab", "pyautogui"))
+        try:
+            # CAPTUREBLT 标志为捕获分层窗口而设，BitBlt 慢 3-5 倍；
+            # 远控 60fps 场景去掉它（分层窗口脉冲窗口 1px 透明，无需捕获）
+            import mss.windows as _mss_win
+            _mss_win.CAPTUREBLT = 0
+        except Exception:
+            pass
+        print("[RemoteDesktop] Screen capturer initialized (headless-safe: mss first, fast-bitblt)")
 
 
 class DisplayResolutionManager:
@@ -1154,11 +1181,11 @@ class RemoteDesktopSession:
         self.capture_runtime_mode = (
             "service_capture_pending"
             if self.service_client is not None
-            else "service_capture_unavailable"
+            else "legacy_local_capture"
         )
         self.capture_host_backend = ""
         self.capture_host_session_id: int | None = None
-        self.service_managed_session_routing = True
+        self.service_managed_session_routing = self.service_client is not None
         self.capture_stack = create_capture_stack(
             runtime_mode=self.capture_runtime_mode,
             helper_available=bool(self.service_client),
@@ -1168,15 +1195,18 @@ class RemoteDesktopSession:
         self.runtime_stack: dict = {}
         self._last_capture_runtime_signature: tuple[str, str, int | None] | None = None
 
-        # 配置
-        # 当前链路仍是 JPEG over WebSocket，默认值偏向低延迟而非满分辨率。
-        self.quality = 75
-        self.fps = 18
-        self.scale = 0.9
+        # 配置：内网环境不限帧率，60fps 流畅优先
+        self.quality = 60
+        self.fps = 60
+        self.scale = 0.6
         self.adaptive_streaming = True
         self.wheel_speed = 1.0
         self.mouse_sensitivity = 1.0
         self.color_preset = "balanced"
+        # 轻量 DWM 唤醒窗口（替代重绘全桌面的 RedrawWindow）
+        self._redraw_hwnd = None
+        self._redraw_thread_lock = threading.Lock()
+        self._redraw_executor = None
 
         # 初始化模块
         self.display_manager = self._initialize_required_component(
@@ -1196,6 +1226,16 @@ class RemoteDesktopSession:
                 follow_service_session=self.service_managed_session_routing,
             ),
         )
+        # 输入处理专用单线程执行器：委托 helper 的命名管道调用可能阻塞，
+        # 必须移出 asyncio 事件循环，否则会冻结帧推送并造成"无法操作"；
+        # max_workers=1 同时保证键盘/鼠标事件按到达顺序执行。
+        self._input_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"rd-input-{self.session_id}"
+        )
+        # move 合并状态：队列中至多一个待处理 move（始终最新位置）
+        self._pending_move_message: dict | None = None
+        self._move_task_scheduled = False
+        self._pending_move_lock = threading.Lock()
         self.capturer = self._initialize_required_component(
             "screen_capturer",
             ScreenCapturer,
@@ -1238,6 +1278,7 @@ class RemoteDesktopSession:
         self.skipped_frame_count = 0
         self.capture_pressure = 0.0
         self.capture_profile_name = "interactive"
+        self._last_sent_frame: dict | None = None  # 用于 unchanged 期间的心跳重发
         self.force_keyframe_interval = 1.0
         self.stale_frame_after_input_threshold = 3.0
         self.stale_frame_rotation_cooldown = 5.0
@@ -1346,16 +1387,27 @@ class RemoteDesktopSession:
             return None
 
         try:
+            # 深度诊断仅按需采集：每帧携带 desktop_state/backend_diagnostics 会让
+            # 响应膨胀数十 KB，经两跳命名管道传输后把帧率拖到亚秒级。
+            include_diagnostics = self.capture_empty_count >= 3
+            call_started_at = time.perf_counter()
             response = await asyncio.to_thread(
                 self.service_client.capture_frame,
                 {
                     "quality": profile["quality"],
                     "scale": profile["scale"],
                     "previous_signature": self.last_frame_signature,
-                    "include_desktop_state": True,
-                    "include_backend_diagnostics": True,
+                    "include_desktop_state": include_diagnostics,
+                    "include_backend_diagnostics": include_diagnostics,
                 },
             )
+            call_elapsed = time.perf_counter() - call_started_at
+            if call_elapsed > 0.25:
+                self._log_session_event(
+                    "capture_service_call",
+                    f"slow round-trip elapsed={call_elapsed:.3f}s "
+                    f"mode={self.capture_runtime_mode}",
+                )
         except Exception as exc:
             self._log_session_event("capture_service_helper", f"unavailable error={exc}")
             return None
@@ -1406,6 +1458,130 @@ class RemoteDesktopSession:
             "session_id": helper_session_id,
             "backend": helper_backend,
             "capture_context": capture_context,
+        }
+
+    def _ensure_redraw_executor(self):
+        """重绘/脉冲专用单线程 executor，与捕获线程池隔离。"""
+        if self._redraw_executor is None:
+            with self._redraw_thread_lock:
+                if self._redraw_executor is None:
+                    self._redraw_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix=f"rd-dwm-{self.session_id}"
+                    )
+
+    def _trigger_dwm_redraw(self) -> None:
+        """强制应用重绘产出新像素：RedrawWindow 全桌面（后台线程调用，勿阻塞事件循环）。
+
+        headless/VM 场景下 DWM 不主动合成新像素，RedrawWindow 让所有窗口
+        立即重绘（时钟/动画/悬停效果等产生真实像素变化）。耗时 70-100ms，
+        必须由 capture_loop 通过 run_in_executor 后台调用。
+        """
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            HWND_DESKTOP = 0
+            RDW_INVALIDATE = 0x0001
+            RDW_UPDATENOW = 0x0100
+            RDW_ALLCHILDREN = 0x0080
+            user32.RedrawWindow(
+                HWND_DESKTOP, None, None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            )
+        except Exception:
+            pass
+
+    def _pulse_layered_window(self) -> None:
+        """轻量 DWM 合成脉冲：1px 透明分层窗口 alpha 微调（微秒级），强制 DWM 重新合成。
+
+        不产出新像素，但让 DWM 尽快把已变化的内容合成到屏幕（配合 RedrawWindow 用）。
+        """
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            hwnd = self._redraw_hwnd
+            if not hwnd:
+                with self._redraw_thread_lock:
+                    if self._redraw_hwnd:
+                        hwnd = self._redraw_hwnd
+                    else:
+                        WS_POPUP = 0x80000000
+                        WS_VISIBLE = 0x10000000
+                        WS_EX_LAYERED = 0x00080000
+                        WS_EX_TRANSPARENT = 0x00000020
+                        WS_EX_NOACTIVATE = 0x08000000
+                        WS_EX_TOOLWINDOW = 0x00000080
+                        HWND_TOPMOST = -1
+                        SWP_NOMOVE = 0x0002
+                        SWP_NOSIZE = 0x0001
+                        SWP_NOACTIVATE = 0x0010
+                        SWP_SHOWWINDOW = 0x0040
+                        LWA_ALPHA = 0x00000002
+                        hwnd = user32.CreateWindowExW(
+                            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                            "STATIC", None, WS_POPUP | WS_VISIBLE,
+                            0, 0, 1, 1, None, None, None, None,
+                        )
+                        if hwnd:
+                            user32.SetWindowPos(
+                                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            )
+                            user32.SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA)
+                            self._redraw_hwnd = hwnd
+            if not hwnd:
+                return
+            LWA_ALPHA = 0x00000002
+            # alpha 在 1/2 间微调：每次分层属性更新都强制 DWM 重新合成
+            self._redraw_alpha = 2 if not getattr(self, "_redraw_alpha", 0) == 2 else 1
+            user32.SetLayeredWindowAttributes(hwnd, 0, self._redraw_alpha, LWA_ALPHA)
+        except Exception:
+            pass
+
+    async def _capture_frame_locally(self, profile: dict) -> dict:
+        """Use the interactive Agent process when the optional service is absent."""
+        self._set_active_capture_source("legacy_local_capture")
+        local_started_at = time.perf_counter()
+        frame = await asyncio.to_thread(
+            self.capturer.capture,
+            quality=profile["quality"],
+            scale=profile["scale"],
+        )
+        local_elapsed = time.perf_counter() - local_started_at
+        if local_elapsed > 0.25:
+            self._log_session_event(
+                "local_capture_timing",
+                f"slow grab+encode elapsed={local_elapsed:.3f}s "
+                f"backend={getattr(self.capturer, 'capture_backend', '')}",
+            )
+        if not frame:
+            return {
+                "empty": True,
+                "captured_at": time.time(),
+                "capture_context": {},
+            }
+
+        signature = zlib.adler32(frame["data"].encode("ascii"))
+        profile_key = (
+            profile["quality"],
+            round(profile["scale"], 4),
+            profile["fps"],
+            self.capture_profile_name,
+        )
+        if signature == self.last_frame_signature and profile_key == self.last_frame_profile_key:
+            return {
+                "unchanged": True,
+                "signature": signature,
+                "captured_at": time.time(),
+                "capture_context": {},
+            }
+
+        return {
+            "frame": frame,
+            "signature": signature,
+            "captured_at": time.time(),
+            "capture_context": {},
         }
 
     def _log_session_event(self, stage: str, detail: str):
@@ -1516,6 +1692,39 @@ class RemoteDesktopSession:
         self.running = True
 
         try:
+            requester = "未知管理员"
+            remote_address = getattr(self.websocket, "remote_address", None)
+            if remote_address:
+                requester = str(remote_address)
+            target = os.environ.get("COMPUTERNAME") or "当前终端"
+            await self._send_json({
+                "type": "consent_required",
+                "target": target,
+            })
+            approved, reason = await CONSENT_MANAGER.request_permission({
+                "requester": requester,
+                "origin": requester,
+                "target": target,
+            })
+            if not approved:
+                self._log_session_event("consent", f"rejected reason={reason}")
+                await self._send_json({
+                    "type": "consent_result",
+                    "approved": False,
+                    "reason": reason,
+                    "message": "被控端拒绝或未响应远程控制请求",
+                })
+                await self.websocket.close(code=4003, reason="consent_denied")
+                return
+
+            self._log_session_event("consent", f"approved reason={reason}")
+            await self._send_json({
+                "type": "consent_result",
+                "approved": True,
+                "reason": reason,
+                "message": "被控端已允许远程控制",
+            })
+
             # 发送屏幕信息给控制端
             self._log_session_event("start", "send_screen_info")
             await self._send_screen_info()
@@ -1617,7 +1826,21 @@ class RemoteDesktopSession:
             try:
                 loop_started_at = time.perf_counter()
                 profile = self._select_capture_profile()
-                helper_result = await self._capture_frame_via_service(profile)
+
+                # 主路径：同会话进程内直抓（毫秒级），避免每帧两跳服务管道往返；
+                # 本地抓不到（锁屏/桌面不可见）时降级 SYSTEM 助手处理特殊桌面。
+                helper_result = await self._capture_frame_locally(profile)
+                if helper_result.get("empty"):
+                    service_fallback = await self._capture_frame_via_service(profile)
+                    if service_fallback is not None:
+                        helper_result = {**service_fallback, "via_service": True}
+
+                if helper_result is None:
+                    helper_result = {
+                        "empty": True,
+                        "captured_at": time.time(),
+                        "capture_context": {},
+                    }
 
                 if helper_result is not None:
                     frame_observed_at = float(helper_result.get("captured_at") or time.time())
@@ -1628,7 +1851,11 @@ class RemoteDesktopSession:
                     if helper_result.get("empty"):
                         await self._handle_capture_empty(
                             profile,
-                            capture_source="service_helper_empty",
+                            capture_source=(
+                                "legacy_local_capture_empty"
+                                if self.service_client is None
+                                else "service_helper_empty"
+                            ),
                             capture_context=helper_result.get("capture_context") or {},
                         )
                     elif helper_result.get("unchanged"):
@@ -1643,6 +1870,50 @@ class RemoteDesktopSession:
                             and frame_observed_at - self.last_input_at >= self.stale_frame_after_input_threshold
                         ):
                             await self._handle_stale_frame(unchanged_for)
+                        # 主动 DWM 唤醒：mss/GDI 抓帧本身依赖桌面合成器持续渲染。
+                        # headless 场景下 DWM 可能停止产出新像素 → 用 RedrawWindow 强制重绘。
+                        # 这是向日葵/ToDesk 在无显示器/VM 场景下保证画面更新的关键 hack。
+                        backend = str(getattr(self.capturer, "capture_backend", "") or "")
+                        if backend in ("mss", "gdi", "imagegrab", "pyautogui"):
+                            now_t = time.time()
+                            # 双机制：
+                            # 1) RedrawWindow 后台线程@80ms——强制应用重绘产出新像素（帧率上限12.5fps）
+                            # 2) 分层窗口 pulse@33ms——强制 DWM 合成保鲜（微秒级，不产像素）
+                            if (
+                                not hasattr(self, "_last_dwm_wakeup_at")
+                                or (now_t - self._last_dwm_wakeup_at) >= 0.08
+                            ):
+                                self._last_dwm_wakeup_at = now_t
+                                # 专用单线程 executor：与捕获线程池隔离，避免重绘任务阻塞抓帧
+                                self._ensure_redraw_executor()
+                                self._redraw_executor.submit(self._trigger_dwm_redraw)
+                            if (
+                                not hasattr(self, "_last_dwm_pulse_at")
+                                or (now_t - self._last_dwm_pulse_at) >= 0.033
+                            ):
+                                self._last_dwm_pulse_at = now_t
+                                self._ensure_redraw_executor()
+                                self._redraw_executor.submit(self._pulse_layered_window)
+                        # 定期心跳重发：即使像素未变，每隔一定帧数强制推一帧，
+                        # 避免前端画面"看起来卡死"（与鼠标操作无关的静止场景）。
+                        heartbeat_interval = max(0.5, profile.get("fps_heartbeat_seconds", 2.0))
+                        if (
+                            self.last_frame_sent_at == 0.0
+                            or (time.time() - self.last_frame_sent_at) >= heartbeat_interval
+                        ):
+                            stale_frame = (
+                                self._last_sent_frame
+                                if self._last_sent_frame
+                                else (helper_result.get("frame") or {})
+                            )
+                            if stale_frame:
+                                self._enqueue_frame({
+                                    "type": "frame",
+                                    "data": stale_frame["data"],
+                                    "width": stale_frame["width"],
+                                    "height": stale_frame["height"],
+                                })
+                                self.last_frame_sent_at = time.time()
                     else:
                         frame = helper_result.get("frame") or {}
                         self.capture_empty_count = 0
@@ -1656,15 +1927,16 @@ class RemoteDesktopSession:
                         )
                         self.last_visual_change_at = frame_observed_at
                         self.skipped_frame_count = 0
+                        self._last_sent_frame = frame
 
-                        send_started_at = time.perf_counter()
-                        await self._send_json({
+                        # 异步发送：不再 await（避免 110KB 帧/网络慢时卡循环）
+                        self._enqueue_frame({
                             "type": "frame",
                             "data": frame["data"],
                             "width": frame["width"],
                             "height": frame["height"],
                         })
-                        send_elapsed = time.perf_counter() - send_started_at
+                        send_elapsed = 0.0
                         self._update_capture_pressure(send_elapsed, int(frame.get("size") or 0))
 
                         self.frame_count += 1
@@ -1694,6 +1966,10 @@ class RemoteDesktopSession:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                self._log_session_event(
+                    "capture_loop",
+                    f"fatal type={type(e).__name__} error={e}",
+                )
                 print(f"[RemoteDesktop] Capture loop error: {e}")
                 break
         self._log_session_event("capture_loop", "stopped")
@@ -1717,13 +1993,13 @@ class RemoteDesktopSession:
 
         if idle_seconds >= 15:
             profile_name = "idle"
-            profile = {"fps": 4, "quality": 55, "scale": min(self.scale, 0.65)}
+            profile = {"fps": 15, "quality": 55, "scale": min(self.scale, 0.65)}
         elif idle_seconds >= 5 or self.capture_pressure > 0.8:
             profile_name = "balanced"
-            profile = {"fps": min(self.fps, 8), "quality": 62, "scale": min(self.scale, 0.75)}
+            profile = {"fps": min(self.fps, 30), "quality": 62, "scale": min(self.scale, 0.75)}
         elif self.capture_pressure > 0.45:
             profile_name = "interactive-lite"
-            profile = {"fps": min(self.fps, 12), "quality": 68, "scale": min(self.scale, 0.85)}
+            profile = {"fps": min(self.fps, 45), "quality": 68, "scale": min(self.scale, 0.85)}
 
         self.capture_profile_name = profile_name
         return profile
@@ -2196,15 +2472,12 @@ class RemoteDesktopSession:
 
         self._log_session_event(
             "capture-recreate",
-            "local_fallback_blocked service_managed_capture_required",
+            "recreating local capture backend",
         )
-        self._set_active_capture_source(
-            "service_capture_unavailable",
-            backend=self.capture_host_backend,
-            session_id=self.capture_host_session_id,
-        )
+        self.capturer = ScreenCapturer()
+        self._set_active_capture_source("legacy_local_capture")
         self._refresh_runtime_stack(refresh_service=False)
-        return False
+        return True
 
     async def _handle_capture_empty(
         self,
@@ -2385,12 +2658,86 @@ class RemoteDesktopSession:
             substrate_recovery=substrate_recovery,
         )
 
+    def handle_mouse_in_executor(self, message: dict):
+        """把鼠标处理调度到输入专用线程，避免阻塞事件循环。"""
+        loop = asyncio.get_running_loop()
+
+        # 高频 move 合并（coalescing）：单线程输入队列若被每秒数十个 move 淹没，
+        # 后续 click/drag 会延迟数十秒才执行（表现为"点不动/拖不动"）。
+        # 这里始终只保留最新位置，队列中同时至多存在一个待处理 move。
+        action_name = str(message.get("action") or "").strip().lower()
+        if action_name in ("move", "mousemove"):
+            with self._pending_move_lock:
+                self._pending_move_message = message
+                if self._move_task_scheduled:
+                    return
+                self._move_task_scheduled = True
+
+            def _drain_moves():
+                while True:
+                    with self._pending_move_lock:
+                        pending = self._pending_move_message
+                        self._pending_move_message = None
+                        if pending is None:
+                            self._move_task_scheduled = False
+                            return
+                    try:
+                        self.handle_mouse(pending)
+                    except Exception as exc:
+                        self._log_session_event(
+                            "input_executor",
+                            f"mouse failed type={type(exc).__name__} error={exc}",
+                        )
+
+            loop.run_in_executor(self._input_executor, _drain_moves)
+            return
+
+        def _safe_mouse():
+            try:
+                self.handle_mouse(message)
+            except Exception as exc:
+                self._log_session_event(
+                    "input_executor",
+                    f"mouse failed type={type(exc).__name__} error={exc}",
+                )
+
+        loop.run_in_executor(self._input_executor, _safe_mouse)
+
+    def handle_keyboard_in_executor(self, message: dict):
+        """把键盘处理调度到输入专用线程，避免阻塞事件循环。"""
+        loop = asyncio.get_running_loop()
+
+        def _safe_keyboard():
+            try:
+                self.handle_keyboard(message)
+            except Exception as exc:
+                self._log_session_event(
+                    "input_executor",
+                    f"keyboard failed type={type(exc).__name__} error={exc}",
+                )
+
+        loop.run_in_executor(self._input_executor, _safe_keyboard)
+
     async def message_loop(self):
         """消息处理循环"""
         try:
             while self.running:
-                message = await self.websocket.receive_text()
-                data = json.loads(message)
+                try:
+                    message = await self.websocket.receive_text()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # 连接关闭或传输错误：正常结束会话
+                    break
+                try:
+                    data = json.loads(message)
+                except Exception as exc:
+                    # 单条损坏消息只跳过，不允许终止整个会话
+                    self._log_session_event(
+                        "message_loop",
+                        f"bad message skipped type={type(exc).__name__} error={exc}",
+                    )
+                    continue
                 await self.handle_control(data)
 
         except Exception as e:
@@ -2416,10 +2763,10 @@ class RemoteDesktopSession:
                         f"wheel={message.get('wheel_steps')}"
                     ),
                 )
-                self.handle_mouse(message)
+                self.handle_mouse_in_executor(message)
             elif msg_type == 'keyboard':
                 self.last_input_at = time.time()
-                self.handle_keyboard(message)
+                self.handle_keyboard_in_executor(message)
             elif msg_type == 'settings':
                 self.last_input_at = time.time()
                 await self.handle_settings(message)
@@ -3110,7 +3457,14 @@ class RemoteDesktopSession:
                 pyautogui.press(key)
         elif action == 'type':
             if text:
-                pyautogui.typewrite(text, interval=0.01)
+                try:
+                    from Input.input_controller import send_unicode_text
+
+                    # 逐键模拟会被终端输入法拦截成拼音组合，必须走 UNICODE 注入
+                    if not send_unicode_text(text):
+                        pyautogui.typewrite(text, interval=0.01)
+                except ImportError:
+                    pyautogui.typewrite(text, interval=0.01)
 
     def _invoke_service_input_action(self, action: str, payload: dict | None = None) -> dict:
         if self.service_client is None:
@@ -3187,8 +3541,34 @@ class RemoteDesktopSession:
                 pass
             self.modifier_states[key] = False
 
+    def _enqueue_frame(self, frame_payload: dict) -> bool:
+        """异步发送帧：fire-and-forget，不阻塞 capture_loop。
+        二进制帧协议：[1B type][4B frameId][4B width][4B height][4B jpegLen][jpeg bytes]
+        替代旧 base64-in-JSON，节省 ~33% 带宽 + 解码更快。
+        """
+        try:
+            asyncio.create_task(self._send_binary_frame(frame_payload))
+            return True
+        except RuntimeError:
+            return False
+
+    async def _send_binary_frame(self, frame_payload: dict):
+        """串行化 WebSocket 发送二进制帧。"""
+        import struct
+        async with self.send_lock:
+            try:
+                data_b64 = frame_payload.get("data", "")
+                width = int(frame_payload.get("width") or 0)
+                height = int(frame_payload.get("height") or 0)
+                jpeg_bytes = base64.b64decode(data_b64)
+                frame_id = self._binary_frame_seq = getattr(self, "_binary_frame_seq", 0) + 1
+                header = struct.pack(">BIIII", 0x02, frame_id, width, height, len(jpeg_bytes))
+                await self.websocket.send_bytes(header + jpeg_bytes)
+            except Exception as exc:
+                self._log_session_event("send_binary_frame", f"error: {exc}")
+
     async def _send_json(self, payload: dict):
-        """串行化 WebSocket 发送，避免帧流与心跳并发写入。"""
+        """串行化 WebSocket 发送控制消息（text JSON）。屏幕帧用 _send_binary_frame。"""
         async with self.send_lock:
             await self.websocket.send_json(payload)
 
@@ -3246,6 +3626,10 @@ class RemoteDesktopSession:
         self._release_pressed_inputs()
         self._restore_original_resolution()
         self.input_injector.stop()
+        try:
+            self._input_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         with contextlib.suppress(Exception):
             if self.capturer is not None:
                 self.capturer.close()

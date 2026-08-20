@@ -61,6 +61,14 @@ ROLE_PERMISSIONS = {
         "remote_desktop:control",
         "policies:read",
         "policies:write",
+        "security:read",
+        "security:write",
+        "firewall:manage",
+        "usb:manage",
+        "app_control:manage",
+        "file_protect:manage",
+        "behavior:read",
+        "security_event:handle",
     ),
     "viewer": (
         "auth:self",
@@ -70,6 +78,8 @@ ROLE_PERMISSIONS = {
         "alerts:read",
         "logs:read",
         "policies:read",
+        "security:read",
+        "behavior:read",
     ),
 }
 
@@ -157,6 +167,26 @@ def resolve_required_permission(path: str, method: str) -> str:
         return "alerts:write" if is_write else "alerts:read"
     if normalized_path.startswith("/api/v1/logs"):
         return "logs:write" if is_write else "logs:read"
+    if normalized_path.startswith("/api/v1/security/firewall"):
+        return "firewall:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/usb"):
+        return "usb:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/app-control"):
+        return "app_control:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/file-protect"):
+        return "file_protect:manage" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/behavior"):
+        return "behavior:read"
+    if normalized_path.startswith("/api/v1/security/events"):
+        return "security_event:handle" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/policies"):
+        return "security:write" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/security/remote"):
+        return "security:write"
+    if normalized_path.startswith("/api/v1/security"):
+        return "security:write" if is_write else "security:read"
+    if normalized_path.startswith("/api/v1/remote"):
+        return "remote_desktop:control" if is_write else "security:read"
     return "auth:self"
 
 

@@ -15,12 +15,22 @@ from Common.logging_utils import make_component_logger
 from Common.runtime_paths import get_high_integrity_helper_pipe_name
 from IPC.named_pipe import NamedPipeCommandServer
 from Input.input_controller import InputInjector
-from agent_consent_ipc import get_current_process_session_id, get_current_username
+from agent_consent_ipc import (
+    get_current_process_session_id,
+    get_current_username,
+    load_agent_config,
+    load_tray_settings,
+)
 from desktop_context import InputDesktopController
 from input_injector import MouseButton, MouseEvent, MouseEventType
 
 
 pyautogui.FAILSAFE = False
+
+
+class SecureDesktopInputBlocked(RuntimeError):
+    """策略禁止在安全桌面（UAC 提示所在桌面）上注入输入时抛出。"""
+
 
 
 class _DesktopBindingMismatch(RuntimeError):
@@ -52,6 +62,7 @@ class _DesktopBoundWorker:
         logger: Callable[[str], None],
         on_binding_applied: Callable[[dict[str, Any]], None] | None = None,
         on_worker_recycled: Callable[[dict[str, Any]], None] | None = None,
+        secure_desktop_input_policy: Callable[[], bool] | None = None,
     ):
         self.name = name
         self.binding_mode = str(binding_mode or "input").strip().lower()
@@ -59,6 +70,8 @@ class _DesktopBoundWorker:
         self.logger = logger
         self.on_binding_applied = on_binding_applied
         self.on_worker_recycled = on_worker_recycled
+        # 安全桌面（UAC）输入策略：返回 False 时注入线程拒绝绑定/执行于安全桌面
+        self.secure_desktop_input_policy = secure_desktop_input_policy
         self._tasks: queue.Queue | None = None
         self._worker_stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
@@ -529,6 +542,29 @@ class _DesktopBoundWorker:
                     resolved_binding_payload = self._resolve_binding_payload(binding_state, resolved_binding_payload)
                     current_target_signature = self._resolve_target_signature(binding_state, resolved_binding_payload)
                     binding_state["input_target_signature"] = current_target_signature
+                input_desktop_kind = str(
+                    binding_state.get("input_desktop_kind")
+                    or binding_state.get("desktop_kind")
+                    or ""
+                ).strip().lower()
+                if self.binding_mode == "input" and input_desktop_kind.startswith("secure"):
+                    allowed = True
+                    if self.secure_desktop_input_policy is not None:
+                        try:
+                            allowed = bool(self.secure_desktop_input_policy())
+                        except Exception:
+                            allowed = True
+                    if not allowed:
+                        raise SecureDesktopInputBlocked(
+                            f"{self.name} secure desktop input disabled by policy: "
+                            f"desktop={binding_state.get('input_desktop') or 'unknown'}"
+                        )
+                    # 审计：每次对安全桌面（UAC）的授权注入都留痕
+                    self.logger(
+                        f"AUDIT {self.name} secure-desktop input authorized: reason={reason} "
+                        f"desktop={binding_state.get('input_desktop') or 'unknown'}"
+                    )
+                    binding_state["secure_desktop_authorized"] = True
                 self._record_binding_state(binding_state)
                 current_signature = str(binding_state.get("desktop_signature") or "").strip()
                 if current_signature and current_signature != self._last_desktop_signature:
@@ -764,12 +800,44 @@ class HighIntegritySessionHelperRuntime:
             desktop_controller=self.input_desktop_controller,
             logger=self.logger,
             on_binding_applied=self._handle_input_binding_applied,
+            secure_desktop_input_policy=self._secure_desktop_input_allowed,
         )
+        self._secure_desktop_policy_cache = {"value": None, "expires": 0.0}
         self._pipe_server = NamedPipeCommandServer(
             self.pipe_name,
             self._handle_request,
             logger=self.logger,
+            allow_all_users=True,
+            # 安全审计 P0-5：会话范围 DACL + 客户端会话校验
+            expected_session_id=self.session_id,
+            enforce_session_scope=True,
         )
+
+    def _secure_desktop_input_allowed(self) -> bool:
+        """安全桌面（UAC）输入策略：config 默认值 + 托盘开关覆盖，带 2 秒缓存。"""
+        now = time.monotonic()
+        cache = getattr(self, "_secure_desktop_policy_cache", None)
+        if cache is None:
+            cache = self._secure_desktop_policy_cache = {"value": None, "expires": 0.0}
+        if now < float(cache["expires"]) and cache["value"] is not None:
+            return bool(cache["value"])
+
+        allowed = True  # 与商业远控一致：会话已获同意的前提下默认允许操作 UAC
+        try:
+            remote_settings = (load_agent_config() or {}).get("remote_desktop") or {}
+            allowed = bool(remote_settings.get("allow_secure_desktop_input", True))
+        except Exception:
+            pass
+        try:
+            tray_value = load_tray_settings().get("allow_secure_desktop_input")
+            if tray_value is not None:
+                allowed = bool(tray_value)
+        except Exception:
+            pass
+
+        cache["value"] = bool(allowed)
+        cache["expires"] = now + 2.0
+        return bool(allowed)
 
     def run_forever(self) -> None:
         self._capture_worker.start()
@@ -981,16 +1049,19 @@ class HighIntegritySessionHelperRuntime:
         )
         
         def capture_operation(binding_state: dict[str, Any]) -> dict[str, Any]:
+            op_started_at = time.perf_counter()
             captured_at = time.time()
             desktop_state, display_presence, _display_inventory = self._enrich_desktop_state_with_display_presence(
                 binding_state
             )
             desktop_signature = str(desktop_state.get("desktop_signature") or "").strip()
+            enrich_done_at = time.perf_counter()
             self.frame_capturer.prepare_for_desktop(
                 desktop_signature,
                 desktop_state=desktop_state,
                 reason="capture_worker_desktop_transition",
             )
+            prepare_done_at = time.perf_counter()
             backend_diagnostics = (
                 self.frame_capturer.describe_backend_state()
                 if include_backend_diagnostics
@@ -1010,6 +1081,7 @@ class HighIntegritySessionHelperRuntime:
                     "backend_diagnostics": backend_diagnostics,
                 }
             screenshot = self.frame_capturer.capture_raw()
+            grab_done_at = time.perf_counter()
             backend_diagnostics = (
                 self.frame_capturer.describe_backend_state()
                 if include_backend_diagnostics
@@ -1047,6 +1119,17 @@ class HighIntegritySessionHelperRuntime:
                     frame = self.frame_capturer.encode_frame(screenshot, quality=quality, scale=scale)
                     frame["signature"] = signature
                     response["frame"] = frame
+                encode_done_at = time.perf_counter()
+                self.logger(
+                    "capture_frame timing: "
+                    f"enrich={enrich_done_at - op_started_at:.3f}s "
+                    f"prepare={prepare_done_at - enrich_done_at:.3f}s "
+                    f"grab={grab_done_at - prepare_done_at:.3f}s "
+                    f"encode+sig={encode_done_at - grab_done_at:.3f}s "
+                    f"total={encode_done_at - op_started_at:.3f}s "
+                    f"backend={self.frame_capturer.capture_backend} "
+                    f"unchanged={response.get('unchanged')}"
+                )
                 return response
             finally:
                 try:
@@ -1167,7 +1250,14 @@ class HighIntegritySessionHelperRuntime:
                         pyautogui.press(key)
                 elif action == "type":
                     if text:
-                        pyautogui.typewrite(text, interval=0.01)
+                        try:
+                            from Input.input_controller import send_unicode_text
+
+                            # 逐键模拟会被终端输入法拦截成拼音组合，必须走 UNICODE 注入
+                            if not send_unicode_text(text):
+                                pyautogui.typewrite(text, interval=0.01)
+                        except ImportError:
+                            pyautogui.typewrite(text, interval=0.01)
                 else:
                     raise ValueError(f"unsupported keyboard action: {action}")
             return {

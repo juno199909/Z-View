@@ -77,6 +77,9 @@ def get_db_connection():
     """获取数据库连接"""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("SET time_zone = '+8:00'")
+        cursor.close()
         return conn
     except Error as e:
         print(f"数据库连接错误: {e}")

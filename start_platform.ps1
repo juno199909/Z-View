@@ -127,6 +127,15 @@ function Save-State {
     $Entries | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StateFile -Encoding UTF8
 }
 
+function Stop-OrphanedManagedProcesses {
+    $managedScriptPattern = '(^|\s)(assets_api\.py|software_management_api_complete_v2\.py|software_policy_api\.py)(\s|$)'
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | ForEach-Object {
+        if ($_.CommandLine -and $_.CommandLine -match $managedScriptPattern) {
+            Stop-Tree -ProcessId ([int]$_.ProcessId)
+        }
+    }
+}
+
 function Stop-ManagedPlatform {
     $entries = Load-State
     foreach ($entry in ($entries | Sort-Object @{ Expression = { $_.name -eq 'frontend' }; Descending = $true })) {
@@ -134,6 +143,7 @@ function Stop-ManagedPlatform {
             Stop-Tree -ProcessId ([int]$entry.pid)
         }
     }
+    Stop-OrphanedManagedProcesses
     if (Test-Path -LiteralPath $StateFile) {
         Remove-Item -LiteralPath $StateFile -Force
     }
@@ -201,9 +211,11 @@ if ($Action -eq 'Restart') {
 
 $PythonExe = Get-CommandPath -Name 'python'
 $NpmExe = Get-CommandPath -Name 'npm'
+$NodeExe = Get-CommandPath -Name 'node'
 
 $RequirementsPath = Join-Path $AppRoot 'requirements.txt'
 $FrontendRoot = Join-Path $AppRoot 'frontend'
+$ViteEntrypoint = Join-Path $FrontendRoot 'node_modules\vite\bin\vite.js'
 
 if ($InstallDependencies -or -not (Test-PythonDeps -PythonExe $PythonExe)) {
     Write-Host 'Installing/updating Python dependencies...'
@@ -218,6 +230,10 @@ if ($InstallDependencies -or -not (Test-Path -LiteralPath (Join-Path $FrontendRo
     } finally {
         Pop-Location
     }
+}
+
+if (-not (Test-Path -LiteralPath $ViteEntrypoint -PathType Leaf)) {
+    throw "Vite entrypoint not found after dependency setup: $ViteEntrypoint"
 }
 
 Stop-ManagedPlatform
@@ -253,8 +269,8 @@ $processes += Start-ManagedProcess `
 
 $processes += Start-ManagedProcess `
     -Name 'frontend' `
-    -FilePath $NpmExe `
-    -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1') `
+    -FilePath $NodeExe `
+        -ArgumentList @($ViteEntrypoint, 'preview', '--host', '0.0.0.0') `
     -WorkingDirectory $FrontendRoot `
     -Port 5173 `
     -StdOutLog (Join-Path $LogDir 'frontend.out.log') `

@@ -143,6 +143,11 @@ _user_config = _load_user_config()
 CONFIG = _merge_config(_DEFAULT_CONFIG, _user_config)
 SOFTWARE_CONFIG = _merge_config(_DEFAULT_SOFTWARE_CONFIG, _user_config)
 
+# Agent 版本号（发布时由 build_agent.ps1 或手动 bump；升级机制以此判定新版本）
+AGENT_VERSION = "1.3.2"
+
+_UPGRADE_STATE = {"in_progress": False}
+
 # 统一 server_url 为顶层配置
 if "server_url" in _user_config:
     SOFTWARE_CONFIG["server_url"] = _user_config["server_url"].replace(":8080", ":8081")
@@ -199,20 +204,8 @@ def _get_default_gateway() -> str | None:
             for addr in addrs:
                 if addr.family == socket.AF_INET:
                     pass
-        # 使用系统路由表获取默认网关
-        if os.name == "nt":
-            result = subprocess.run(
-                ["netsh", "interface", "ip", "show", "config"],
-                capture_output=True, text=True, encoding="utf-8", errors="ignore",
-                timeout=10, check=False,
-            )
-            for line in result.stdout.splitlines():
-                if "default gateway" in line.lower():
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        ip = parts[-1].strip()
-                        if ip:
-                            return ip
+        # Gateway is optional telemetry. Avoid invoking netsh every heartbeat:
+        # it creates a visible console host on some interactive Windows hosts.
     except Exception:
         pass
     return None
@@ -470,6 +463,165 @@ def collect_software_list() -> list[dict]:
 
 
 # =============================================================================
+# 平台策略同步（心跳自动下发，管理台可配置）
+# =============================================================================
+
+_AGENT_POLICIES_CACHE_PATH = (
+    Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "runtime" / "agent-policies.json"
+)
+
+
+def _set_prompt_on_secure_desktop(disable: bool) -> str:
+    """设置 UAC 提示是否免安全桌面。
+
+    PromptOnSecureDesktop=1 时 UAC 弹窗位于独立安全桌面，远控抓屏/输入均不可见；
+    置 0 后 UAC 弹窗显示在当前桌面，远程会话可直接查看与操作。
+    需要 SYSTEM/管理员权限；无权限或非 Windows 时返回 "skipped"。
+    返回: "changed" / "unchanged" / "skipped"。
+    """
+    if os.name != "nt":
+        return "skipped"
+    try:
+        import winreg
+
+        key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        desired = 0 if disable else 1
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE
+        ) as key:
+            try:
+                current, _value_type = winreg.QueryValueEx(key, "PromptOnSecureDesktop")
+            except FileNotFoundError:
+                current = 1
+            current = int(current or 1)
+            if current == desired:
+                return "unchanged"
+            winreg.SetValueEx(key, "PromptOnSecureDesktop", 0, winreg.REG_DWORD, desired)
+        print(f"[Policy] PromptOnSecureDesktop -> {desired} (UAC secure desktop {'disabled' if disable else 'enabled'})")
+        return "changed"
+    except PermissionError:
+        print("[Policy] 无法修改 PromptOnSecureDesktop：需要 SYSTEM/管理员权限")
+        return "skipped"
+    except Exception as exc:
+        print(f"[Policy] 设置 PromptOnSecureDesktop 失败: {exc}")
+        return "skipped"
+
+
+def _apply_agent_policies(policies: Any, persist: bool = True) -> dict | None:
+    """将平台下发的策略合并进 CONFIG 并热更新消费方。
+
+    返回实际生效的增量；无有效变更时返回 None。
+    """
+    if not isinstance(policies, dict) or not policies:
+        return None
+
+    applied: dict = {}
+
+    intervals_in = policies.get("intervals")
+    if isinstance(intervals_in, dict):
+        current_intervals = CONFIG.setdefault("intervals", {})
+        for key in ("heartbeat", "software", "hardware"):
+            if key not in intervals_in:
+                continue
+            raw = intervals_in.get(key)
+            if isinstance(raw, bool):
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            value = max(5, min(value, 604800))
+            current_intervals[key] = value
+            applied[key] = value
+
+    remote_in = policies.get("remote_desktop")
+    if isinstance(remote_in, dict):
+        current_remote = CONFIG.setdefault("remote_desktop", {})
+        clean: dict = {}
+        if "require_consent" in remote_in and remote_in.get("require_consent") is not None:
+            value = bool(remote_in.get("require_consent"))
+            current_remote["require_consent"] = value
+            clean["require_consent"] = value
+        if (
+            "consent_timeout_seconds" in remote_in
+            and remote_in.get("consent_timeout_seconds") is not None
+        ):
+            try:
+                value = max(5, int(remote_in.get("consent_timeout_seconds")))
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                current_remote["consent_timeout_seconds"] = value
+                clean["consent_timeout_seconds"] = value
+        if "allow_if_no_user" in remote_in and remote_in.get("allow_if_no_user") is not None:
+            value = bool(remote_in.get("allow_if_no_user"))
+            current_remote["allow_if_no_user"] = value
+            clean["allow_if_no_user"] = value
+        if (
+            "disable_uac_secure_desktop" in remote_in
+            and remote_in.get("disable_uac_secure_desktop") is not None
+        ):
+            value = bool(remote_in.get("disable_uac_secure_desktop"))
+            current_remote["disable_uac_secure_desktop"] = value
+            clean["disable_uac_secure_desktop"] = value
+            _set_prompt_on_secure_desktop(value)
+        if clean:
+            applied["remote_desktop"] = clean
+            try:
+                from remote_desktop_engine_v2 import CONSENT_MANAGER
+
+                CONSENT_MANAGER.configure(current_remote)
+            except Exception:
+                pass
+
+    if persist and applied:
+        try:
+            _AGENT_POLICIES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            merged = {}
+            try:
+                merged = json.loads(_AGENT_POLICIES_CACHE_PATH.read_text(encoding="utf-8"))
+                if not isinstance(merged, dict):
+                    merged = {}
+            except Exception:
+                merged = {}
+            stored_intervals = merged.setdefault("intervals", {})
+            for key in ("heartbeat", "software", "hardware"):
+                if key in applied:
+                    stored_intervals[key] = applied[key]
+            if isinstance(applied.get("remote_desktop"), dict):
+                merged["remote_desktop"] = {
+                    **(merged.get("remote_desktop") or {}),
+                    **applied["remote_desktop"],
+                }
+            _AGENT_POLICIES_CACHE_PATH.write_text(
+                json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    return applied or None
+
+
+def _load_cached_agent_policies() -> None:
+    """进程启动或远控会话创建前，从本地缓存恢复最近一次平台策略。"""
+    try:
+        if not _AGENT_POLICIES_CACHE_PATH.exists():
+            return
+        data = json.loads(_AGENT_POLICIES_CACHE_PATH.read_text(encoding="utf-8"))
+        _apply_agent_policies(data, persist=False)
+    except Exception:
+        pass
+
+
+def _current_interval(name: str, default: int) -> int:
+    try:
+        value = int(CONFIG.get("intervals", {}).get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(5, min(value, 604800))
+
+
+# =============================================================================
 # 资产注册 / 获取 asset_id
 # =============================================================================
 
@@ -490,7 +642,7 @@ def get_asset_id_from_server() -> int | None:
         "cpu_info": hardware.get("cpu_info", ""),
         "memory_total_mb": hardware.get("memory_total_mb", 0),
         "status": "online",
-        "agent_version": "1.2.1",
+        "agent_version": AGENT_VERSION,
         "agent_install_status": "installed",
     }
 
@@ -514,8 +666,94 @@ def get_asset_id_from_server() -> int | None:
 # 心跳上报线程
 # =============================================================================
 
+
+
+# ============================================================
+# Agent 自动升级（R13）
+# ============================================================
+
+def perform_self_upgrade(new_version: str, expected_sha256: str) -> None:
+    """下载新版本 exe -> SHA256 校验 -> 备份当前 -> 写升级脚本(分离执行) -> 自退出。
+
+    升级脚本由独立 cmd 进程执行：等待本进程退出 -> 强杀残留 -> 替换 exe
+    （失败回滚 .old）-> 启动服务 -> 自删。失败回滚保护：下载/校验/备份
+    任一步失败都不会触碰正在运行的 exe。
+    """
+    import hashlib
+    import subprocess
+    import tempfile
+
+    log_tag = "[Upgrade]"
+    try:
+        print(f"{log_tag} 开始升级 -> {new_version}")
+        base = CONFIG["server_url"].rstrip("/")
+        headers = _agent_headers()
+        url = f"{base}/api/v1/agent/upgrade/download?version={new_version}"
+        resp = requests.get(url, headers=headers, timeout=300, stream=True)
+        if resp.status_code != 200:
+            print(f"{log_tag} 下载失败 HTTP {resp.status_code}")
+            _UPGRADE_STATE["in_progress"] = False
+            return
+        new_exe = os.path.join(tempfile.gettempdir(), f"Z-View-{new_version}.exe")
+        with open(new_exe, "wb") as fh:
+            for chunk in resp.iter_content(1024 * 256):
+                fh.write(chunk)
+
+        digest = hashlib.sha256(open(new_exe, "rb").read()).hexdigest()
+        if digest.lower() != expected_sha256.lower():
+            print(f"{log_tag} SHA256 校验失败: {digest} != {expected_sha256}")
+            os.remove(new_exe)
+            _UPGRADE_STATE["in_progress"] = False
+            return
+
+        target_exe = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else r"C:\\Program Files\\CMDB-Agent\\Z-View.exe"
+        backup_exe = target_exe + ".upgrade-old"
+        try:
+            if os.path.exists(target_exe):
+                if os.path.exists(backup_exe):
+                    os.remove(backup_exe)
+                import shutil
+                shutil.copy2(target_exe, backup_exe)
+        except Exception as exc:
+            print(f"{log_tag} 备份失败（继续）: {exc}")
+
+        service_name = "CMDB-Agent"
+        bat_path = os.path.join(tempfile.gettempdir(), "zv-agent-upgrade.bat")
+        with open(bat_path, "w", encoding="gbk", errors="replace") as fh:
+            fh.write("@echo off\r\n")
+            fh.write("timeout /t 3 /nobreak >nul\r\n")
+            fh.write(f"net stop {service_name} >nul 2>&1\r\n")
+            fh.write("timeout /t 2 /nobreak >nul\r\n")
+            fh.write("taskkill /F /IM Z-View.exe >nul 2>&1\r\n")
+            fh.write("timeout /t 2 /nobreak >nul\r\n")
+            fh.write(f'copy /Y "{new_exe}" "{target_exe}"\r\n')
+            fh.write(f"if errorlevel 1 goto rollback\r\n")
+            fh.write(f"net start {service_name}\r\n")
+            fh.write(f'del "{new_exe}" >nul 2>&1\r\n')
+            fh.write(f'del "%~f0" >nul 2>&1\r\n')
+            fh.write("exit /b 0\r\n")
+            fh.write(":rollback\r\n")
+            fh.write(f'copy /Y "{backup_exe}" "{target_exe}" >nul 2>&1\r\n')
+            fh.write(f"net start {service_name}\r\n")
+            fh.write(f'del "%~f0" >nul 2>&1\r\n')
+            fh.write("exit /b 1\r\n")
+
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=flags,
+            close_fds=True,
+        )
+        print(f"{log_tag} 升级脚本已启动，本进程即将退出，等待服务自动恢复为新版本 {new_version}")
+        time.sleep(1.5)
+        os._exit(0)
+    except Exception as exc:
+        print(f"{log_tag} 升级失败: {exc}")
+        _UPGRADE_STATE["in_progress"] = False
+
+
+
 def _heartbeat_loop():
-    interval = CONFIG.get("intervals", {}).get("heartbeat", 30)
     while _AGENT_STATE["running"]:
         try:
             asset_id = _AGENT_STATE.get("asset_id")
@@ -523,7 +761,7 @@ def _heartbeat_loop():
                 # 尝试重新注册
                 asset_id = get_asset_id_from_server()
                 if not asset_id:
-                    time.sleep(interval)
+                    time.sleep(_current_interval("heartbeat", 30))
                     continue
 
             ip, mac = get_primary_network_info()
@@ -533,103 +771,111 @@ def _heartbeat_loop():
                 "hostname": _AGENT_STATE["hostname"],
                 "ip_address": ip,
                 "mac_address": mac,
-                "cpu_percent": status.get("cpu_percent", 0),
-                "memory_percent": status.get("memory_percent", 0),
-                "disk_percent": status.get("disk_percent", 0),
+                "cpu_usage": status.get("cpu_percent", 0),
+                "memory_usage": status.get("memory_percent", 0),
+                "disk_usage": status.get("disk_percent", 0),
+                "process_count": len(psutil.pids()),
+                "logged_users": os.getlogin() if hasattr(os, "getlogin") else "",
                 "status": "online",
-                "username": os.getlogin() if hasattr(os, "getlogin") else "",
+                "agent_version": AGENT_VERSION,
             }
 
             url = urljoin(CONFIG["server_url"], "/api/v1/agent/heartbeat")
             resp = requests.post(url, json=payload, headers=_agent_headers(), timeout=30)
             if resp.status_code in (200, 201):
+                applied = None
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = None
+                if isinstance(body, dict):
+                    applied = _apply_agent_policies(body.get("policies"))
+                    # 自动升级（R13）：平台在心跳响应中携带 upgrade 指令
+                    upgrade_info = body.get("upgrade")
+                    if isinstance(upgrade_info, dict) and upgrade_info.get("version") and upgrade_info.get("sha256"):
+                        if not _UPGRADE_STATE.get("in_progress"):
+                            _UPGRADE_STATE["in_progress"] = True
+                            try:
+                                threading.Thread(
+                                    target=perform_self_upgrade,
+                                    args=(upgrade_info["version"], upgrade_info["sha256"]),
+                                    daemon=True,
+                                    name="agent-self-upgrade",
+                                ).start()
+                            except Exception as exc:
+                                print(f"[Upgrade] trigger failed: {exc}")
+                                _UPGRADE_STATE["in_progress"] = False
                 print(f"[Heartbeat] OK (asset_id={asset_id})")
+                if applied:
+                    print(f"[Heartbeat] 平台策略已更新: {applied}")
             else:
                 print(f"[Heartbeat] HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as exc:
             print(f"[Heartbeat] 错误: {exc}")
 
-        time.sleep(interval)
+        time.sleep(_current_interval("heartbeat", 30))
 
 
 def _system_status_loop():
-    interval = CONFIG.get("intervals", {}).get("system_status", 30)
-    while _AGENT_STATE["running"]:
-        try:
-            asset_id = _AGENT_STATE.get("asset_id")
-            if not asset_id:
-                time.sleep(interval)
-                continue
-
-            status = collect_system_status()
-            payload = {
-                "asset_id": asset_id,
-                "cpu_percent": status.get("cpu_percent", 0),
-                "memory_percent": status.get("memory_percent", 0),
-                "memory_used_mb": status.get("memory_used_mb", 0),
-                "disk_percent": status.get("disk_percent", 0),
-            }
-
-            url = urljoin(CONFIG["server_url"], "/api/v1/assets/stats")
-            resp = requests.post(url, json=payload, headers=_agent_headers(), timeout=30)
-            if resp.status_code not in (200, 201):
-                print(f"[SystemStatus] HTTP {resp.status_code}")
-        except Exception as exc:
-            print(f"[SystemStatus] 错误: {exc}")
-
-        time.sleep(interval)
+    """Compatibility no-op: heartbeat already carries the live metrics."""
+    return
 
 
 def _hardware_report_loop():
-    interval = CONFIG.get("intervals", {}).get("hardware", 86400)
+    """终端接入后立即上报一次完整硬件信息，之后按平台策略周期上报。
+
+    复用 trigger_immediate_report 的心跳通道（服务端心跳接口会更新
+    os/cpu/memory 等静态字段）；上报成功才计入周期，失败时每 60 秒重试。
+    """
     last_run = 0.0
     while _AGENT_STATE["running"]:
         now = time.time()
-        if now - last_run < interval:
+        if now - last_run < _current_interval("hardware", 86400):
             time.sleep(60)
             continue
 
-        try:
-            asset_id = _AGENT_STATE.get("asset_id")
-            if not asset_id:
-                time.sleep(60)
-                continue
-
-            hardware = collect_hardware_info()
-            payload = {
-                "asset_id": asset_id,
-                **hardware,
-            }
-
-            url = urljoin(CONFIG["server_url"], "/api/v1/assets/detail")
-            resp = requests.put(url, json=payload, headers=_agent_headers(), timeout=60)
-            if resp.status_code in (200, 201):
-                print("[Hardware] 硬件信息上报成功")
-                last_run = now
-            else:
-                print(f"[Hardware] HTTP {resp.status_code}")
-        except Exception as exc:
-            print(f"[Hardware] 错误: {exc}")
+        result = trigger_immediate_report()
+        if result.get("success"):
+            print(f"[Hardware] 硬件信息上报成功 (asset_id={result.get('asset_id')})")
+            last_run = now
+        else:
+            print(f"[Hardware] 硬件信息上报失败: {result.get('error')}")
 
         time.sleep(60)
 
 
 def _software_report_loop():
-    interval = CONFIG.get("intervals", {}).get("software", 30)
     while _AGENT_STATE["running"]:
         try:
             asset_id = _AGENT_STATE.get("asset_id")
             if not asset_id:
-                time.sleep(interval)
+                time.sleep(_current_interval("software", 30))
                 continue
 
             software = collect_software_list()
+            ip, mac = get_primary_network_info()
             payload = {
                 "asset_id": asset_id,
-                "software": software,
+                "hostname": _AGENT_STATE["hostname"],
+                "ip_address": ip,
+                "mac_address": mac,
+                "status": "online",
+                "report_type": "software",
+                "agent_version": AGENT_VERSION,
+                "software_list": [
+                    {
+                        "name": item.get("name"),
+                        "version": item.get("version"),
+                        "vendor": item.get("publisher") or item.get("vendor"),
+                        "install_date": item.get("install_date"),
+                        "size": item.get("size_mb") or item.get("size"),
+                    }
+                    for item in software
+                    if item.get("name")
+                ],
             }
 
-            url = urljoin(CONFIG["server_url"], "/api/v1/assets/software")
+            url = urljoin(CONFIG["server_url"], "/api/v1/agent/heartbeat")
             resp = requests.post(url, json=payload, headers=_agent_headers(), timeout=60)
             if resp.status_code in (200, 201):
                 print(f"[Software] 上报 {len(software)} 个软件")
@@ -638,7 +884,7 @@ def _software_report_loop():
         except Exception as exc:
             print(f"[Software] 错误: {exc}")
 
-        time.sleep(interval)
+        time.sleep(_current_interval("software", 30))
 
 
 # =============================================================================
@@ -1052,6 +1298,7 @@ def trigger_immediate_report() -> dict:
         "mac_address": mac_address,
         "status": "online",
         "report_type": "triggered_report",
+        "agent_version": AGENT_VERSION,
         "os_type": hardware.get("os_info") or platform.platform(),
         "os_version": hardware.get("os_version") or platform.version(),
         "cpu_cores": psutil.cpu_count(logical=False) or psutil.cpu_count() or 0,
@@ -1145,6 +1392,17 @@ class AgentControlRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200 if result["success"] else 400, result)
             return
 
+        if self.path == "/api/v1/security-command":
+            try:
+                from security_manager import execute_security_command
+                command_type = payload.get("command_type") or ""
+                params = payload.get("params") or {}
+                result = execute_security_command(command_type, params)
+                self._send_json(200 if result.get("success") else 400, result)
+            except Exception as exc:
+                self._send_json(500, {"success": False, "error": str(exc)})
+            return
+
         if self.path == "/api/v1/trigger-report":
             result = trigger_immediate_report()
             self._send_json(200 if result["success"] else 502, result)
@@ -1154,7 +1412,8 @@ class AgentControlRequestHandler(BaseHTTPRequestHandler):
 
 
 class AgentControlServer:
-    def __init__(self, host: str = "0.0.0.0", port: int | None = None):
+    def __init__(self, host: str | None = None, port: int | None = None):
+        host = host or get_env("ZVIEW_BIND_HOST", "0.0.0.0") or "0.0.0.0"  # P0-2: 可配置监听地址
         self.host = host
         self.port = int(port or CONFIG.get("control_port") or 9001)
         self.server: ThreadingHTTPServer | None = None
@@ -1179,21 +1438,73 @@ class AgentControlServer:
             self.thread = None
 
 
+class StarletteWebSocketAdapter:
+    """Adapt the native websockets connection to the engine's Starlette API."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.remote_address = connection.remote_address
+
+    async def receive_text(self) -> str:
+        message = await self.connection.recv()
+        if isinstance(message, bytes):
+            return message.decode("utf-8")
+        return str(message)
+
+    async def send_json(self, payload: dict):
+        await self.connection.send(json.dumps(payload, ensure_ascii=False))
+
+    async def send_bytes(self, data: bytes):
+        await self.connection.send(data)
+
+    async def close(self, code: int = 1000, reason: str = ""):
+        await self.connection.close(code=code, reason=reason)
+
+
 class RemoteDesktopServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 9000):
+    def __init__(self, host: str | None = None, port: int = 9000):
+        host = host or get_env("ZVIEW_BIND_HOST", "0.0.0.0") or "0.0.0.0"  # P0-2: 可配置监听地址
         self.host = host
         self.port = port
         self.running = False
         self.server = None
         self.thread: threading.Thread | None = None
 
+    @staticmethod
+    def _log(message: str, exc: BaseException | None = None) -> None:
+        lines = [f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [RemoteDesktopServer] {message}"]
+        if exc is not None:
+            lines.append(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        try:
+            log_dir = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "remote-desktop-server.log", "a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
     def start(self):
         if self.running:
             return
         self.running = True
-        self.thread = threading.Thread(target=self._run_server, name="rdp-server", daemon=True)
+        self.thread = threading.Thread(target=self.serve_blocking, name="rdp-server", daemon=True)
         self.thread.start()
         print(f"[RemoteDesktop] 服务端启动: ws://{self.host}:{self.port}/remote-desktop")
+
+    def serve_blocking(self):
+        """Run the websocket server loop in the calling thread until stopped."""
+        if self.running:
+            return
+        self.running = True
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self._serve())
+        except Exception as exc:
+            self._log("服务线程异常退出", exc)
+            print(f"[RemoteDesktop] 服务端错误: {exc}")
+        finally:
+            self.running = False
 
     def stop(self):
         self.running = False
@@ -1204,40 +1515,51 @@ class RemoteDesktopServer:
                 pass
 
     def _run_server(self):
-        try:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._serve())
-        except Exception as exc:
-            print(f"[RemoteDesktop] 服务端错误: {exc}")
+        self.serve_blocking()
 
     async def _serve(self):
         try:
             import websockets
         except ImportError:
+            self._log("websockets 未安装，远程桌面不可用")
             print("[RemoteDesktop] websockets 未安装，远程桌面不可用")
             return
 
+        self._log(f"websockets {getattr(websockets, '__version__', 'unknown')} 导入成功，准备监听 ws://{self.host}:{self.port}")
+
+        try:
+            apply_agent_firewall_whitelist(
+                CONFIG.get("server_url", ""), logger=lambda m: self._log(m)
+            )
+        except Exception:
+            pass
+
         async def handler(websocket, path=None):
-            print(f"[RemoteDesktop] 客户端连接: {websocket.remote_address}")
+            self._log(f"客户端连接: {websocket.remote_address}")
             try:
-                session = self._create_session(websocket)
+                session = self._create_session(StarletteWebSocketAdapter(websocket))
                 await session.start()
             except Exception as exc:
-                print(f"[RemoteDesktop] 会话错误: {exc}")
+                import traceback
+                self._log(f"会话错误: {type(exc).__name__}: {exc}")
+                self._log("traceback: " + traceback.format_exc()[-800:])
             finally:
-                print(f"[RemoteDesktop] 客户端断开: {websocket.remote_address}")
+                self._log(f"客户端断开: {websocket.remote_address}")
 
         try:
             self.server = await websockets.serve(
                 handler, self.host, self.port,
                 ping_interval=20, ping_timeout=10,
             )
+            self._log(f"监听成功 ws://{self.host}:{self.port}，等待连接")
             await self.server.wait_closed()
+            self._log("server.wait_closed 返回，服务端正常关闭")
         except Exception as exc:
+            self._log("serve 失败", exc)
             print(f"[RemoteDesktop] serve 错误: {exc}")
 
     def _create_session(self, websocket):
+        _load_cached_agent_policies()
         session_id = f"session_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         try:
             # 优先使用 v2 引擎
@@ -1285,13 +1607,214 @@ def start_software_management(asset_id: int):
     _software_manager_instance.start()
 
 
-def start_remote_desktop_server():
-    """启动远程桌面 WebSocket 服务端。"""
+_security_policy_sync_instance: "SecurityPolicySync | None" = None
+
+
+class SecurityPolicySync:
+    """安全策略自动轮询同步：定时从平台拉取绑定的安全策略并应用，回传执行结果。"""
+
+    _LOG_PATH = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "logs" / "security-sync.log"
+
+    def __init__(self, asset_id: int):
+        self.asset_id = asset_id
+        self.running = False
+        self.thread: threading.Thread | None = None
+
+    def _log(self, msg: str):
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(f"[SecurityPolicySync] {msg}")
+        try:
+            self._LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, name="security-policy-sync", daemon=True)
+        self.thread.start()
+
+def apply_agent_firewall_whitelist(server_url: str, logger=None):
+    """R2 防火墙白名单（可选，ZVIEW_FIREWALL_WHITELIST=1 启用）：
+    仅允许平台主机与本机访问 Agent 9000/9001 端口。
+    幂等：规则名固定，先删后建。失败不影响服务启动。
+    """
+    import subprocess
+    import ipaddress
+    from urllib.parse import urlparse
+    try:
+        if get_env("ZVIEW_FIREWALL_WHITELIST", "").strip() not in ("1", "true", "True"):
+            return
+        parsed = urlparse(server_url)
+        platform_host = parsed.hostname or ""
+        try:
+            platform_ip = ipaddress.ip_address(platform_host).exploded
+        except ValueError:
+            import socket
+            platform_ip = socket.gethostbyname(platform_host)
+        RULE_ALLOW = "zv-agent-allow-platform"
+        RULE_BLOCK = "zv-agent-block-others"
+        for name in (RULE_ALLOW, RULE_BLOCK):
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+                capture_output=True, timeout=15, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name={RULE_ALLOW}",
+             "dir=in", "action=allow", "protocol=TCP",
+             f"localport=9000,9001", f"remoteip={platform_ip},127.0.0.1"],
+            capture_output=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name={RULE_BLOCK}",
+             "dir=in", "action=block", "protocol=TCP", "localport=9000,9001"],
+            capture_output=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if logger:
+            logger(f"agent firewall whitelist applied: allow={platform_ip},127.0.0.1 -> 9000,9001")
+    except Exception as exc:
+        if logger:
+            logger(f"agent firewall whitelist failed (ignored): {exc}")
+        self._log(f"启动 (asset_id={self.asset_id})")
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        interval = int(CONFIG.get("intervals", {}).get("security_policy_sync", 300) or 300)
+        interval = max(60, min(interval, 3600))
+        self._log(f"轮询间隔={interval}s")
+        while self.running:
+            try:
+                self._sync_and_apply()
+            except Exception as exc:
+                self._log(f"同步失败: {exc}")
+            time.sleep(interval)
+
+    def _sync_and_apply(self):
+        from security_manager import execute_security_command
+        token = CONFIG.get("token") or ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = urljoin(CONFIG["server_url"], f"/api/v1/agent/security-policies?asset_id={self.asset_id}")
+        self._log(f"拉取策略: {url}")
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            self._log(f"拉取策略 HTTP {resp.status_code}")
+            return
+        data = resp.json()
+        policies = data.get("policies") or []
+        self._log(f"拉取到 {len(policies)} 条安全策略")
+        if not policies:
+            return
+        for p in policies:
+            try:
+                self._apply_one(p, execute_security_command)
+            except Exception as exc:
+                self._log(f"应用策略 {p.get('id')} 失败: {exc}")
+
+    def _apply_one(self, policy: dict, executor):
+        ptype = policy.get("policy_type")
+        config = policy.get("config") or {}
+        policy_id = policy.get("id")
+        scope_type = policy.get("scope_type", "asset")
+        applied = 0
+        failed = 0
+        error_detail = None
+        try:
+            if ptype == "firewall":
+                rules = config.get("rules") or []
+                res = executor("firewall_apply", {"rules": rules})
+                applied = res.get("applied", 0)
+                failed = res.get("failed", 0)
+                if not res.get("success"):
+                    error_detail = res.get("error") or json.dumps(res.get("details", []))[:500]
+            elif ptype == "usb":
+                action = config.get("action", "block")
+                cmd = "usb_block" if action == "block" else "usb_allow"
+                res = executor(cmd, {})
+                if not res.get("success"):
+                    failed = 1
+                    error_detail = res.get("error", "usb apply failed")
+                else:
+                    applied = 1
+            elif ptype == "app_control":
+                blacklist = config.get("blacklist") or []
+                res = executor("process_scan_blacklist", {"blacklist": blacklist})
+                if not res.get("success"):
+                    failed = 1
+                    error_detail = res.get("error", "scan failed")
+                else:
+                    applied = 1
+            elif ptype == "file_protect":
+                dirs = config.get("protected_dirs") or []
+                for d in dirs:
+                    res = executor("file_baseline", {"dir_path": d})
+                    if res.get("success"):
+                        applied += 1
+                    else:
+                        failed += 1
+                        error_detail = (error_detail or "") + f"{d}: {res.get('error', 'fail')}; "
+            elif ptype == "behavior":
+                # 行为监控策略无即时执行动作，仅记录已应用
+                applied = 1
+            else:
+                error_detail = f"unknown policy_type: {ptype}"
+                failed = 1
+        except Exception as exc:
+            failed = 1
+            error_detail = str(exc)
+
+        self._report_result(policy_id, scope_type, applied, failed, error_detail)
+
+    def _report_result(self, policy_id, scope_type, applied, failed, error_detail):
+        token = CONFIG.get("token") or ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = urljoin(CONFIG["server_url"], "/api/v1/agent/security-policy-result")
+        status = "success" if failed == 0 and applied > 0 else ("partial" if applied > 0 else "failed")
+        payload = {
+            "policy_id": policy_id,
+            "asset_id": self.asset_id,
+            "scope_type": scope_type,
+            "status": status,
+            "applied_rules": applied,
+            "failed_rules": failed,
+            "error_detail": error_detail,
+        }
+        try:
+            requests.post(url, json=payload, headers=headers, timeout=15)
+        except Exception as exc:
+            print(f"[SecurityPolicySync] 回传结果失败: {exc}")
+
+
+def start_security_policy_sync(asset_id: int):
+    """启动安全策略自动轮询同步。"""
+    global _security_policy_sync_instance
+    if _security_policy_sync_instance is not None:
+        return
+    _security_policy_sync_instance = SecurityPolicySync(asset_id)
+    _security_policy_sync_instance.start()
+
+
+def start_remote_desktop_server(wait: bool = False):
+    """启动远程桌面 WebSocket 服务端。
+
+    wait=False 时在后台线程运行并立即返回；
+    wait=True 时在调用线程内阻塞运行，直到服务端关闭。
+    """
     global _server_instance
     if _server_instance is not None:
         return
-    _server_instance = RemoteDesktopServer(host="0.0.0.0", port=9000)
-    _server_instance.start()
+    _server_instance = RemoteDesktopServer(port=9000)  # host 经 ZVIEW_BIND_HOST 可配置
+    if wait:
+        _server_instance.serve_blocking()
+    else:
+        _server_instance.start()
 
 
 def start_agent_control_server():
@@ -1304,3 +1827,7 @@ def start_agent_control_server():
         port=int(CONFIG.get("control_port") or 9001),
     )
     _control_server_instance.start()
+
+
+# 模块加载时恢复最近一次平台下发的策略（重启后立即生效，无需等待下一轮心跳）
+_load_cached_agent_policies()

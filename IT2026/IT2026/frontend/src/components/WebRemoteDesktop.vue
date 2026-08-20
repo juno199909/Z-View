@@ -585,6 +585,7 @@ import {
   DocumentCopy, FolderOpened, UploadFilled, Download
 } from '@element-plus/icons-vue'
 import { getAuthToken } from '@/api/auth-session'
+import { createRemoteSession, deleteRemoteSession } from '@/api/remote'
 
 const props = defineProps({
   assetId: {
@@ -709,9 +710,9 @@ const latency = ref(0)
 const bandwidth = ref('0 KB/s')
 const sessionWarningText = ref('')
 const defaultSessionSettings = (overrides = {}) => ({
-  quality: 75,
-  fps: 18,
-  scalePercent: 90,
+  quality: 60,
+  fps: 60,
+  scalePercent: 60,
   adaptive: true,
   profile: 'interactive',
   wheelSpeed: 1,
@@ -838,6 +839,7 @@ const pointerState = {
 
 // WebSocket连接
 let ws = null
+let currentSessionId = null
 let ctx = null
 let heartbeatTimer = null
 let lastFrameTime = 0
@@ -954,6 +956,11 @@ onBeforeUnmount(() => {
   resetPointerState()
   disconnect({ suppressReconnect: true })
   cleanupRemoteDialogArtifacts()
+  // 释放后端远控会话，避免会话只能等超时回收
+  if (currentSessionId) {
+    deleteRemoteSession(currentSessionId).catch(() => {})
+    currentSessionId = null
+  }
 })
 
 watch(() => props.visible, (visible) => {
@@ -1148,7 +1155,7 @@ const initCanvas = () => {
   console.log('✅ Canvas初始化完成，初始尺寸:', canvas.width, 'x', canvas.height)
 }
 
-const connect = () => {
+const connect = async () => {
   clearReconnectTimer()
   reconnectSuppressed = false
   connectionStatus.value = 'connecting'
@@ -1214,14 +1221,14 @@ const connect = () => {
       throw new Error('缺少终端资产标识，无法建立远程桌面代理连接')
     }
 
+    // 新流程：先创建会话拿 session_token + ws_url
+    const sessionInfo = await createRemoteSession({ asset_id: props.assetId, fps_limit: sessionSettings.value.fps || 60 })
+    currentSessionId = sessionInfo.session_id
     const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const query = new URLSearchParams({
-      token
-    })
-    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/assets/${props.assetId}/remote-desktop/ws?${query.toString()}`
+    const wsUrl = `${wsProtocol}://${window.location.host}${sessionInfo.ws_url}`
 
-    console.log('连接到平台代理远程桌面:', `/api/v1/assets/${props.assetId}/remote-desktop/ws`)
     const socket = new WebSocket(wsUrl)
+    socket.binaryType = 'arraybuffer'
     ws = socket
     remoteSessionInitialized = false
     reconnectSuppressed = false
@@ -1239,7 +1246,12 @@ const connect = () => {
     socket.onmessage = (event) => {
       if (ws !== socket) return
 
-      handleMessage(event.data)
+      // 二进制帧协议：控制消息走 text(JSON)，屏幕帧走 binary(ArrayBuffer)
+      if (event.data instanceof ArrayBuffer) {
+        handleBinaryFrame(event.data)
+      } else {
+        handleMessage(event.data)
+      }
     }
 
     socket.onerror = (error) => {
@@ -1395,6 +1407,49 @@ const markSessionConnected = () => {
   }
   if (errorMessage.value) {
     errorMessage.value = ''
+  }
+}
+
+const handleBinaryFrame = async (arrayBuffer) => {
+  // 解析二进制帧头: [1B type][4B frameId][4B width][4B height][4B jpegLen][jpeg bytes]
+  try {
+    const view = new DataView(arrayBuffer)
+    if (arrayBuffer.byteLength < 17) return
+    const frameType = view.getUint8(0)
+    const frameId = view.getUint32(1)
+    const width = view.getUint32(5)
+    const height = view.getUint32(9)
+    const jpegLen = view.getUint32(13)
+    if (arrayBuffer.byteLength < 17 + jpegLen) return
+    const jpegBytes = new Uint8Array(arrayBuffer, 17, jpegLen)
+
+    markRemoteSessionInitialized()
+    markSessionConnected()
+    latestFrameId += 1
+
+    // 更新FPS
+    const now = Date.now()
+    if (lastFrameTime > 0) {
+      const delta = now - lastFrameTime
+      fps.value = Math.round(1000 / delta)
+    }
+    lastFrameTime = now
+    frameCounter++
+
+    // 更新推流分辨率
+    streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+    // 更新带宽
+    if (frameCounter % 10 === 0) {
+      const dataSize = jpegLen / 1024
+      bandwidth.value = `${Math.round(dataSize * fps.value)} KB/s`
+    }
+
+    // 用 createImageBitmap 解码（比 new Image + base64 快且无 base64 开销）
+    const blob = new Blob([jpegBytes], { type: 'image/jpeg' })
+    const bitmap = await createImageBitmap(blob)
+    drawBitmapFrame(bitmap, width, height, frameId)
+  } catch (e) {
+    console.warn('[remote-desktop] binary frame decode failed', e)
   }
 }
 
@@ -2612,6 +2667,17 @@ const flushPendingFrame = () => {
   drawFrame(nextFrame.message, nextFrame.frameId)
 }
 
+const drawBitmapFrame = (bitmap, width, height, frameId) => {
+  if (!ctx || !desktopCanvas.value) return
+  if (frameId < lastRenderedFrameId) return
+  const canvas = desktopCanvas.value
+  applyRemoteResolution(width, height)
+  ctx.clearRect(0, 0, width, height)
+  ctx.drawImage(bitmap, 0, 0, width, height)
+  lastRenderedFrameId = frameId
+  if (bitmap && bitmap.close) bitmap.close()
+}
+
 const drawFrame = (message, frameId) => {
   if (!ctx || !desktopCanvas.value) {
     console.error('❌ Canvas未初始化')
@@ -3139,8 +3205,10 @@ const resolveCanvasPosition = (event, options = {}) => {
   const rawCanvasY = (offsetY / usableHeight) * canvasHeight
   const canvasX = Math.max(0, Math.min(rawCanvasX, maxCanvasX))
   const canvasY = Math.max(0, Math.min(rawCanvasY, maxCanvasY))
-  const normalized_x = maxCanvasX > 0 ? Math.max(0, Math.min(canvasX / maxCanvasX, 1)) : 0
-  const normalized_y = maxCanvasY > 0 ? Math.max(0, Math.min(canvasY / maxCanvasY, 1)) : 0
+  // 归一化必须按位图全宽/全高换算：按 (size-1) 会放大约 size/(size-1)，
+  // 在被控端放大回屏幕尺寸时产生最高约 2px 的系统性右/下偏移。
+  const normalized_x = canvasWidth > 0 ? Math.max(0, Math.min(canvasX / canvasWidth, 1)) : 0
+  const normalized_y = canvasHeight > 0 ? Math.max(0, Math.min(canvasY / canvasHeight, 1)) : 0
 
   const position = {
     canvasX,
