@@ -157,7 +157,7 @@ CONFIG = _merge_config(_DEFAULT_CONFIG, _user_config)
 SOFTWARE_CONFIG = _merge_config(_DEFAULT_SOFTWARE_CONFIG, _user_config)
 
 # Agent 版本号（发布时由 build_agent.ps1 或手动 bump；升级机制以此判定新版本）
-AGENT_VERSION = "1.9.0"
+AGENT_VERSION = "1.9.1"
 
 # 一机一密（P0-01）：设备凭据缓存（agent_id + device_secret）
 _AGENT_CREDENTIALS_CACHE_PATH = (
