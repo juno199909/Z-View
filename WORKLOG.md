@@ -2207,3 +2207,26 @@
 - 发现：用户保存了 URL 但启用通知开关仍为关闭（enabled=0）——已提醒用户打开。
 - 通道行为确认：企业微信格式错误也返回 HTTP 200，必须校验 body errcode（已实现）。
 
+
+## [2026-09-10] 服务端升级熔断上线（V1.7.0 补充）+ 1.9.1 发布（本机）+ 2213 待手动迁移
+
+- Where things stand
+  1) 1.8.3 → 1.9.0 → 1.9.1 三连发完成：本机 asset 28 已在 1.9.1（COMMITTED，
+     versions 保留 1.9.0/1.9.1，updater 链路实战通过）；
+  2) 2213 发现新缺陷：迁移安装器（1.8.2 常量时代构建）写的 config.local.json
+     为 server_url-only → 运行中 Agent 内存 CONFIG 无 token → updater 任务 401 →
+     10s 一次 ROLLBACK 循环刷屏 agent_upgrade_history；
+  3) 服务端熔断上线（V1.7.0 方案第八条的制度化）：同一资产对同一目标版本
+     连续 3 次 ROLLBACK/FAILED → 熔断 30min 不下发指令；COMMITTED 或目标版本
+     变化或冷却结束自动解除。内存态，重启清零；
+  4) 熔断首版实现有 bug（指令块 POP 掉计数累积中的 breaker，永远到不了阈值）
+     ——单测思路捕获后修复（分三种情况：目标变化/熔断中/冷却结束）；
+  5) 验证：重启后 100s 零新增 ROLLBACK 行（修复前 6 行/分钟），2213 心跳稳定 1.9.0。
+  待办：
+  2213 手动迁移到 1.9.1（其 updater 为旧版，无法走自动通道）——管理员运行：
+    浏览器下载 http://172.16.250.120:8080/api/v1/agent/upgrade/download?version=1.9.1&agent_token=<token>
+    → 解包 → Z-View.exe --install --quiet --server-url http://172.16.250.120:8080
+       --migrate-from 1.9.0 --migrate-to 1.9.1
+    （1.9.1 安装器含 config 合并修复，token 自动补齐）；
+  观察期跳过（用户确认）；V1.8.0 Agent Core 重构为下一个大项。
+

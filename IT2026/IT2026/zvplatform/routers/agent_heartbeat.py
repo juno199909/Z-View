@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import os
+import time
 import traceback
 
 from fastapi import APIRouter, HTTPException, Request
@@ -28,6 +29,11 @@ from zvplatform.services.agent_policy_service import load_agent_policies
 
 
 router = APIRouter(tags=["agent-heartbeat"])
+
+# V1.7.0 服务端升级熔断（内存态）：asset_id -> {to_version, count, last_at, until}
+_UPGRADE_FAILURE_BREAKER = {}
+_UPGRADE_BREAKER_THRESHOLD = 3
+_UPGRADE_BREAKER_COOLDOWN_SECONDS = 1800
 
 
 @router.post("/api/v1/agent/heartbeat")
@@ -636,6 +642,26 @@ def agent_heartbeat(data: dict, request: Request):
         upgrade_state = data.get("agent_upgrade_state")
         if isinstance(upgrade_state, dict) and upgrade_state.get("stage"):
             stage = str(upgrade_state.get("stage"))
+            # V1.7.0 服务端熔断：同一资产对同一目标版本连续失败达阈值后暂停下发，
+            # 防止旧版 Agent 在无法完成迁移时陷入"下载→回滚"死循环
+            # （2026-09-10 2213 事件：旧 updater 401 → 10s 一次 ROLLBACK 刷屏）。
+            # 内存态，后端重启即清零；COMMITTED 或目标版本变化自动解除。
+            if stage in ("ROLLBACK", "FAILED"):
+                to_version = str(upgrade_state.get("to_version") or "")
+                breaker = _UPGRADE_FAILURE_BREAKER.setdefault(asset_id, {"to_version": to_version, "count": 0})
+                if breaker.get("to_version") == to_version:
+                    breaker["count"] = int(breaker.get("count") or 0) + 1
+                    breaker["last_at"] = time.time()
+                    if int(breaker["count"]) >= _UPGRADE_BREAKER_THRESHOLD:
+                        breaker["until"] = time.time() + _UPGRADE_BREAKER_COOLDOWN_SECONDS
+                        safe_console_print(
+                            f"[Heartbeat] upgrade breaker OPEN for asset {asset_id} "
+                            f"(target {to_version}, {breaker['count']} failures, "
+                            f"cooldown {_UPGRADE_BREAKER_COOLDOWN_SECONDS}s)")
+                else:
+                    _UPGRADE_FAILURE_BREAKER[asset_id] = {"to_version": to_version, "count": 1, "last_at": time.time()}
+            elif stage == "COMMIT":
+                _UPGRADE_FAILURE_BREAKER.pop(asset_id, None)
             try:
                 from agent_upgrade_api import record_agent_upgrade_state
                 normalized = {"COMMIT": "COMMITTED", "ROLLBACK": "ROLLBACK",
@@ -705,8 +731,18 @@ def agent_heartbeat(data: dict, request: Request):
                 except Exception:
                     should_upgrade = reported_version != latest_upgrade["version"]
             # V1.7.0：desired/reported/upgrade_state 协议 —— desired_version 显式下发，
-            # 升级指令带事务 ID（按目标版本确定性生成，重发幂等）
+            # 升级指令带事务 ID（按目标版本确定性生成，重发幂等）；
+            # 服务端熔断开启期间不下发指令（防止旧版 Agent 迁移死循环刷屏）
             heartbeat_response["desired_version"] = latest_upgrade["version"]
+            breaker = _UPGRADE_FAILURE_BREAKER.get(asset_id)
+            if breaker:
+                until = float(breaker.get("until") or 0)
+                if breaker.get("to_version") != latest_upgrade["version"]:
+                    _UPGRADE_FAILURE_BREAKER.pop(asset_id, None)  # 目标版本已变化，重新计数
+                elif until and time.time() < until:
+                    return heartbeat_response  # 熔断中：不下发指令
+                elif until:
+                    _UPGRADE_FAILURE_BREAKER.pop(asset_id, None)  # 冷却结束，恢复下发
             if should_upgrade:
                 dispatch_upgrade_id = f"UPG-{latest_upgrade['version']}"
                 heartbeat_response["upgrade"] = {
