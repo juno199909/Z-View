@@ -2230,3 +2230,47 @@
     （1.9.1 安装器含 config 合并修复，token 自动补齐）；
   观察期跳过（用户确认）；V1.8.0 Agent Core 重构为下一个大项。
 
+
+## [2026-09-10] V1.8.0 Phase 1 完成：zvagent 包化 + git 仓库治理
+
+- Where things stand
+  1) git 治理：本周全部工作已入库（用户 amend 进 first commit d5dcc99 + 治理提交链
+     3bb496d/5ffd4ae/91e010d/f22e072/7e6be35）；3548 个构建产物二进制解除跟踪；
+     kilo_tmp（含 token 脚本）解除跟踪并 gitignore 覆盖；仓库 status 清零；
+  2) zvagent 包骨架上线（V1.8.0 Phase 1）：__init__/layout（迁入，
+     cmdb_agent_layout.py 转兼容 shim）/hygiene（MEI 清理迁入，logger 注入式解耦）；
+     updater 与 unified_v2 委托链路切换验证；
+  3) E2E 沙箱 4 场景回归全过（patch 目标已改 zvagent.layout——shim 重导出绑定
+     patch 无效的坑已写进 shim docstring 与设计文档）；
+  4) 设计文档 docs/V1.8.0-agent-core-design.md：目标结构/迁移规则/里程碑
+     （V1.8.1 config/auth/upgrade → V1.8.2 heartbeat/collectors → V1.8.3 policy/jobs
+     → V1.9.x security boundary）。
+  当前版本态：28=1.9.1 ✅ / 2213=1.9.0（等用户跑手动迁移命令，熔断已止住其循环）。
+
+- Next step
+  2213 手动迁移收尾确认；V1.8.1（config/auth/upgrade 迁入 zvagent）。
+
+
+## [2026-09-10] V1.8.1 完成：config/auth/upgrade 迁入 zvagent（core 减重 28%）
+
+- Where things stand
+  1) zvagent/config.py：默认配置、多候选解析（ProgramData 优先）、env 覆盖、
+     load_configs() 整合原分散的 server_url 派生逻辑（行为等价验证通过）；
+  2) zvagent/auth.py：设备凭据（缓存/持久化/清除）、zv1 请求头、ca-bundle 解析、
+     TLS 自动协商（8443 探测 + 24h 缓存）；
+  3) zvagent/upgrade.py：升级状态机/失败台账/跨重启锁/Authenticode 校验/
+     perform_self_upgrade/onedir 迁移编排/终态消费（491 行，含全部事故修复）；
+  4) cmdb_agent_core.py：2688 → 1942 行，保留薄委托 re-export（存量引用零改动）；
+  5) zvagent/__init__.py 增加 __version__（与 core.AGENT_VERSION 同源）。
+  验证证据：
+  py_compile（SyntaxWarning 即错）+ pyflakes 0 undefined（抽取过程曾丢
+  network/collectors 段 ~520 行——装配脚本漏段，备份恢复 + 修脚本重跑解决）；
+  集成测试：模块导入/对象同一性（core.CONFIG IS zvagent.config.CONFIG、
+  _UPGRADE_STATE 共享）/全部关键符号/真实运行态 active_version=1.9.1；
+  沙箱 E2E 4 场景 + 升级护栏单测回归全过（patch 目标已切 zvagent.*）；
+  onedir 构建 xref 验证 zvagent 正确入包（83 处引用、0 警告）。
+
+- Next step
+  V1.8.2（heartbeat/collectors 迁入）；下次发版（1.9.2）携带重构代码 +
+  V1.7.0 Agent 侧全阶段上报；V1.8.3 policy/jobs。
+
