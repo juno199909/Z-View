@@ -2274,3 +2274,29 @@
   V1.8.2（heartbeat/collectors 迁入）；下次发版（1.9.2）携带重构代码 +
   V1.7.0 Agent 侧全阶段上报；V1.8.3 policy/jobs。
 
+
+## [2026-09-10] V1.8.2 完成：state/collectors/policy/heartbeat 迁入 zvagent（core 减至 1457 行）
+
+- Where things stand
+  1) zvagent/state.py：_AGENT_STATE + _LOCK（心跳/注册/远控共享运行时状态）；
+  2) zvagent/collectors/：system.py（网络工具智能网卡选择/WMI/硬件/系统状态，215 行）、
+     software.py（注册表软件清单 + 顺序无关变更哈希，82 行）；
+  3) zvagent/policy.py：策略应用（间隔调整/UAC SecureDesktop/缓存加载）、
+     _current_interval（159 行，CONFIG 共享 dict 引用，间隔变更互通）；
+  4) zvagent/heartbeat.py：资产注册（zv1 401 回退全局 token 重试 + 凭据重签）、
+     心跳主循环（策略应用/凭据签发/ca-bundle 原子写/升级指令触发/自愈退出）、
+     四个上报线程、trigger_immediate_report（432 行）；
+  5) cmdb_agent_core.py：1942 → 1457 行，剩余 SoftwareManager/控制命令/远控服务端/
+     start_* 入口（V1.8.3 jobs 正式化对象）。
+  验证证据：
+  py_compile + pyflakes 0 undefined（修 heartbeat 缺 json 导入）；
+  集成测试：状态/配置对象同一性、全部关键符号、真机采集实测
+  （硬件 Windows 11、软件 125 项、系统状态）、布局 1.9.1；
+  E2E 沙箱 4 场景回归全过；onedir 构建 xref 168 处 zvagent 引用 0 警告。
+  累计抽取：core 2688 → 1457 行（-46%），zvagent 包 8 个模块。
+
+- Next step
+  V1.8.3：policy/jobs 正式化（策略 handlers 结构化 + 通用任务通道）；
+  下次发版（1.9.2）携带全部重构 + V1.7.0 Agent 侧全阶段上报；
+  V1.8.0 收官后转 V1.9.x security boundary。
+
