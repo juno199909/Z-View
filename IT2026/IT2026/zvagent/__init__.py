@@ -9,3 +9,6 @@
 policy（策略执行）、jobs（任务执行端）。单体文件保留为薄委托层以兼容
 存量导入与 frozen 打包入口。
 """
+
+# Agent 版本号（与 cmdb_agent_core.AGENT_VERSION 同源，发布时 bump）
+__version__ = "1.9.1"
