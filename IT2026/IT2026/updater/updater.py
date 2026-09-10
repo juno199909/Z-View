@@ -41,7 +41,7 @@ LOCK_PATH = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "runtime" 
 HEALTH_PATH = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "runtime" / "upgrade-health.json"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import cmdb_agent_layout as layout  # noqa: E402
+import zvagent.layout as layout  # noqa: E402
 
 
 def state_write(stage: str, **extra) -> None:
