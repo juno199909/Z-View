@@ -66,3 +66,10 @@ IT2026/agent_upgrade/
 # 本地临时测试/运维脚本（含敏感 token，不入库）
 IT2026/kilo_tmp/
 kilo_tmp/
+dist_agent/
+dist_agent_onefile/
+dist_updater/
+build_agent_work/
+build_updater_work/
+releases/
+agent_upgrade/
