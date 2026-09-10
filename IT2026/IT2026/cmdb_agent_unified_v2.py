@@ -2147,14 +2147,18 @@ def ensure_windows_dpi_awareness() -> bool:
 
 
 def cleanup_stale_mei_dirs(max_age_minutes: int = 30) -> int:
-    """自清前代已死进程遗留的 _MEI* 临时解压目录（2026-09-09 事故修复）。
+    """自清前代已死进程遗留的 _MEI* 临时解压目录（V1.8.0 起委托 zvagent.hygiene）。"""
+    try:
+        from zvagent.hygiene import cleanup_stale_mei_dirs as _cleanup
 
-    onefile 进程每次启动解压 ~140MB 到 %TEMP%\\_MEI<rand>，正常退出时
-    bootloader 自删；被杀/崩溃/子进程仍存活时泄漏。升级风暴曾在 1.5h 内
-    泄漏 320 个目录（44GB）撑满 C 盘。每个进程启动时清理前代残留，
-    使堆积始终被钳制在"最近一轮"量级；存活进程的在用目录受文件锁
-    保护，删除失败静默跳过。
-    """
+        return _cleanup(
+            max_age_minutes=max_age_minutes,
+            own_meipass=str(getattr(sys, "_MEIPASS", "") or ""),
+            log=log_runtime_event,
+        )
+    except ImportError:
+        # 兼容兜底：zvagent 包缺失时使用内联实现
+        pass
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return 0
     import tempfile
