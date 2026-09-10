@@ -2327,3 +2327,24 @@
   1.9.2 发布（携带 V1.7.0 Agent 侧 + V1.8.x 全部重构，经 updater 通道灰度）；
   V1.8.0 收官；V1.9.x security boundary（job 通道鉴权强化已在设计内）。
 
+
+## [2026-09-10] 1.9.2 发布完成：两台终端统一进入新架构（V1.5.x~V1.8.x 全量落地）
+
+- Where things stand
+  两台终端统一 1.9.2 onedir 新布局，心跳正常：
+  - 28 (XXH-XXX)：1.9.1 → 1.9.2 经 updater 自动迁移 ✅（V1.7.0 协议首次完整实战：
+    UPG-1.9.2 事务 DISPATCHED 记录 + 全阶段上报）
+  - 2213 (DESKTOP-JEGI046)：1.9.0 → 1.9.2 手动安装器迁移 ✅（其 updater 旧版
+    + 内存 config 缺 token 的组合无法自动通道，401 熔断止住循环后手动收尾；
+    config 缺 token 根因由 pre-check 证实）
+  本机最终布局：versions\{1.9.1,1.9.2}（keep=2，1.9.0 已 prune）、
+  current junction → versions\1.9.2、服务 binPath 固定 current\Z-View.exe。
+  升级通道静默（manifest 1.9.2 与上报一致）。
+  遗留协议瑕疵（下版修复）：updater 状态写未携带 server_upgrade_id
+  （ROLLBACK 记录回退到内部 id，历史表按 attempt 记行而非按事务合并）；
+  webhook payload first_triggered_at 空串。
+
+- Next step
+  观察期（远控回归/心跳/升级通道）；updater server_upgrade_id 贯穿修复随下版；
+  V1.8.0 架构收官，后续转 V1.9.x security boundary 与平台 P1/P2 大盘。
+
