@@ -157,6 +157,7 @@ from zvplatform.obs import format_log_line, get_request_id, new_request_id, requ
 from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus, set_gauge  # noqa: E402
 from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
+from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.groups import router as groups_platform_router
 from zvplatform.routers.agent_policy import router as agent_policy_router
 from zvplatform.routers.logs import (  # noqa: E402
@@ -3839,6 +3840,7 @@ app.include_router(discovery_platform_router)  # P1-01：终端发现路由
 app.include_router(groups_platform_router)  # P1-01：终端分组路由
 app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
+app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 
 # 网络监控路由（第一阶段：实时状态 + 历史趋势）
 from zvplatform.routers.network import router as network_router

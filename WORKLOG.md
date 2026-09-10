@@ -2300,3 +2300,30 @@
   下次发版（1.9.2）携带全部重构 + V1.7.0 Agent 侧全阶段上报；
   V1.8.0 收官后转 V1.9.x security boundary。
 
+
+## [2026-09-10] V1.8.3 完成：policy/jobs 正式化 + 通用任务通道（服务端+Agent 端到端）
+
+- Where things stand
+  1) zvagent/policy.py 正式化：handler 注册表模式（policy_handler 装饰器，
+     intervals/remote_desktop 两个 handler），分发循环与业务逻辑解耦，
+     新策略类型只需注册 handler；_apply_agent_policies 保留兼容别名；
+  2) zvagent/jobs.py：通用任务执行框架（注册表 + execute_pending_jobs，
+     单任务失败隔离、未知类型显式 failed、缺 job_id 防御）；
+  3) 服务端 zvplatform/routers/agent_jobs.py：agent_jobs 表（job_id UNIQUE、
+     asset_state 索引）、console API GET/POST /api/v1/console/agent-jobs（admin）、
+     fetch_pending_jobs（下发即标记 dispatched）、record_job_state（终态不可回退）；
+  4) Agent 接线：心跳响应 jobs → 执行 → 结果暂存 → 随下次心跳上报 job_results
+     （payload 重建时序缺陷已修：移交所有权+清空暂存）；handler 注册：
+     command（core，复用控制通道安全模型/raw 门控）+ report（heartbeat）；
+  5) assets_api 挂载 agent_jobs_router（pid 19992 验证 endpoints 已注册）。
+  验证证据：
+  沙箱测试全过（jobs 框架 4 场景/policy 注册表+CONFIG 变更互通/服务端任务表
+  dispatch 标记+终态+终态不可回退）；
+  后端 health ok + agent-jobs endpoints 注册确认。
+  已知缺陷（记录）：webhook payload first_triggered_at 为空串（build_current_alerts
+  未带该字段，SQL NOW() 填充）——小瑕疵待修。
+
+- Next step
+  1.9.2 发布（携带 V1.7.0 Agent 侧 + V1.8.x 全部重构，经 updater 通道灰度）；
+  V1.8.0 收官；V1.9.x security boundary（job 通道鉴权强化已在设计内）。
+

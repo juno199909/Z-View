@@ -964,6 +964,21 @@ def execute_control_command(command: str, timeout_seconds: int = 60) -> dict:
         }
 
 
+# V1.8.3 通用任务通道：注册 command handler（与控制通道同一安全模型——
+# raw 命令受 ZVIEW_AGENT_ALLOW_RAW_COMMAND 门控，zv 结构化命令白名单分发）
+from zvagent import jobs as _agent_jobs  # noqa: E402
+
+
+def _job_command_handler(payload: dict) -> dict:
+    return execute_control_command(
+        str(payload.get("command") or ""),
+        _clamp_timeout(payload.get("timeout_seconds"), 60),
+    )
+
+
+_agent_jobs.register_job_handler("command", _job_command_handler)
+
+
 class AgentControlRequestHandler(BaseHTTPRequestHandler):
     server_version = "ZViewAgentControl/1.0"
     max_request_body_bytes = 1024 * 1024

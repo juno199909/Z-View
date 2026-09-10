@@ -20,6 +20,7 @@ import requests
 
 from console_utils import safe_console_print
 from zvagent import __version__ as AGENT_VERSION
+from zvagent import jobs as _jobs
 from zvagent.auth import (
     _AGENT_TLS_CACHE_PATH,
     _agent_headers,
@@ -134,6 +135,7 @@ def _check_heartbeat_self_heal(consecutive_failures: int) -> None:
 
 def _heartbeat_loop():
     consecutive_failures = 0  # P0-06：连续失败自愈计数
+    pending_job_results: list[dict] = []  # V1.8.3：任务结果暂存，随下次心跳上报
     while _AGENT_STATE["running"]:
         try:
             asset_id = _AGENT_STATE.get("asset_id")
@@ -174,6 +176,10 @@ def _heartbeat_loop():
                 last_upgrade_state = _get_last_upgrade_state()
                 if last_upgrade_state:
                     payload["agent_upgrade_state"] = last_upgrade_state
+            # V1.8.3：上轮执行的任务结果随本次心跳上报
+            if pending_job_results:
+                payload["job_results"] = pending_job_results
+                pending_job_results = []  # 移交 payload，清空暂存避免重复
 
             url = urljoin(_platform_base(), "/api/v1/agent/heartbeat")
             resp = requests.post(url, json=payload, headers=_agent_headers(), timeout=30, verify=_agent_requests_verify())
@@ -185,6 +191,15 @@ def _heartbeat_loop():
                     body = None
                 if isinstance(body, dict):
                     applied = _apply_agent_policies(body.get("policies"))
+                    # V1.8.3 通用任务通道：执行心跳下发的任务，结果随下次心跳上报
+                    try:
+                        pending_jobs = body.get("jobs")
+                        if isinstance(pending_jobs, list) and pending_jobs:
+                            job_results = _jobs.execute_pending_jobs(pending_jobs)
+                            if job_results:
+                                pending_job_results.extend(job_results)
+                    except Exception as exc:
+                        print(f"[Jobs] dispatch failed: {exc}")
                     # 一机一密（P0-01）：保存平台签发的设备凭据，后续请求改用 zv1 token
                     credential_info = body.get("agent_credential")
                     if isinstance(credential_info, dict) and credential_info.get("agent_id") and credential_info.get("device_secret"):
@@ -476,5 +491,9 @@ def trigger_immediate_report() -> dict:
         "message": "Immediate report completed",
         "result": response_body,
     }
+
+
+# V1.8.3 通用任务通道：注册 report handler（定义于本模块，注册须在其定义之后）
+_jobs.register_job_handler("report", trigger_immediate_report)
 
 
