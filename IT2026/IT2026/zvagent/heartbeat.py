@@ -135,6 +135,7 @@ def _check_heartbeat_self_heal(consecutive_failures: int) -> None:
 
 def _heartbeat_loop():
     consecutive_failures = 0  # P0-06：连续失败自愈计数
+    print("[V199MARKER] heartbeat loop marker active")
     pending_job_results: list[dict] = []  # V1.8.3：任务结果暂存，随下次心跳上报
     while _AGENT_STATE["running"]:
         try:
@@ -196,6 +197,7 @@ def _heartbeat_loop():
                     # V1.8.3 通用任务通道：执行心跳下发的任务，结果随下次心跳上报
                     try:
                         pending_jobs = body.get("jobs")
+                        safe_console_print(f"[Jobs][DBG] heartbeat response jobs: {len(pending_jobs or [])}")
                         if isinstance(pending_jobs, list) and pending_jobs:
                             job_results = _jobs.execute_pending_jobs(pending_jobs)
                             if job_results:

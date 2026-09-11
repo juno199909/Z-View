@@ -2482,3 +2482,42 @@
   下次构建（1.9.6，携带 jobs 下发 gating + wu_diag/wu_install + deferred 框架）后
   重测 wu_diag 端到端；Incident 恢复通知已上线（本次已验证分发函数工作正常）。
 
+
+## [2026-09-11] 1.9.6 发布 + wu_diag 端到端仍未通（需 Agent 进程级调试）
+
+- Where things stand
+  1.9.6 发布完成：两台终端迁移至 1.9.6（携带 jobs 下发 gating 修复 +
+     wu_diag/wu_install handlers + deferred 框架 + 全部协议修复）。
+  构建产物验证：PYZ 解包确认 zvagent.collectors.patches 含
+     wu_diag/wu_install/_register_patch_job_handlers 常量 ✓（模块正确入包）。
+  wu_diag 任务重新下发：服务端 dispatch ✅（DBG 确认，状态 dispatched）→
+     Agent 侧仍不执行/不回传（worker 日志无 [Jobs] 痕迹、审计无记录、
+     任务停留 dispatched）✗。
+  服务端链路已完整验证（合成测试：下发/执行/结果落库/状态流转/收敛全过）；
+  handler 本地进程内实测通过（wu_diag 诊断返回完整数据）。
+  唯一未验证环节：frozen Agent 进程内的 jobs 执行路径——需要带详细日志的
+  诊断构建（1.9.7：jobs 执行块每步 print）做终端侧定位。
+
+- Next step
+  1.9.7 诊断构建（jobs 执行路径每步日志）→ 终端侧定位 → 修复 → wu_diag 闭环。
+
+
+## [2026-09-11] 通用任务通道：Agent 端执行问题定位（远程分析极限，待现场调试）
+
+- Where things stand
+  1) 服务端任务通道完整验证 ✅（合成心跳测试：下发 → 响应携带 jobs → job_results
+     上报 → 状态流转 → 结果落库，全链路 OK）；
+  2) Agent 端 handlers 进程内实测 ✅（wu_diag 诊断返回完整数据）；
+  3) 1.9.6/1.9.9 构建产物验证 ✅（PYZ 解包：zvagent.heartbeat 含 jobs 执行块
+     （递归检查）、collectors.patches 含 wu_diag/wu_install 注册、V199MARKER 在
+     _heartbeat_loop 内）；
+  4) 两台终端 1.9.9 心跳正常 ✅；
+  5) ✗ 但终端上的 wu_diag 任务执行/结果回传不发生（3 个任务停留 dispatched，
+     worker 日志零 [Jobs][DBG]/[V199MARKER] 痕迹，审计无记录）。
+  已修复的缺陷（本轮）：任务下发 gating（network 循环不读响应体会丢任务）、
+  重试回收（dispatched 30min → pending）、服务端 job_results 处理、
+  close_reached_upgrade 收敛、updater server_upgrade_id 贯穿。
+  定位手段已用尽（远程）：服务端日志/DB/合成请求/PYZ 解包/xref/进程内直调。
+  下一步必须现场调试：1.9.9 Agent 的 worker 日志（DESKTOP-JEGI046 本地）+
+  若无痕迹则在 zvagent/heartbeat.py 的 jobs 执行块加逐步 print 出 1.9.10 诊断版。
+

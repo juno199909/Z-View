@@ -74,18 +74,24 @@ def execute_pending_jobs(jobs: Any) -> list[dict]:
             continue
         handler = _JOB_HANDLERS.get(job_type)
         if handler is None:
+            safe_console_print(f"[Jobs][DBG] job {job_id} type {job_type}: handler NOT registered "
+                               f"(registered: {sorted(_JOB_HANDLERS)})")
             results.append({"job_id": job_id, "state": "failed",
                             "error": f"unknown job_type: {job_type}"})
             continue
+        safe_console_print(f"[Jobs][DBG] job {job_id} type {job_type}: executing")
         try:
             # V1.9.x：handler 可返回 {"_async": True} 表示已自行启动异步执行，
             # 完成后通过 push_deferred_result 上报结果（长任务如补丁安装）
             exec_payload = {**(payload if isinstance(payload, dict) else {}), "job_id": job_id}
             result = handler(exec_payload)
             if isinstance(result, dict) and result.get("_async"):
+                safe_console_print(f"[Jobs][DBG] job {job_id}: async started")
                 results.append({"job_id": job_id, "state": "running"})
             else:
+                safe_console_print(f"[Jobs][DBG] job {job_id}: succeeded")
                 results.append({"job_id": job_id, "state": "succeeded", "result": result})
         except Exception as exc:
+            safe_console_print(f"[Jobs][DBG] job {job_id}: failed {type(exc).__name__}: {exc}")
             results.append({"job_id": job_id, "state": "failed", "error": f"{type(exc).__name__}: {exc}"})
     return results
