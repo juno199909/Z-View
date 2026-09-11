@@ -90,12 +90,13 @@ def sync_incidents(conn) -> dict:
         for row in active_rows:
             active_by_asset.setdefault(int(row["asset_id"]), []).append(row)
 
-        # 2. 现有开放事件
+        # 2. 现有开放事件（含 hostname/title 供恢复通知使用）
         cursor.execute(
-            f"SELECT id, incident_id, asset_id, alert_count FROM {_INCIDENTS_TABLE} "
-            f"WHERE status IN ('open', 'acknowledged')"
+            f"SELECT id, incident_id, asset_id, hostname, title, severity, alert_count "
+            f"FROM {_INCIDENTS_TABLE} WHERE status IN ('open', 'acknowledged')"
         )
         open_by_asset = {int(r["asset_id"]): r for r in (cursor.fetchall() or [])}
+        resolved_incidents: list[dict] = []
 
         # 3. 主机名补全
         hostnames = {}
@@ -140,7 +141,7 @@ def sync_incidents(conn) -> dict:
                 )
                 result["opened"] += 1
 
-        # 5. 开放事件但其资产已无活跃告警 → 自动恢复
+        # 5. 开放事件但其资产已无活跃告警 → 自动恢复（收集详情供恢复通知）
         for asset_id, existing in open_by_asset.items():
             if asset_id in active_by_asset:
                 continue
@@ -150,6 +151,15 @@ def sync_incidents(conn) -> dict:
                 (now, existing["id"]),
             )
             result["resolved"] += 1
+            resolved_incidents.append({
+                "incident_id": existing.get("incident_id"),
+                "asset_id": asset_id,
+                "hostname": existing.get("hostname"),
+                "title": existing.get("title"),
+                "alert_count": existing.get("alert_count"),
+                "resolved_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        result["resolved_incidents"] = resolved_incidents
 
         # 6. 活跃告警挂靠 incident_id
         cursor.execute(

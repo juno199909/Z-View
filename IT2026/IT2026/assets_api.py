@@ -1023,7 +1023,16 @@ def alert_sync_loop():
                         from zvplatform.services.incident_service import sync_incidents
                         incident_result = sync_incidents(conn)
                         if incident_result.get("opened") or incident_result.get("resolved"):
-                            safe_console_print(f"[AlertSync] incidents: {incident_result}")
+                            safe_console_print(f"[AlertSync] incidents: "
+                                               f"{ {k: v for k, v in incident_result.items() if k != 'resolved_incidents'} }")
+                        # V1.9.0 恢复通知：事件自动恢复后推送到已配置通道
+                        resolved_incidents = incident_result.get("resolved_incidents") or []
+                        if resolved_incidents:
+                            from zvplatform.services.alert_notify import dispatch_recovery_notifications
+                            recovery_result = dispatch_recovery_notifications(conn, resolved_incidents)
+                            if recovery_result.get("sent"):
+                                safe_console_print(f"[AlertSync] recovery notification sent: "
+                                                   f"{recovery_result.get('channel')} x{len(resolved_incidents)}")
                     except Exception as inc_exc:
                         safe_console_print(f"[AlertSync] incident sync failed: {inc_exc}")
                     # V1.7.1 通知层：新触发告警分发（webhook/邮件，配置见 alert_notify_config）

@@ -2402,3 +2402,26 @@
   2213 上 fix_2213.ps1 删除（token 卫生）；
   后续路线：Incident 聚合、Agent Fleet、Patch Management（P1/P2）。
 
+
+## [2026-09-11] V1.9.0 完成：Incident 事件聚合（告警中心最后功能缺口关闭）
+
+- Where things stand
+  1) zvplatform/services/incident_service.py：事件聚合模型
+     （一终端一开放事件、新告警挂靠 alert_count++/severity 取最高、
+     全部恢复自动关单 resolved_by=system、incident_id 随机后缀防同秒碰撞、
+     alerts.incident_id 挂靠列增量迁移）；
+  2) 控制台 API：GET /console/incidents（列表+状态过滤）、GET /stats、
+     POST /{incident_id}/acknowledge、POST /{incident_id}/close（admin，审计走
+     system_activity_logs 由调用方另行记录）；
+  3) 前端 /incidents 事件列表页（统计卡：开放/已确认/含严重/已恢复，
+     状态过滤、确认/关闭操作、自动刷新）+ 路由 + 监控中心菜单"事件列表"；
+  4) 告警同步线程（60s）接入 sync_incidents（sync_alerts 后执行）。
+  验证证据：
+  沙箱 4 场景全过（开新+合并/挂靠幂等/ack+close 流转/告警清空自动恢复
+  +同秒重开防碰撞）；后端 health ok；4 个 incident 端点注册确认；
+  两台终端 1.9.3 心跳正常；git 全部入库（e34f5f7）。
+
+- Next step
+  事件通知联动（事件开启/升级时复用通知层，可选增强）；
+  平台 P1/P2 大盘（Agent Fleet/Patch Management/Scoped RBAC/Dashboard）。
+

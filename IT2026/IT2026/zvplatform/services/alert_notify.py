@@ -143,12 +143,10 @@ def _wecom_markdown_content(pending: list, hostnames: dict) -> str:
     return content
 
 
-def _send_wecom(url: str, pending: list, hostnames: dict) -> tuple[bool, str]:
-    """企业微信群机器人：markdown 消息，多条告警合并为一条（规避 20 条/分钟限流）。
-    严格校验响应 errcode==0（企业微信格式错误也返回 200，必须看 body）。"""
+def _post_wecom_markdown(url: str, content: str) -> tuple[bool, str]:
+    """企业微信机器人 markdown 消息（严格校验 errcode）。"""
     try:
-        body = {"msgtype": "markdown", "markdown": {"content": _wecom_markdown_content(pending, hostnames)}}
-        resp = requests.post(url, json=body, timeout=10)
+        resp = requests.post(url, json={"msgtype": "markdown", "markdown": {"content": content}}, timeout=10)
         try:
             data = resp.json()
         except Exception:
@@ -158,6 +156,72 @@ def _send_wecom(url: str, pending: list, hostnames: dict) -> tuple[bool, str]:
         return False, f"errcode={data.get('errcode')} errmsg={data.get('errmsg')}"
     except Exception as exc:
         return False, str(exc)
+
+
+def _send_wecom(url: str, pending: list, hostnames: dict) -> tuple[bool, str]:
+    """企业微信群机器人：markdown 消息，多条告警合并为一条（规避 20 条/分钟限流）。
+    严格校验响应 errcode==0（企业微信格式错误也返回 200，必须看 body）。"""
+    return _post_wecom_markdown(url, _wecom_markdown_content(pending, hostnames))
+
+
+def _wecom_recovery_content(resolved_incidents: list) -> str:
+    lines = ["**Z-View 恢复通知**"]
+    for inc in resolved_incidents:
+        hostname = inc.get("hostname") or str(inc.get("asset_id"))
+        count = inc.get("alert_count")
+        lines.append(
+            f'> <font color="info">✅ **{hostname}** — {count if count is not None else "若干"} 条告警已全部恢复</font>'
+        )
+        lines.append(f"> 事件：{inc.get('incident_id')}")
+    lines.append(f"> 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+    content = "\n".join(lines)
+    if len(content) > _WECOM_CONTENT_MAX_CHARS:
+        content = content[:_WECOM_CONTENT_MAX_CHARS] + "\n> …（内容过长已截断）"
+    return content
+
+
+def dispatch_recovery_notifications(conn, resolved_incidents: list) -> dict:
+    """事件恢复通知（V1.9.0）：全部活跃告警恢复的事件推送到已配置通道。
+
+    与告警分发共用启用开关与通道配置；未配置/未启用时静默跳过。
+    """
+    if not resolved_incidents:
+        return {"skipped": "no_resolved_incidents"}
+    config = get_notify_config(conn)
+    if not config.get("enabled"):
+        return {"skipped": "disabled"}
+
+    result: dict = {"channel": None, "sent": False, "error": ""}
+    webhook_url = str(config.get("webhook_url") or "").strip()
+    if webhook_url:
+        if _is_wecom_webhook(webhook_url):
+            result["channel"] = "wecom"
+            content = _wecom_recovery_content(resolved_incidents)
+            ok, err = _post_wecom_markdown(webhook_url, content)
+            result["sent"] = ok
+            if not ok:
+                result["error"] = err
+                print(f"[AlertNotify] wecom recovery failed: {err}")
+        else:
+            result["channel"] = "webhook"
+            result["sent"] = _send_webhook(webhook_url, {
+                "type": "recovery",
+                "incidents": resolved_incidents,
+            })
+
+    if not result["sent"] and config.get("smtp_host") and config.get("to_addrs"):
+        result["channel"] = (result["channel"] or "") + "+email"
+        body = "\n\n".join(
+            f"{inc.get('hostname') or inc.get('asset_id')} — {inc.get('alert_count')} 条告警已全部恢复"
+            f"（事件 {inc.get('incident_id')}）"
+            for inc in resolved_incidents
+        )
+        result["sent"] = _send_email(
+            config,
+            f"Z-View 恢复通知：{len(resolved_incidents)} 个事件已恢复",
+            body + f"\n\n时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+    return result
 
 
 def _send_email(config: dict, subject: str, body: str) -> bool:
