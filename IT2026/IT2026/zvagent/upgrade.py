@@ -323,6 +323,8 @@ def perform_self_upgrade(new_version: str, expected_sha256: str) -> None:
                 "sha256": expected_sha256,
                 "from_version": from_version,
                 "upgrade_id": upgrade_id,
+                # V1.7.0 协议补全：服务端事务 ID 传给 updater，贯穿全部状态写
+                "server_upgrade_id": str(_UPGRADE_STATE.get("server_upgrade_id") or ""),
             }
             _layout.UPGRADE_TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
             _layout.UPGRADE_TASK_FILE.write_text(
@@ -514,7 +516,8 @@ def _get_last_upgrade_state() -> Optional[Dict[str, Any]]:
     try:
         if _UPGRADE_STATE_PATH.exists():
             state = json.loads(_UPGRADE_STATE_PATH.read_text(encoding="utf-8"))
-            if state.get("stage") in ("COMMIT", "ROLLBACK", "FAILED"):
+            # COMMITTED = updater 成功写法；COMMIT = bat 流成功写法（两者等价）
+            if state.get("stage") in ("COMMIT", "COMMITTED", "ROLLBACK", "FAILED"):
                 return state
     except Exception:
         pass

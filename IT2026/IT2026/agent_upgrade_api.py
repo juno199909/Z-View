@@ -120,6 +120,30 @@ def record_agent_upgrade_state(conn, asset_id: int, upgrade_id: str, state: str,
         safe_console_print(f"[AgentUpgrade] history record failed: {exc}")
 
 
+def close_reached_upgrade(conn, asset_id: int, version: str) -> int:
+    """V1.7.0 收敛：Agent 版本已达 desired → 未完结事务标 COMMITTED。
+
+    updater 旧版不上报终态，版本到位即最强 COMMIT 证据
+    （避免事务停留在 DISPATCHED/RUNNING）。返回受影响行数。
+    """
+    try:
+        ensure_agent_upgrade_history(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE agent_upgrade_history SET state = 'COMMITTED' "
+                "WHERE asset_id = %s AND to_version = %s AND state IN ('DISPATCHED', 'RUNNING')",
+                (asset_id, version),
+            )
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            cursor.close()
+    except Exception as exc:
+        safe_console_print(f"[AgentUpgrade] close reached upgrade failed: {exc}")
+        return 0
+
+
 def get_latest_upgrade_states(conn) -> dict:
     """asset_id -> 该资产最近一条升级历史（升级状态页用）。"""
     try:

@@ -254,3 +254,55 @@ def dispatch_alert_notifications(conn, new_alerts: list) -> dict:
     mark_alerts_notified(conn, [i for i in notified_ids if i])
     result["notified"] = len(notified_ids)
     return result
+
+
+def send_test_notification(conn) -> dict:
+    """按已保存配置逐通道发送测试通知（控制台"发送测试"按钮）。
+
+    返回每通道结果：webhook/wecom/email 各自 ok 与错误详情。
+    """
+    config = get_notify_config(conn)
+    if not config.get("enabled"):
+        return {"enabled": False, "error": "通知未启用，请先打开启用开关并保存"}
+    if not config.get("webhook_url") and not config.get("smtp_host"):
+        return {"enabled": True, "error": "未配置任何通道（webhook_url 与 smtp_host 均为空）"}
+
+    test_alert = {
+        "asset_id": 0,
+        "alert_type": "test",
+        "severity": "info",
+        "message": "Z-View 测试通知：通知链路验证（可安全忽略）",
+        "current_value": None,
+        "threshold_value": None,
+        "active_fingerprint": "test:notify",
+        "first_triggered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    hostnames = {0: "TEST"}
+    result: dict = {"enabled": True, "channel": None}
+
+    webhook_url = str(config.get("webhook_url") or "").strip()
+    if webhook_url:
+        if _is_wecom_webhook(webhook_url):
+            result["channel"] = "wecom"
+            ok, err = _send_wecom(webhook_url, [test_alert], hostnames)
+            result["wecom_ok"] = ok
+            result["wecom_error"] = err
+        else:
+            result["channel"] = "webhook"
+            result["webhook_ok"] = _send_webhook(webhook_url, {
+                "alert_type": "test",
+                "severity": "info",
+                "message": test_alert["message"],
+                "hostname": "TEST",
+            })
+
+    if config.get("smtp_host") and config.get("to_addrs"):
+        result["email"] = _send_email(
+            config,
+            "Z-View 测试通知",
+            "这是一条 Z-View 告警通知测试邮件（可安全忽略）。\n\n"
+            f"时间：{test_alert['first_triggered_at']}",
+        )
+        result["email_ok"] = result["email"]
+
+    return result

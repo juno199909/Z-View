@@ -2348,3 +2348,27 @@
   观察期（远控回归/心跳/升级通道）；updater server_upgrade_id 贯穿修复随下版；
   V1.8.0 架构收官，后续转 V1.9.x security boundary 与平台 P1/P2 大盘。
 
+
+## [2026-09-11] 全部遗留问题清零：协议收敛 + SMTP 自服务 + 安全边界 + 仓库治理
+
+- Where things stand
+  1) updater 状态写携带 server_upgrade_id（V1.7.0 协议补全，已随 1.9.3 部署）；
+  2) webhook payload first_triggered_at 补齐（build_current_alerts + sync_alerts）；
+  3) SMTP 联调自服务：POST /api/v1/console/alert-notify-test（逐通道试发）
+     + 通知配置页"发送测试通知"按钮（结果分组提示）；
+  4) 任务通道安全边界：job_type 白名单（command/report）+ 每资产 pending 上限 10（429）；
+  5) 协议收敛闭环：Agent 版本到位 → close_reached_upgrade 自动把
+     DISPATCHED/RUNNING 收敛为 COMMITTED（不依赖 Agent 上报终态）——
+     实测 UPG-1.9.3 两行 DISPATCHED → COMMITTED；
+  6) 协议断点修复：_get_last_upgrade_state 过滤器漏 COMMITTED（updater 成功写法）
+     + 服务端 state_map 同步——成功升级终态不再被静默丢弃；
+  7) .bak 清理：32 个 Z-View.exe.bak* + old/upgrade-old（~1.3GB）；
+  8) git 治理收尾：全部工作入库，status 清零
+     （链：3bb496d → d5dcc99 → 5ffd4ae → 91e010d → f22e072 → 7e6be35 → cc0eae3 → c85d59c → 4283437 → 09b6c1f → 5ffd4ae 后续 → 91e010d 后续）。
+  运行态：两台终端 1.9.3 心跳正常（08:16）；4 worker 全绿；升级通道静默。
+
+- 剩余（非遗留，属后续路线/用户操作）
+  2213 上 fix_2213.ps1 删除（token 卫生，用户侧）；
+  SMTP 真实账号联调（配置页填账号 → 发送测试按钮自服务）；
+  V1.9.x security boundary；平台 P1/P2 大盘（Incident/阈值配置化/Agent Fleet）。
+

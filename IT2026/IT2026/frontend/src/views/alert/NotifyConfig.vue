@@ -7,6 +7,7 @@
       </div>
       <div class="zv-page-actions">
         <el-button :icon="Refresh" @click="loadConfig" :loading="loading">刷新</el-button>
+        <el-button type="success" :icon="Promotion" :loading="testing" @click="sendTest">发送测试通知</el-button>
       </div>
     </div>
 
@@ -65,11 +66,12 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh } from '@element-plus/icons-vue'
-import { fetchAlertNotifyConfig, updateAlertNotifyConfig } from '@/api/alert'
+import { Promotion, Refresh } from '@element-plus/icons-vue'
+import { fetchAlertNotifyConfig, testAlertNotifyConfig, updateAlertNotifyConfig } from '@/api/alert'
 
 const loading = ref(false)
 const saving = ref(false)
+const testing = ref(false)
 const form = ref({
   enabled: false,
   min_severity: 'critical',
@@ -105,6 +107,31 @@ const loadConfig = async () => {
     // 错误提示由全局拦截器弹出
   } finally {
     loading.value = false
+  }
+}
+
+const sendTest = async () => {
+  testing.value = true
+  try {
+    const result = await testAlertNotifyConfig()
+    if (result && result.error) {
+      ElMessage.warning(`测试未发送：${result.error}`)
+      return
+    }
+    const parts = []
+    if (result.wecom_ok !== undefined) parts.push(`企业微信: ${result.wecom_ok ? '已送达' : '失败 ' + (result.wecom_error || '')}`)
+    if (result.webhook_ok !== undefined) parts.push(`Webhook: ${result.webhook_ok ? '已送达' : '失败'}`)
+    if (result.email_ok !== undefined) parts.push(`邮件: ${result.email_ok ? '已发送' : '失败'}`)
+    const ok = parts.some(p => p.includes('已送达') || p.includes('已发送'))
+    if (ok) {
+      ElMessage.success(`测试通知已发送（${parts.join('；')}），请到对应群组/邮箱确认`)
+    } else {
+      ElMessage.error(`测试发送失败：${parts.join('；') || '无可用通道'}`)
+    }
+  } catch (e) {
+    // 错误提示由全局拦截器弹出
+  } finally {
+    testing.value = false
   }
 }
 

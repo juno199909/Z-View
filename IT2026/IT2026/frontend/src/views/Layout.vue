@@ -60,6 +60,7 @@
               </template>
             </el-menu-item>
             <el-menu-item index="/alert/notify" class="zv-menu-item">通知配置</el-menu-item>
+            <el-menu-item index="/alert/thresholds" class="zv-menu-item">告警阈值</el-menu-item>
             <el-menu-item index="/log" class="zv-menu-item">日志总览</el-menu-item>
             <el-menu-item index="/log/operations" class="zv-menu-item">操作日志</el-menu-item>
           </el-sub-menu>

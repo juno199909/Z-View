@@ -60,3 +60,25 @@ export function updateAlertNotifyConfig(patch) {
     data: patch
   })
 }
+
+export function testAlertNotifyConfig() {
+  return request({
+    url: '/console/alert-notify-test',
+    method: 'post'
+  })
+}
+
+export function fetchAlertThresholds() {
+  return request({
+    url: '/console/alert-thresholds',
+    method: 'get'
+  })
+}
+
+export function updateAlertThresholds(patch) {
+  return request({
+    url: '/console/alert-thresholds',
+    method: 'put',
+    data: patch
+  })
+}

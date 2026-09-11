@@ -57,6 +57,12 @@ const routes = [
         meta: { title: '通知配置' }
       },
       {
+        path: '/alert/thresholds',
+        name: 'AlertThresholds',
+        component: () => import('@/views/alert/ThresholdConfig.vue'),
+        meta: { title: '告警阈值' }
+      },
+      {
         path: '/log',
         name: 'LogCenter',
         component: () => import('@/views/log/Index.vue'),

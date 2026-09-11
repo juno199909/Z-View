@@ -44,6 +44,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import zvagent.layout as layout  # noqa: E402
 
 
+_SERVER_UPGRADE_ID = ""  # V1.7.0：服务端事务 ID，main() 从任务文件读取后贯穿全部状态写
+
+
 def state_write(stage: str, **extra) -> None:
     try:
         state = {}
@@ -53,6 +56,9 @@ def state_write(stage: str, **extra) -> None:
             except Exception:
                 state = {}
         state.update({"stage": stage, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        # V1.7.0 协议补全：服务端事务 ID 贯穿全部状态写（终态上报可按事务合并）
+        if _SERVER_UPGRADE_ID:
+            state.setdefault("server_upgrade_id", _SERVER_UPGRADE_ID)
         state.update(extra)
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -223,6 +229,9 @@ def main() -> int:
     server_url = str(task.get("server_url") or "").rstrip("/")
     token = str(task.get("token") or "")
     previous_version = str(task.get("from_version") or layout.active_version() or "")
+    # V1.7.0 协议补全：服务端事务 ID 贯穿全部状态写
+    global _SERVER_UPGRADE_ID
+    _SERVER_UPGRADE_ID = str(task.get("server_upgrade_id") or "")
 
     # V1.6.0 修复：任务 token 为空时回退到设备凭据（迁移安装器曾把
     # config.local.json 写成 server_url-only，CONFIG token 丢失 → 下载 401）

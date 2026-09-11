@@ -664,8 +664,8 @@ def agent_heartbeat(data: dict, request: Request):
                 _UPGRADE_FAILURE_BREAKER.pop(asset_id, None)
             try:
                 from agent_upgrade_api import record_agent_upgrade_state
-                normalized = {"COMMIT": "COMMITTED", "ROLLBACK": "ROLLBACK",
-                              "FAILED": "FAILED"}.get(stage, "RUNNING")
+                normalized = {"COMMIT": "COMMITTED", "COMMITTED": "COMMITTED",
+                              "ROLLBACK": "ROLLBACK", "FAILED": "FAILED"}.get(stage, "RUNNING")
                 record_agent_upgrade_state(
                     conn, asset_id,
                     str(upgrade_state.get("server_upgrade_id") or upgrade_state.get("upgrade_id") or "UPG-unknown"),
@@ -734,6 +734,16 @@ def agent_heartbeat(data: dict, request: Request):
             # 升级指令带事务 ID（按目标版本确定性生成，重发幂等）；
             # 服务端熔断开启期间不下发指令（防止旧版 Agent 迁移死循环刷屏）
             heartbeat_response["desired_version"] = latest_upgrade["version"]
+            # V1.7.0 收敛：Agent 版本已达 desired → 未完结事务标 COMMITTED
+            # （updater 旧版不上报终态，版本到位即最强 COMMIT 证据）
+            if reported_version and _agent_version_tuple(reported_version) >= _agent_version_tuple(
+                latest_upgrade["version"]
+            ):
+                try:
+                    from agent_upgrade_api import close_reached_upgrade
+                    close_reached_upgrade(conn, asset_id, latest_upgrade["version"])
+                except Exception:
+                    pass
             breaker = _UPGRADE_FAILURE_BREAKER.get(asset_id)
             if breaker:
                 until = float(breaker.get("until") or 0)

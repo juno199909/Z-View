@@ -4000,6 +4000,60 @@ def update_alert_notify_config_api(request: Request, patch: dict):
         conn.close()
 
 
+@app.post("/api/v1/console/alert-notify-test")
+def test_alert_notify_config(request: Request):
+    """发送测试通知（admin）：按已保存配置逐通道试发，返回每通道结果。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    from zvplatform.services.alert_notify import send_test_notification
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        return send_test_notification(conn)
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/console/alert-thresholds")
+def get_alert_thresholds_api(request: Request):
+    """读取告警阈值配置（NULL = 使用默认）。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    from zvplatform.services.alert_thresholds import get_threshold_config, get_effective_thresholds
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        return {
+            "config": get_threshold_config(conn),
+            "effective": get_effective_thresholds(conn),
+        }
+    finally:
+        conn.close()
+
+
+@app.put("/api/v1/console/alert-thresholds")
+def update_alert_thresholds_api(request: Request, patch: dict):
+    """更新告警阈值（合并式；NULL/空串 = 回落默认；校验范围与 warning<critical）。"""
+    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
+    if not isinstance(patch, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+    from zvplatform.services.alert_thresholds import get_threshold_config, get_effective_thresholds, update_threshold_config
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        try:
+            update_threshold_config(conn, patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return {
+            "config": get_threshold_config(conn),
+            "effective": get_effective_thresholds(conn),
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/v1/console/agent-credentials")
 def list_agent_credentials(request: Request):
     """设备凭据注册状态（含未注册资产）"""
