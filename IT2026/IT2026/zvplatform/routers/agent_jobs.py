@@ -24,9 +24,10 @@ router = APIRouter(tags=["agent-jobs"])
 _TABLE = "agent_jobs"
 _VALID_STATES = ("pending", "dispatched", "succeeded", "failed")
 # V1.9.x 安全边界：服务端任务类型白名单（与 Agent 端 handler 注册表对应）
-_KNOWN_JOB_TYPES = ("command", "report")
+_KNOWN_JOB_TYPES = ("command", "report", "wu_diag", "wu_install", "wu_collect")
 _MAX_PENDING_PER_ASSET = 10
 _JOB_EXPIRY_HOURS = 24  # pending 超时未下发即过期（陈旧任务不应执行）
+_REDISPATCH_MINUTES = 30  # dispatched 超时无结果 → 回到 pending 重试
 
 
 def ensure_agent_jobs_table(conn) -> None:
@@ -115,11 +116,20 @@ def fetch_pending_jobs(conn, asset_id: int, limit: int = 5) -> list[dict]:
     """取该资产的 pending 任务并在下发时标记 dispatched。
 
     V1.9.x 安全边界：先过期陈旧 pending（超 _JOB_EXPIRY_HOURS 未下发即
-    expired，陈旧任务不应在终端执行）。
+    expired，陈旧任务不应在终端执行）；再回收卡死的 dispatched
+    （超 _REDISPATCH_MINUTES 无结果 → 回到 pending 重试，终端掉线/重启/
+    版本不匹配时任务不丢失）。
     """
     ensure_agent_jobs_table(conn)
     cursor = conn.cursor(dictionary=True)
     try:
+        cursor.execute(
+            f"UPDATE {_TABLE} SET state = 'pending', updated_at = NOW() "
+            f"WHERE state = 'dispatched' "
+            f"AND updated_at < NOW() - INTERVAL {_REDISPATCH_MINUTES} MINUTE"
+            .replace("%s", "%s"),
+            (),
+        )
         cursor.execute(
             f"UPDATE {_TABLE} SET state = 'expired' "
             f"WHERE asset_id = %s AND state = 'pending' "

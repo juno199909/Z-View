@@ -2444,3 +2444,23 @@
   V1.9.x security boundary 细化（可选）；平台 P1/P2 大盘（Agent Fleet/
   Patch Management/Scoped RBAC/Dashboard）。
 
+
+## [2026-09-11] P1 Patch Management Phase 1 完成 + 1.9.4 发布（补丁状态端到端验证）
+
+- Where things stand
+  1) Agent 采集器 zvagent/collectors/patches.py：WU COM 查询（Microsoft.Update.Session，
+     IsInstalled=0）、KB 提取、重启需求判定、1h TTL 缓存、fail-safe 错误捕获——
+     真机实测通过（本机 2 个 Broadcom 驱动补丁待安装）；
+  2) Agent 上报循环 _patch_report_loop（6h 全量 + 变更哈希即报，采集 TTL 1h）；
+  3) 服务端 agent_patches 表（REPLACE-per-report）+ report_type='patches' 处理；
+  4) 控制台 API GET /api/v1/console/patch-status（admin，汇总 + 明细展开）；
+  5) 前端 /patches 补丁管理页（统计卡 + 终端表 + 展开明细）+ 终端管理菜单；
+  6) 1.9.4 发布：两台终端自动迁移完成（28+2213 均 1.9.4），补丁数据端到端到达——
+     28 真实数据（2 pending/reboot）；2213 采集报错 0x80072EE6（WININET_E_INVALID_URL，
+     终端侧 WU/WSUS 配置问题，fail-safe 正常上报——Phase 2 排查项）。
+  git 全部入库（f084fb0），status 清零。
+
+- Next step
+  Phase 2：2213 WU 配置排查 + 补丁安装下发（jobs 通道 wu_install handler）；
+  Patch Management 前端已就绪（数据随 1.9.4 Agent 上报自动出现）。
+

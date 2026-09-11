@@ -177,6 +177,8 @@ def _heartbeat_loop():
                 if last_upgrade_state:
                     payload["agent_upgrade_state"] = last_upgrade_state
             # V1.8.3：上轮执行的任务结果随本次心跳上报
+            # V1.9.x deferred：长任务（补丁安装）完成结果并入上报
+            pending_job_results.extend(_jobs.take_deferred_results())
             if pending_job_results:
                 payload["job_results"] = pending_job_results
                 pending_job_results = []  # 移交 payload，清空暂存避免重复

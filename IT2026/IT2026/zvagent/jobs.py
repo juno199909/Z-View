@@ -19,6 +19,24 @@ from typing import Any, Callable
 
 _JOB_HANDLERS: dict[str, Callable[[dict], Any]] = {}
 
+# V1.9.x deferred 结果：长任务 handler 自行启动线程，完成后推送结果，
+# 由心跳循环 take_deferred_results() 取走并随 job_results 上报。
+_DEFERRED_RESULTS: list[dict] = []
+
+
+def push_deferred_result(job_id: str, state: str, result: Any = None) -> None:
+    """长任务完成后推送结果（state: succeeded/failed）。"""
+    _DEFERRED_RESULTS.append({"job_id": str(job_id), "state": state, "result": result})
+
+
+def take_deferred_results() -> list[dict]:
+    """心跳循环取走已完成的 deferred 结果（取走即清空）。"""
+    if not _DEFERRED_RESULTS:
+        return []
+    results = list(_DEFERRED_RESULTS)
+    _DEFERRED_RESULTS.clear()
+    return results
+
 
 def register_job_handler(job_type: str, handler: Callable[[dict], Any]) -> None:
     """注册任务 handler（幂等，后注册覆盖）。"""
@@ -60,8 +78,14 @@ def execute_pending_jobs(jobs: Any) -> list[dict]:
                             "error": f"unknown job_type: {job_type}"})
             continue
         try:
-            result = handler(payload if isinstance(payload, dict) else {})
-            results.append({"job_id": job_id, "state": "succeeded", "result": result})
+            # V1.9.x：handler 可返回 {"_async": True} 表示已自行启动异步执行，
+            # 完成后通过 push_deferred_result 上报结果（长任务如补丁安装）
+            exec_payload = {**(payload if isinstance(payload, dict) else {}), "job_id": job_id}
+            result = handler(exec_payload)
+            if isinstance(result, dict) and result.get("_async"):
+                results.append({"job_id": job_id, "state": "running"})
+            else:
+                results.append({"job_id": job_id, "state": "succeeded", "result": result})
         except Exception as exc:
             results.append({"job_id": job_id, "state": "failed", "error": f"{type(exc).__name__}: {exc}"})
     return results

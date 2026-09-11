@@ -741,6 +741,34 @@ def agent_heartbeat(data: dict, request: Request):
         }
         if heartbeat_credential:
             heartbeat_response["agent_credential"] = heartbeat_credential
+        # V1.8.3 通用任务通道：仅在主心跳下发 pending 任务（Agent 主循环处理响应体；
+        # network/hardware/software 上报循环不读响应体，任务会被丢弃）
+        if report_type in ('heartbeat', 'system_status'):
+            try:
+                from zvplatform.routers.agent_jobs import fetch_pending_jobs
+                pending_jobs = fetch_pending_jobs(conn, asset_id)
+                if pending_jobs:
+                    safe_console_print(f"[Heartbeat][DBG] jobs dispatched to asset {asset_id}: "
+                                       f"{[j.get('job_id') for j in pending_jobs]}")
+                    heartbeat_response["jobs"] = pending_jobs
+            except Exception as jobs_exc:
+                safe_console_print(f"[Heartbeat] jobs dispatch failed: {jobs_exc}")
+        # V1.8.3 通用任务通道：Agent 上报任务执行结果 → 事务状态记录（终态审计）
+        job_results = data.get("job_results")
+        if isinstance(job_results, list) and job_results:
+            safe_console_print(f"[Heartbeat][DBG] job_results received from asset {asset_id}: "
+                               f"{json.dumps(job_results, ensure_ascii=False)[:300]}")
+            try:
+                from zvplatform.routers.agent_jobs import record_job_state
+                for job_result in job_results:
+                    if isinstance(job_result, dict) and job_result.get("job_id"):
+                        record_job_state(
+                            conn, str(job_result["job_id"]),
+                            str(job_result.get("state") or "succeeded"),
+                            job_result.get("result"),
+                        )
+            except Exception as jobs_exc:
+                safe_console_print(f"[Heartbeat] job_results record failed: {jobs_exc}")
         # P0-02：下发平台证书公钥，Agent 存为 ca-bundle 用于 TLS 校验
         try:
             _ca_pem_path = os.path.join(os.path.dirname(os.path.abspath(assets_api.__file__)),
