@@ -197,13 +197,16 @@ def _heartbeat_loop():
                     # V1.8.3 通用任务通道：执行心跳下发的任务，结果随下次心跳上报
                     try:
                         pending_jobs = body.get("jobs")
-                        safe_console_print(f"[Jobs][DBG] heartbeat response jobs: {len(pending_jobs or [])}")
+                        safe_console_print(f"[V1910DBG] heartbeat body keys={sorted(body.keys())[:12]} "
+                                           f"jobs={len(pending_jobs or [])}")
                         if isinstance(pending_jobs, list) and pending_jobs:
+                            safe_console_print(f"[V1910DBG] executing {len(pending_jobs)} jobs now")
                             job_results = _jobs.execute_pending_jobs(pending_jobs)
+                            safe_console_print(f"[V1910DBG] jobs executed, results={len(job_results)}")
                             if job_results:
                                 pending_job_results.extend(job_results)
                     except Exception as exc:
-                        print(f"[Jobs] dispatch failed: {exc}")
+                        safe_console_print(f"[V1910DBG] jobs dispatch EXCEPTION: {type(exc).__name__}: {exc}")
                     # 一机一密（P0-01）：保存平台签发的设备凭据，后续请求改用 zv1 token
                     credential_info = body.get("agent_credential")
                     if isinstance(credential_info, dict) and credential_info.get("agent_id") and credential_info.get("device_secret"):

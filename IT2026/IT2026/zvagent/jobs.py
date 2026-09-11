@@ -73,6 +73,7 @@ def execute_pending_jobs(jobs: Any) -> list[dict]:
             results.append({"job_id": job_id, "state": "failed", "error": "missing job_id/job_type"})
             continue
         handler = _JOB_HANDLERS.get(job_type)
+        safe_console_print(f"[V1910DBG] job {job_id} type {job_type}: handler={'FOUND' if handler else 'NOT FOUND'}")
         if handler is None:
             safe_console_print(f"[Jobs][DBG] job {job_id} type {job_type}: handler NOT registered "
                                f"(registered: {sorted(_JOB_HANDLERS)})")

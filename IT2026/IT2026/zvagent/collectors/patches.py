@@ -232,7 +232,12 @@ def _register_patch_job_handlers() -> None:
     try:
         from zvagent import jobs as _jobs
 
-        _jobs.register_job_handler("wu_diag", lambda payload: wu_diagnose())
+        def _wu_diag_handler(payload: dict) -> dict:
+            safe_console_print("[V1910DBG] wu_diag handler entered")
+            result = wu_diagnose()
+            safe_console_print(f"[V1910DBG] wu_diag done: pending={result.get('com_pending')} err={result.get('com_search_error')}")
+            return result
+        _jobs.register_job_handler("wu_diag", _wu_diag_handler)
 
         def _wu_install_handler(payload: dict) -> dict:
             kb = payload.get("kb") or None

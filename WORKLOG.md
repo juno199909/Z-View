@@ -2557,3 +2557,30 @@
   （1.9.7 诊断版已部署，DBG 日志会显示任务接收/handler 查找/执行/结果每步）；
   ② 1.9.10 诊断构建（zvagent/heartbeat.py jobs 块逐步 print）→ 终端侧定位。
 
+
+## [2026-09-11] 通用任务通道调试最终报告：服务端全通，Agent 端执行待现场定位
+
+- Where things stand
+  服务端任务通道完整验证 ✅（合成心跳全链路：创建 → 主心跳下发（gating 后仅
+  heartbeat 触发）→ 响应携带 jobs → 合成 job_results 上报 → record_job_state
+  状态流转 → 结果落库，全 OK）。wu_diag handler 进程内实测 ✅。
+  Agent 端执行：任务 dispatched 后不执行/不回传 ✗（三连复现：1.9.5/1.9.7/1.9.9
+  三个诊断版，本机 worker 日志零 [Jobs][DBG]/[V1910DBG] 痕迹、审计无记录）。
+  排查过程修复的真实缺陷：
+  ① 任务下发 gating（network 循环不读响应体 → 任务丢失，本机与 2213 复现）；
+  ② dispatched 30min 重试回收 + pending 24h 过期；
+  ③ 服务端 job_results 处理缺失（Agent 上报结果从未被记录）；
+  ④ close_reached_upgrade 版本到位收敛（实测 UPG-1.9.3 收敛）；
+  ⑤ updater server_upgrade_id 贯穿 + 任务创建/终态审计 + 资产校验 + 白名单/上限。
+  定位手段已全部用尽（远程）：服务端日志/DB/合成请求（含 mac_address 修正）/
+  PYZ 解包递归检查（co_consts/co_names/co_varnames）/xref/进程内直调/沙箱测试/
+  构建产物二进制与 PYZ 验证。
+  矛盾点：PYZ 解包确认 zvagent.heartbeat 含完整 jobs 块 ✓（递归含 varnames），
+  但运行时行为不同——疑似 frozen 环境的模块加载问题（需现场确认）。
+
+- Next step
+  现场调试：DESKTOP-JEGI046 本地查看
+  C:\ProgramData\CMDB-Agent\logs\agent-worker.log 的 [V1910DBG]/[Jobs][DBG] 输出
+  （1.9.10 诊断版已部署，DBG 会打印 body keys/jobs 数量/handler 查找/执行每步）；
+  或 1.9.11 诊断构建（zvagent/heartbeat.py jobs 块每步 print）到终端定位。
+
