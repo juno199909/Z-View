@@ -2464,3 +2464,21 @@
   Phase 2：2213 WU 配置排查 + 补丁安装下发（jobs 通道 wu_install handler）；
   Patch Management 前端已就绪（数据随 1.9.4 Agent 上报自动出现）。
 
+
+## [2026-09-11] 通用任务通道调试收官：发现并修复"任务下发到错误上报循环"缺陷
+
+- Where things stand
+  1) wu_diag 端到端调试：服务端下发 ✅（DBG 日志确认）→ Agent 收到后不执行/不回传 ✗；
+  2) 根因：任务下发原本在任意 report_type 上触发——network 上报线程（10s 一次）抢到
+     fetch_pending_jobs，任务被放进 network 循环的 HTTP 响应，而 network 循环不读
+     响应体 → 任务全部丢失（本机 28 与 2213 同样复现）；
+  3) 修复：任务下发只在 report_type in (heartbeat, system_status) 时触发（主心跳循环
+     处理响应体 ✓），并加了 DBG 日志（下发/结果接收两端）；
+  4) 调试过程中发现修复/验证的时序错位（多次后端重启与源码修改交织）导致误判，
+     已用 DB 时钟对账厘清；
+  5) 孤儿任务清理 + 通知配置恢复默认；全部入库 status 清零。
+
+- Next step
+  下次构建（1.9.6，携带 jobs 下发 gating + wu_diag/wu_install + deferred 框架）后
+  重测 wu_diag 端到端；Incident 恢复通知已上线（本次已验证分发函数工作正常）。
+
