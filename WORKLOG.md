@@ -2372,3 +2372,33 @@
   SMTP 真实账号联调（配置页填账号 → 发送测试按钮自服务）；
   V1.9.x security boundary；平台 P1/P2 大盘（Incident/阈值配置化/Agent Fleet）。
 
+
+## [2026-09-11] V1.9.0 完成：告警阈值可配置化 + 任务通道安全边界收尾
+
+- Where things stand
+  1) 阈值可配置化：alert_threshold_config 表（NULL=回落默认）、
+     zvplatform/services/alert_thresholds.py（get_effective_thresholds/
+     update_threshold_config，范围校验 + 同类约束——cpu/memory/disk 正向
+     warning<critical、health 反向 warning>critical）、
+     build_current_alerts 参数化 + sync_alerts 每轮读取生效阈值；
+  2) 控制台 API GET/PUT /api/v1/console/alert-thresholds（校验失败 422 回传原因）；
+  3) 前端 /alert/thresholds 告警阈值页（成对输入 + 留空回落默认提示）+ 菜单入监控中心；
+  4) 任务通道安全边界收尾（V1.9.x）：
+     fetch_pending_jobs 先过期陈旧 pending（24h）；
+     创建时资产校验（404）+ job_type 白名单（422）+ 每资产 pending 上限 10（429）；
+     任务创建/终态审计入 system_activity_logs；
+  5) 通知测试端点 POST /api/v1/console/alert-notify-test + 通知配置页
+     "发送测试通知"按钮（SMTP 自服务联调就绪）；
+  6) updater 状态写贯穿 server_upgrade_id + webhook first_triggered_at 补齐
+     （随 1.9.3 部署生效）。
+  验证证据：
+  阈值沙箱测试全过（回落/覆盖生效/评估联动 cpu60→warning/校验拒绝 95>=90/清理回落）；
+  全部文件 py_compile（SyntaxWarning 即错）+ pyflakes 0 undefined；
+  两台终端 1.9.3 心跳正常；后端 health ok；三组新端点全部注册；
+  git status 清零（2944333）。
+
+- Next step
+  用户侧：通知配置页填 SMTP 账号 → "发送测试通知"自服务联调；
+  2213 上 fix_2213.ps1 删除（token 卫生）；
+  后续路线：Incident 聚合、Agent Fleet、Patch Management（P1/P2）。
+

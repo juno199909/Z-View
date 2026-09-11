@@ -158,6 +158,7 @@ from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus
 from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
+from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
 from zvplatform.routers.groups import router as groups_platform_router
 from zvplatform.routers.agent_policy import router as agent_policy_router
 from zvplatform.routers.logs import (  # noqa: E402
@@ -1017,6 +1018,14 @@ def alert_sync_loop():
             if conn:
                 try:
                     new_alerts = sync_alerts(conn)
+                    # V1.9.0 事件聚合：按当前活跃告警归并事件（每资产一个开放事件）
+                    try:
+                        from zvplatform.services.incident_service import sync_incidents
+                        incident_result = sync_incidents(conn)
+                        if incident_result.get("opened") or incident_result.get("resolved"):
+                            safe_console_print(f"[AlertSync] incidents: {incident_result}")
+                    except Exception as inc_exc:
+                        safe_console_print(f"[AlertSync] incident sync failed: {inc_exc}")
                     # V1.7.1 通知层：新触发告警分发（webhook/邮件，配置见 alert_notify_config）
                     try:
                         from zvplatform.services.alert_notify import dispatch_alert_notifications
@@ -3841,6 +3850,7 @@ app.include_router(groups_platform_router)  # P1-01：终端分组路由
 app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
+app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
 
 # 网络监控路由（第一阶段：实时状态 + 历史趋势）
 from zvplatform.routers.network import router as network_router

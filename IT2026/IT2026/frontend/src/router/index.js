@@ -63,6 +63,12 @@ const routes = [
         meta: { title: '告警阈值' }
       },
       {
+        path: '/incidents',
+        name: 'Incidents',
+        component: () => import('@/views/alert/Incidents.vue'),
+        meta: { title: '事件列表' }
+      },
+      {
         path: '/log',
         name: 'LogCenter',
         component: () => import('@/views/log/Index.vue'),
