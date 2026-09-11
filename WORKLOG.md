@@ -2521,3 +2521,39 @@
   下一步必须现场调试：1.9.9 Agent 的 worker 日志（DESKTOP-JEGI046 本地）+
   若无痕迹则在 zvagent/heartbeat.py 的 jobs 执行块加逐步 print 出 1.9.10 诊断版。
 
+
+## [2026-09-11] 通用任务通道调试终报：服务端全通，Agent 端执行待现场定位
+
+- Where things stand
+  1) 服务端全链路 ✅（合成心跳隔离测试：任务创建 → 主心跳下发（gating 后仅
+     heartbeat/system_status 触发）→ 响应携带 jobs → 合成 job_results 上报 →
+     record_job_state 状态流转 → 结果落库 → close_reached_upgrade 收敛）；
+  2) wu_diag handler 进程内实测 ✅（诊断返回完整 WU 数据）；
+  3) 1.9.6/1.9.9 构建产物验证 ✅（PYZ 解包递归检查：zvagent.heartbeat 含
+     jobs 执行块/pending_job_results/take_deferred_results、collectors.patches 含
+     wu_diag/wu_install 注册、V199MARKER 在 _heartbeat_loop）；
+  4) 两台终端 1.9.9 心跳正常 ✅；
+  5) ✗ 终端上的 wu_diag 执行/结果回传仍不发生：任务 dispatched、本机
+     worker/runtime/error 日志零 [Jobs] 痕迹、审计无记录。
+  过程中修复的真实缺陷：
+  ① 任务下发 gating（network 循环不读响应体 → 任务丢失——本机与 2213 复现）；
+  ② 重试回收（dispatched 30min → pending）+ 任务过期（24h）；
+  ③ 服务端 job_results 处理缺失（Agent 上报的结果从未被记录）；
+  ④ close_reached_upgrade 版本到位收敛；
+  ⑤ updater server_upgrade_id 贯穿 + webhook first_triggered_at 补齐；
+  ⑥ 任务创建审计 + 终态审计 + 资产校验 + 类型白名单 + pending 上限。
+  定位手段已全部用尽（远程）：服务端日志/DB/合成请求/PYZ 解包递归检查/
+  xref/进程内直调/沙箱测试/构建产物二进制验证。
+
+- 关键发现（本轮）
+  jobs 框架增强（deferred + job_id 注入）与 wu_diag/wu_install handler 的源码
+  修改时间（10:06-10:37）晚于 1.9.4-1.9.7 构建（09:49-14:4x）——期间多个版本
+  的构建产物不含这些修改（PyInstaller localpycs 缓存未随源码失效），
+  1.9.8 清重建（删除 build_agent_work）后 PYZ 才包含完整代码（V199MARKER 验证）。
+
+- Next step
+  现场调试两选一：① DESKTOP-JEGI046 本地查看
+  C:\ProgramData\CMDB-Agent\logs\agent-worker.log 的 [Jobs][DBG] 输出
+  （1.9.7 诊断版已部署，DBG 日志会显示任务接收/handler 查找/执行/结果每步）；
+  ② 1.9.10 诊断构建（zvagent/heartbeat.py jobs 块逐步 print）→ 终端侧定位。
+
