@@ -89,6 +89,7 @@ from zvagent.collectors.system import (  # noqa: F401
     get_primary_network_info,
 )
 from zvagent.collectors.software import collect_software_list  # noqa: F401
+from zvagent.collectors.patches import collect_windows_update_status  # noqa: F401
 from zvagent.policy import (  # noqa: F401
     _AGENT_POLICIES_CACHE_PATH,
     _apply_agent_policies,
@@ -489,6 +490,76 @@ def _network_report_loop():
                 print(f"[Network] 采集上报错误: {exc}")
 
         time.sleep(_current_interval("network", 10))
+
+
+# =============================================================================
+# Patch Management Phase 1 - WU 补丁状态采集上报（基于 Windows Update 状态）
+# =============================================================================
+
+_PATCH_FULL_SYNC_INTERVAL = 6 * 3600  # 无变化时也定期全量上报，兜底数据一致性
+_PATCH_REPORT_STATE = {"hash": None, "last_full_sync": 0.0}
+
+
+def _patch_payload_hash(patch_status: dict) -> str:
+    """对补丁列表做顺序无关哈希（不变则跳过上报）。"""
+    normalized = sorted(
+        (
+            str(p.get("kb") or ""),
+            str(p.get("title") or ""),
+            str(p.get("severity") or ""),
+        )
+        for p in patch_status.get("pending") or []
+    )
+    normalized.append(str(patch_status.get("pending_count") or 0))
+    normalized.append(str(patch_status.get("reboot_required") or False))
+    return hashlib.sha256(json.dumps(normalized, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _patch_report_loop():
+    """补丁状态上报（独立低频线程，6h 全量 + 变更即报）。
+
+    WU 在线搜索代价高（10~60s），采集侧带 1h TTL 缓存；
+    循环节奏：采集 → 上报 → 休眠 300s。
+    """
+    while _AGENT_STATE["running"]:
+        try:
+            asset_id = _AGENT_STATE.get("asset_id")
+            if not asset_id:
+                time.sleep(120)
+                continue
+
+            patch_status = collect_windows_update_status()
+            payload_hash = _patch_payload_hash(patch_status)
+            now = time.time()
+            unchanged = payload_hash == _PATCH_REPORT_STATE["hash"]
+            full_sync_due = now - _PATCH_REPORT_STATE["last_full_sync"] >= _PATCH_FULL_SYNC_INTERVAL
+            if unchanged and not full_sync_due and not patch_status.get("error"):
+                time.sleep(300)
+                continue
+
+            ip, mac = get_primary_network_info()
+            payload = {
+                "asset_id": asset_id,
+                "hostname": _AGENT_STATE["hostname"],
+                "ip_address": ip,
+                "mac_address": mac,
+                "status": "online",
+                "report_type": "patches",
+                "agent_version": AGENT_VERSION,
+                "patch_status": patch_status,
+            }
+            url = urljoin(_platform_base(), "/api/v1/agent/heartbeat")
+            resp = requests.post(url, json=payload, headers=_agent_headers(), timeout=60, verify=_agent_requests_verify())
+            if resp.status_code in (200, 201):
+                _PATCH_REPORT_STATE["hash"] = payload_hash
+                _PATCH_REPORT_STATE["last_full_sync"] = now
+                print(f"[Patches] 上报完成 (pending={patch_status.get('pending_count')})")
+            else:
+                print(f"[Patches] HTTP {resp.status_code}")
+        except Exception as exc:
+            print(f"[Patches] 错误: {exc}")
+
+        time.sleep(300)
 
 
 # =============================================================================
@@ -1235,6 +1306,7 @@ def start_cmdb_reporter():
         ("hardware_report", _hardware_report_loop),
         ("software_report", _software_report_loop),
         ("network_report", _network_report_loop),
+        ("patch_report", _patch_report_loop),
     ]
 
     for name, target in threads:

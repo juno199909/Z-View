@@ -2425,3 +2425,22 @@
   事件通知联动（事件开启/升级时复用通知层，可选增强）；
   平台 P1/P2 大盘（Agent Fleet/Patch Management/Scoped RBAC/Dashboard）。
 
+
+## [2026-09-11] Incident 恢复通知联动上线（运维闭环完成）
+
+- Where things stand
+  1) incident_service：resolve 循环收集恢复事件详情（incident_id/hostname/title/
+     alert_count/resolved_at）并随 result 返回 resolved_incidents；
+  2) alert_notify.dispatch_recovery_notifications：恢复通知分发
+     （企微 markdown 恢复卡片（✅ 主机 — N 条告警已全部恢复）/ webhook
+     {"type": "recovery", "incidents": [...]} / 邮件摘要；复用启用开关与通道配置）；
+  3) 告警同步线程接线：sync_incidents → resolved_incidents → 恢复通知分发；
+  4) 沙箱测试 3 场景全过：开事件不误报 / 恢复推送送达（payload 验证）/
+     disabled 跳过；修复测试编排缺失（sync 后未调分发）。
+  运维闭环终态：告警触发 → 企微推送 → 处理 → 全部恢复 → 企微恢复卡片。
+  git 全部入库（868db37），status 清零。
+
+- Next step
+  V1.9.x security boundary 细化（可选）；平台 P1/P2 大盘（Agent Fleet/
+  Patch Management/Scoped RBAC/Dashboard）。
+

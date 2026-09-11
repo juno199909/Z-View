@@ -553,6 +553,41 @@ def agent_heartbeat(data: dict, request: Request):
             except Exception as net_exc:
                 safe_console_print(f"[Heartbeat] Network ingest failed (ignored): {net_exc}")
 
+        elif report_type == 'patches':
+            # Patch Management Phase 1：补丁状态存储（replace-per-report，fail-safe）
+            try:
+                patch_status = data.get('patch_status') or {}
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_patches (
+                        asset_id INT PRIMARY KEY,
+                        pending_count INT NOT NULL DEFAULT 0,
+                        reboot_required TINYINT(1) NOT NULL DEFAULT 0,
+                        last_scan DATETIME NULL,
+                        patches JSON NULL,
+                        error VARCHAR(500) NULL,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    )
+                """)
+                pending = patch_status.get('pending') or []
+                if isinstance(pending, dict):
+                    pending = [pending]
+                cursor.execute("""
+                    REPLACE INTO agent_patches
+                        (asset_id, pending_count, reboot_required, last_scan, patches, error)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    asset_id,
+                    int(patch_status.get('pending_count') or 0),
+                    1 if patch_status.get('reboot_required') else 0,
+                    patch_status.get('last_scan') or None,
+                    json.dumps(pending, ensure_ascii=False) if pending else None,
+                    str(patch_status.get('error') or '')[:500] or None,
+                ))
+                safe_console_print(f"[Heartbeat] Patch report ingested: asset_id={asset_id} "
+                                   f"pending={patch_status.get('pending_count')}")
+            except Exception as patch_exc:
+                safe_console_print(f"[Heartbeat] Patch ingest failed (ignored): {patch_exc}")
+
         elif report_type == 'software':
             # 更新软件清单
             software_list = data.get('software_list', [])

@@ -44,6 +44,7 @@
             <el-menu-item index="/terminal/software-center" class="zv-menu-item">软件管理</el-menu-item>
             <el-menu-item index="/terminal/agent-upgrade" class="zv-menu-item">Agent升级</el-menu-item>
             <el-menu-item index="/terminal/agent-deploy" class="zv-menu-item">终端部署</el-menu-item>
+            <el-menu-item index="/patches" class="zv-menu-item">补丁管理</el-menu-item>
             <el-menu-item index="/automation" class="zv-menu-item">批量操作</el-menu-item>
             <el-menu-item index="/settings/agent-policy" class="zv-menu-item">终端策略</el-menu-item>
           </el-sub-menu>
