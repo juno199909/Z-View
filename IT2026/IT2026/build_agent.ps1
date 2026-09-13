@@ -23,7 +23,8 @@ $DistDir = Join-Path $BuildRoot "dist"
 $BuildDir = Join-Path $BuildRoot "build"
 $CacheDir = Join-Path $BuildRoot "pyinstaller-cache"
 $TempDir = Join-Path $BuildRoot "temp"
-$ExePath = Join-Path $DistDir "Z-View.exe"
+# V1.8.3+ onedir 布局：产物为 dist\Z-View\{Z-View.exe,_internal,...}
+$ExePath = Join-Path $DistDir "Z-View\Z-View.exe"
 $VerifyScript = Join-Path $ProjectRoot "verify_release_package.ps1"
 $RuntimeConfigPath = Join-Path $ProjectRoot "config.json"
 $PackageDir = Get-ChildItem -LiteralPath $ProjectRoot -Directory |

@@ -17,6 +17,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from console_utils import safe_console_print  # 2026-09-12：修复 NameError——
+# 本模块所有 [V1910DBG]/[Jobs][DBG] 诊断输出依赖此函数，但此前从未导入；
+# 遮蔽 bug 修复后 jobs 块首次真正执行即在 handler 查找处炸出 NameError，
+# 导致任务结果永远无法生成与上报（服务端任务永远停在 dispatched）。
+
 _JOB_HANDLERS: dict[str, Callable[[dict], Any]] = {}
 
 # V1.9.x deferred 结果：长任务 handler 自行启动线程，完成后推送结果，

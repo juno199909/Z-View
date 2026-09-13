@@ -165,6 +165,7 @@ def _heartbeat_loop():
                 "agent_version": AGENT_VERSION,
             }
             # P0-06 + V1.7.0：升级状态随心跳上报 —— 进行中报实时阶段，空闲报最近终态
+            last_upgrade_state = None  # 防止 in_progress 分支跳过赋值后下方引用 NameError
             if _UPGRADE_STATE.get("in_progress"):
                 payload["agent_upgrade_state"] = {
                     "stage": _UPGRADE_STATE.get("stage") or "RUNNING",
