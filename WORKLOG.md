@@ -2584,3 +2584,43 @@
   （1.9.10 诊断版已部署，DBG 会打印 body keys/jobs 数量/handler 查找/执行每步）；
   或 1.9.11 诊断构建（zvagent/heartbeat.py jobs 块每步 print）到终端定位。
 
+
+## [2026-09-12] 任务通道 Agent 端执行问题根治（双重根因 + 1.9.12 全线闭环）
+
+- Where things stand
+  通用任务通道全线打通 ✅：服务端下发 → Agent 执行 → 结果回传 → 状态落库 →
+  重试回收补执行，全部环节实测闭环。agent_jobs 存量清零（4/4 succeeded），
+  两台终端心跳正常，2213 已随升级管道自动升到 1.9.12（UPG-1.9.12 COMMITTED，
+  含 Authenticode 签名校验），XXH-XXX 手动灰度 1.9.12。
+
+- 双重根因（9/11 终报遗留问题的最终答案）
+  ① cmdb_agent_core.py 本地遗留 def _heartbeat_loop 遮蔽了
+     from zvagent.heartbeat import 的正本（V1.8.2 重构未删净）——运行时永远走
+     无 jobs 块的旧副本，body["jobs"] 被静默忽略（服务端 dispatched、终端零痕迹、
+     PYZ 验证通过三方矛盾的来源）。
+  ② zvagent/jobs.py 使用 safe_console_print 但从未导入——遮蔽修复后 jobs 块
+     首次真正执行，即在 execute_pending_jobs 的 handler 查找打印处 NameError，
+     结果永远无法生成（worker 日志实锤：jobs dispatch EXCEPTION: NameError）。
+  教训：上一轮 pyflakes 只查了 heartbeat/core 两个文件，漏了 jobs.py；
+  shadowing 类事故必须整包静态检查。
+
+- 本轮改动
+  ① cmdb_agent_core.py：全量清理 8 处 shadowing（_heartbeat_loop + 7 个同名
+     重复函数，逐个与 zvagent 正本 diff 确认一致后删除），并加注释立规：
+     本文件对 zvagent 只做 re-export，禁止再定义同名函数。
+  ② zvagent/jobs.py：补 from console_utils import safe_console_print。
+  ③ zvagent/heartbeat.py：last_upgrade_state 预置 None（升级进行中分支的
+     潜在 NameError）。
+  ④ build_agent.ps1：$ExePath 修正为 onedir 布局 dist\\Z-View\\Z-View.exe。
+  ⑤ 1.9.12 构建（隔离构建根 --clean）→ 签名（Valid）→ package_agent.py 打包
+     → 发布 agent_upgrade/1.9.12 + manifest（sha256/size）→ assets-api 重启加载。
+
+- 验证结果（实测）
+  - E2E：JOB-WUDIAG-28-E2E2 14:11:28 dispatched → 14:12:08 succeeded（40s 全链路，
+    完整 WU 诊断数据落库）
+  - 存量收敛：E2E1 / 28-06 / 2213-06 全部经重试回收补执行 → succeeded
+  - 升级管道：2213 从 1.9.10 收到指令 → 下载 → 签名校验 → COMMITTED（3 分钟）
+  - agent_jobs 无 pending/dispatched 存量；双终端心跳持续
+  - 诊断手段备注：print 到重定向文件是块缓冲（8KB 才落盘）， Select-String 对
+    混合编码日志会漏检——用字节级检索（bytes.count）才可靠；行为验证（任务
+    状态流转）比日志标记更权威。
