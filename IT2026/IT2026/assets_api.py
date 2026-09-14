@@ -1126,8 +1126,9 @@ DATA_RETENTION_DAYS = {
     "remote_sessions": 90,
     "usb_events": 180,
     # V1.9.21 全库体检补充：两张最大表此前不在留存策略内
-    # agent_heartbeat 33 万行（66% 超 30 天）、asset_changes 26 万行（审计 180 天）
-    "agent_heartbeat": 30,
+    # agent_heartbeat 心跳明细 15 天（用户决策 2026-09-14：无需留 30 天），
+    # asset_changes 26 万行（审计 180 天）
+    "agent_heartbeat": 15,
     "asset_changes": 180,
 }
 # 分批删除：首次清理 20+ 万行时避免单事务锁表/回滚段膨胀
