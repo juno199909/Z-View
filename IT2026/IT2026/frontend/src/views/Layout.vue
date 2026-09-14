@@ -40,7 +40,6 @@
             <el-menu-item index="/terminal/overview" class="zv-menu-item">终端概览</el-menu-item>
             <el-menu-item index="/asset/list" class="zv-menu-item">终端列表</el-menu-item>
             <el-menu-item index="/asset/group" class="zv-menu-item">终端分组</el-menu-item>
-            <el-menu-item index="/discovery" class="zv-menu-item">终端发现</el-menu-item>
             <el-menu-item index="/terminal/software-center" class="zv-menu-item">软件管理</el-menu-item>
             <el-menu-item index="/terminal/agent-upgrade" class="zv-menu-item">Agent升级</el-menu-item>
             <el-menu-item index="/terminal/agent-deploy" class="zv-menu-item">终端部署</el-menu-item>
