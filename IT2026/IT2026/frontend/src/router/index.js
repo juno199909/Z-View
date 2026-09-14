@@ -81,6 +81,12 @@ const routes = [
         meta: { title: '操作日志' }
       },
       {
+        path: '/log/retention',
+        name: 'LogRetention',
+        component: () => import('@/views/log/RetentionConfig.vue'),
+        meta: { title: '日志配置' }
+      },
+      {
         path: '/system/users',
         name: 'SystemUsers',
         component: () => import('@/views/system/Users.vue'),

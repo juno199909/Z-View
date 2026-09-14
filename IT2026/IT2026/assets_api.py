@@ -158,6 +158,7 @@ from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus
 from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
+from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
 from zvplatform.routers.groups import router as groups_platform_router
 from zvplatform.routers.agent_policy import router as agent_policy_router
@@ -1120,19 +1121,9 @@ def ensure_disk_guard_worker_started():
 # 数据保留策略（审计 R11）：每日清理过期日志/事件/会话/心跳
 # ============================================================
 
-DATA_RETENTION_DAYS = {
-    "system_activity_logs": 180,
-    "security_policy_exec_results": 180,
-    "remote_sessions": 90,
-    "usb_events": 180,
-    # V1.9.21 全库体检补充：两张最大表此前不在留存策略内
-    # agent_heartbeat 心跳明细 15 天（用户决策 2026-09-14：无需留 30 天），
-    # asset_changes 26 万行（审计 180 天）
-    "agent_heartbeat": 15,
-    "asset_changes": 180,
-}
-# 分批删除：首次清理 20+ 万行时避免单事务锁表/回滚段膨胀
-RETENTION_DELETE_BATCH = 20000
+# V1.9.23：日志留存策略迁移至 zvplatform/routers/log_retention.py（监控中心·日志配置）——
+# 受管表注册表 / 默认天数 / system_config 持久化 / 立即清理均由该模块提供；
+# 本文件的 worker 与清理入口仅做委托，天数以 system_config 配置为准。
 RETENTION_CHECK_INTERVAL_SECONDS = 6 * 3600  # 每 6 小时检查一次
 DATA_RETENTION_THREAD = None
 DATA_RETENTION_STARTED = False
@@ -1140,58 +1131,20 @@ DATA_RETENTION_LOCK = threading.Lock()
 
 
 def run_data_retention_cleanup() -> dict:
-    """按保留天数清理过期数据，返回各表删除行数。"""
-    conn = get_db_connection()
-    if not conn:
-        return {"error": "db_unavailable"}
-    cursor = None
-    deleted = {}
+    """按留存配置清理过期数据（委托 log_retention 模块，返回各表删除行数）。"""
     try:
-        cursor = conn.cursor()
-        for table, days in DATA_RETENTION_DAYS.items():
-            if table in ("usb_events",):
-                time_col = "occurred_at"
-            elif table == "security_policy_exec_results":
-                time_col = "executed_at"
-            elif table == "remote_sessions":
-                time_col = "disconnected_at"
-            elif table == "agent_heartbeat":
-                time_col = "heartbeat_time"
-            elif table == "asset_changes":
-                time_col = "changed_at"
-            else:
-                time_col = "created_at"
-            try:
-                # 分批删除：单批 RETENTION_DELETE_BATCH，循环直至删净
-                table_deleted = 0
-                while True:
-                    cursor.execute(
-                        f"DELETE FROM {table} WHERE {time_col} < DATE_SUB(NOW(), INTERVAL %s DAY) LIMIT {RETENTION_DELETE_BATCH}",
-                        (days,),
-                    )
-                    batch = cursor.rowcount
-                    table_deleted += batch
-                    if batch < RETENTION_DELETE_BATCH:
-                        break
-                conn.commit()
-                deleted[table] = table_deleted
-            except Exception as exc:
-                deleted[table] = f"error: {exc}"
-        conn.commit()
+        from zvplatform.routers.log_retention import run_retention_cleanup
+    except Exception as exc:
+        safe_console_print(f"[DataRetention] log_retention module unavailable: {exc}")
+        return {"error": str(exc)}
+    try:
+        deleted = run_retention_cleanup()
         if any(isinstance(v, int) and v > 0 for v in deleted.values()):
             safe_console_print(f"[DataRetention] cleaned: {deleted}")
         return deleted
     except Exception as exc:
         safe_console_print(f"[DataRetention] error: {exc}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         return {"error": str(exc)}
-    finally:
-        if cursor:
-            cursor.close()
-        conn.close()
 
 
 def data_retention_loop():
@@ -1199,7 +1152,7 @@ def data_retention_loop():
     worker_health.register("data-retention", "数据保留清理 + 磁盘缓存清理（6h）")
     safe_console_print(
         f"[DataRetention] Worker started; interval={RETENTION_CHECK_INTERVAL_SECONDS}s; "
-        f"policy={DATA_RETENTION_DAYS}"
+        f"policy=system_config:{'monitoring.log_retention_days'}"
     )
 
     def _run_all():
@@ -3898,6 +3851,7 @@ app.include_router(groups_platform_router)  # P1-01：终端分组路由
 app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
+app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
 
 # 网络监控路由（第一阶段：实时状态 + 历史趋势）

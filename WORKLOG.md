@@ -2881,3 +2881,25 @@
   表体量约 25MB。
 - 稳态：15 天 × 双终端 ≈ 8 万行；终端扩到 50 台时 ≈ 200 万行，届时可再收紧
   至 7 天或按行数封顶。
+
+
+## [2026-09-14] 监控中心·日志配置：可视化控制各类日志留存天数（1.9.23 新功能）
+
+- Where things stand
+  监控中心菜单组新增"日志配置"页（/log/retention）：六类日志（心跳明细/
+  资产变更历史/系统操作日志/安全策略执行记录/远控会话记录/USB 事件）各自
+  可视化配置留存天数（1~3650），展示当前行数与最早数据，支持立即清理并
+  弹窗回显各表删除行数。双端已部署验证。
+
+- 实现
+  ① 后端新路由 zvplatform/routers/log_retention.py：
+     - 留存配置持久化 system_config（key=monitoring.log_retention_days，json，
+       uk_config_key upsert），未配置的表回退内置默认（15/180/180/180/90/180）；
+     - GET/PUT /api/v1/monitoring/log-retention + POST .../run（立即清理）；
+     - run_retention_cleanup 按 RETENTION_TABLE_META 的 time_col 分批删除
+       （2 万/批），assets_api 的 run_data_retention_cleanup 改为委托本模块
+       （worker 每 6h 与启动轮跑的是同一套配置化逻辑）。
+  ② 前端 api/monitoring.js + views/log/RetentionConfig.vue + 路由 /log/retention
+     + 监控中心菜单项"日志配置"。
+  验证：进程内四项（GET 现状/非法值 400/保存回读/run 清理）全过；前端构建
+  通过，路由与懒加载分块均进 dist。

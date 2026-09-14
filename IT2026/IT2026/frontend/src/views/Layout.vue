@@ -66,6 +66,7 @@
             <el-menu-item index="/incidents" class="zv-menu-item">事件列表</el-menu-item>
             <el-menu-item index="/log" class="zv-menu-item">日志总览</el-menu-item>
             <el-menu-item index="/log/operations" class="zv-menu-item">操作日志</el-menu-item>
+            <el-menu-item index="/log/retention" class="zv-menu-item">日志配置</el-menu-item>
           </el-sub-menu>
 
           <el-sub-menu index="/security" class="zv-submenu">
