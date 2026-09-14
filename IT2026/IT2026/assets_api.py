@@ -3104,8 +3104,10 @@ def get_asset_status_history(asset_id: int, limit: int = 20):
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
+
     try:
         cursor = conn.cursor(dictionary=True)
+        # 多取一行用于计算相邻心跳间隔（判断离线段），返回时剔除
         cursor.execute("""
             SELECT cpu_usage, memory_usage, disk_usage, process_count,
                    logged_users, heartbeat_time
@@ -3113,12 +3115,35 @@ def get_asset_status_history(asset_id: int, limit: int = 20):
             WHERE asset_id = %s
             ORDER BY heartbeat_time DESC
             LIMIT %s
-        """, (asset_id, limit))
+        """, (asset_id, limit + 1))
         rows = cursor.fetchall()
-        for h in rows:
-            if h.get('heartbeat_time'):
-                h['heartbeat_time'] = h['heartbeat_time'].strftime('%Y-%m-%d %H:%M:%S')
-        return {"data": rows, "total": len(rows)}
+        # V1.9.20 修复：此前不返回 status 字段，前端颜色映射 fallback 全灰。
+        # 状态推断：相邻心跳间隔 <=90s（正常 30s 心跳的 3 倍）视为连续在线；
+        # 间隔超限 = 两次心跳之间有离线时段，离线前最后一次心跳标 offline；
+        # 最旧一行视为 online（心跳成功即在线）；最新一行若距 NOW() 超 90s
+        # 也已离线。
+        if rows:
+            now_dt = datetime.now()
+            for i, h in enumerate(rows):
+                h_dt = h.get('heartbeat_time')
+                if not h_dt:
+                    h['status'] = 'online'
+                    continue
+                gap = None
+                if i + 1 < len(rows):
+                    prev_dt = rows[i + 1].get('heartbeat_time')
+                    if prev_dt:
+                        gap = (h_dt - prev_dt).total_seconds()
+                else:
+                    gap = (now_dt - h_dt).total_seconds()
+                if gap is not None and gap > 90:
+                    h['status'] = 'offline'
+                else:
+                    h['status'] = 'online'
+                if h.get('heartbeat_time'):
+                    h['heartbeat_time'] = h_dt.strftime('%Y-%m-%d %H:%M:%S')
+        out_rows = rows[:limit]
+        return {"data": out_rows, "total": len(out_rows)}
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:

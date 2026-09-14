@@ -447,7 +447,13 @@ def _network_report_loop():
 
 
 
-def trigger_immediate_report() -> dict:
+def trigger_immediate_report(payload: dict | None = None) -> dict:
+    """立即上报（硬件/系统状态快照）。
+
+    V1.9.23 修复：通用任务通道以 handler(payload) 调用 report 任务，此前函数
+    不接受参数导致每个 report 任务必然 TypeError 失败（任务通道上线以来
+    report 类型从未成功过）。payload 为任务载荷，正常触发路径传 None。
+    """
     asset_id = get_asset_id_from_server()
     if not asset_id:
         return {
@@ -474,7 +480,9 @@ def trigger_immediate_report() -> dict:
         "os_version": hardware.get("os_version") or platform.version(),
         "cpu_cores": psutil.cpu_count(logical=False) or psutil.cpu_count() or 0,
         "memory_total": system_status.get("memory_total_mb") or hardware.get("memory_total_mb") or 0,
-        "disk_total": round(disk_total),
+        # V1.9.22 修复：disk_info 的 total_mb 是 MB，此前直接求和上报被服务端按
+        # GB 语义存入 assets.disk_gb → 资产档案显示"562863 GB"。现除以 1024 转 GB。
+        "disk_total": round(disk_total / 1024, 1),
         "serial_number": hardware.get("serial_number") or "",
         "manufacturer": hardware.get("manufacturer") or "",
         "model": hardware.get("model") or "",

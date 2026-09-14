@@ -2803,3 +2803,21 @@
      agent_heartbeat.disk_info 入库与详情接口解析早已支持，只缺载荷。
   ② 前端 fallback：disk_info 为空时回退旧的综合 disk_usage 环（兼容旧版本
      Agent 数据）。
+
+
+## [2026-09-14] 状态历史灰色 + report 任务失败：三小缺陷修复（1.9.23）
+
+- Where things stand
+  ① 状态历史不再全灰：/status/history 按相邻心跳间隔推断状态（间隔>90s 的
+     离线段，离线前最后一次心跳标 offline 红色，其余 online 绿色）——此前
+     接口根本不返回 status 字段，前端颜色映射 fallback 全灰且文字为空。
+  ② failed 任务失败原因可见：job_results ingest 此前丢弃 "error" 键，failed
+     任务 result 列恒空；现 error 一并入库（GB2 的 TypeError 详情即由此捕获）。
+  ③ report 任务类型首次真正可用：handler 注册的 trigger_immediate_report()
+     不接受参数，任务通道 handler(payload) 调用必然 TypeError——签名改为
+     接受可选 payload。闭环验证：JOB-REPORT-28-GB3 succeeded，disk_gb 549GB
+     正确刷新。
+
+- 过程要点
+  error 透传修复上线当轮即暴露 report 任务的 TypeError 真因——失败详情
+  可见化是排障效率的杠杆。

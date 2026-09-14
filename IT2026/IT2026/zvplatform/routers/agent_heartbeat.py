@@ -772,10 +772,13 @@ def agent_heartbeat(data: dict, request: Request):
                 from zvplatform.routers.agent_jobs import record_job_state
                 for job_result in job_results:
                     if isinstance(job_result, dict) and job_result.get("job_id"):
+                        # 失败任务的失败原因在 "error" 键（jobs.py 约定），此前被丢弃
+                        # 导致 failed 任务 result 列恒为空、无法排障——一并入库
                         record_job_state(
                             conn, str(job_result["job_id"]),
                             str(job_result.get("state") or "succeeded"),
-                            job_result.get("result"),
+                            job_result.get("result") if job_result.get("result") is not None
+                            else job_result.get("error"),
                         )
             except Exception as jobs_exc:
                 safe_console_print(f"[Heartbeat] job_results record failed: {jobs_exc}")
