@@ -2982,3 +2982,19 @@
   理由：Agent 模式下部署链路（三件套+自注册）不经过发现；发现产出为无
   Agent 的空壳记录；任务表 0 行 + 扫描列表接口损坏数月无反馈 = 零使用。
   将来需要"未纳管设备盘点"时，加回一条菜单即可。
+
+
+## [2026-09-14] 虚标资产清理（用户指正：真实终端只有 2 台）
+
+- 更正
+  上轮清理后我报告"剩 10 台全部 installed"——实情是其中 8 台从未有过一次
+  心跳（Brain/test×3 [IP 1.1.1.1]/Juno/POLICY-PROBE[127.0.0.1]/
+  DESKTOP-T8R40KE/DESKTOP-HPD0GJ7），为 6~7 月手工创建的测试/占位记录，
+  agent_install_status 虚标 installed。真实终端自始只有 2 台。
+- 已删
+  8 台虚标资产及关联（alerts 12/batch 7/software_task_results 16/
+  asset_software 250）。assets 现仅 2 台：28 XXH-XXX、2213 DESKTOP-JEGI046
+  （均 agent 1.9.23 在线）。
+- 教训
+  agent_install_status 是意图字段不是事实字段——判断真实终端必须看心跳
+  （agent_heartbeat），不能信资产记录的自报状态。
