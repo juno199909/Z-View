@@ -60,7 +60,7 @@ const routes = [
         path: '/alert/thresholds',
         name: 'AlertThresholds',
         component: () => import('@/views/alert/ThresholdConfig.vue'),
-        meta: { title: '告警阈值' }
+        meta: { title: '告警配置' }
       },
       {
         path: '/incidents',
@@ -81,9 +81,9 @@ const routes = [
         meta: { title: '操作日志' }
       },
       {
-        path: '/log/retention',
-        name: 'LogRetention',
-        component: () => import('@/views/log/RetentionConfig.vue'),
+        path: '/log/config',
+        name: 'LogConfig',
+        component: () => import('@/views/log/ConfigCenter.vue'),
         meta: { title: '日志配置' }
       },
       {

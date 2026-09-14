@@ -2,7 +2,7 @@
   <div class="zv-page">
     <div class="zv-page-header">
       <div>
-        <h2 class="zv-page-title">告警阈值配置</h2>
+        <h2 class="zv-page-title">告警配置</h2>
         <div class="zv-page-subtitle">CPU / 内存 / 磁盘 / 健康度 / 离线判定阈值，保存后由告警评估线程（60 秒周期）自动生效；留空的项回落系统默认值</div>
       </div>
       <div class="zv-page-actions">
