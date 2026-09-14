@@ -1,11 +1,10 @@
 <template>
-  <div class="zv-page">
-    <div class="zv-page-header">
-      <div>
-        <h2 class="zv-page-title">日志留存配置</h2>
-        <div class="zv-page-subtitle">控制各类日志/记录在数据库中的保存时间，超期数据由后台每 6 小时自动清理</div>
-      </div>
-      <div class="zv-page-actions">
+  <div>
+    <div class="zv-embed-toolbar">
+      <span class="zv-embed-desc">
+        超过留存期的数据每 6 小时自动清理一次，也可点击"立即清理"即时生效；心跳明细建议不低于 7 天。
+      </span>
+      <div class="zv-embed-actions">
         <el-button :icon="Refresh" @click="loadData" :loading="loading">刷新</el-button>
         <el-button type="warning" :icon="Delete" @click="runNow" :loading="runLoading">立即清理</el-button>
         <el-button type="primary" :icon="Check" @click="save" :loading="saving">保存配置</el-button>
@@ -28,10 +27,6 @@
           <template #default="{ row }">{{ row.oldest || '暂无数据' }}</template>
         </el-table-column>
       </el-table>
-      <div class="zv-tip">
-        说明：留存天数范围 1~3650；超过留存期的数据每 6 小时自动清理一次，也可点击"立即清理"即时生效。
-        心跳明细留存过短会影响终端状态历史的可回溯范围，建议不低于 7 天。
-      </div>
     </div>
 
     <el-dialog v-model="resultVisible" title="清理结果" width="420px">
@@ -112,8 +107,15 @@ onMounted(loadData)
 </script>
 
 <style scoped>
-.zv-tip {
-  margin-top: 12px;
+.zv-embed-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.zv-embed-desc {
   font-size: 12px;
   color: #94a3b8;
   line-height: 1.8;

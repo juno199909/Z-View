@@ -33,4 +33,14 @@ const activeTab = ref('retention')
 .zv-config-tabs :deep(.el-tabs__content) {
   padding-top: 4px;
 }
+/* 嵌入的配置页去掉独立页面外壳（双重内边距/限宽），对齐页签内容 */
+.zv-config-tabs :deep(.zv-page) {
+  padding: 0;
+  max-width: none;
+  margin: 0;
+}
+/* 页签标签已表达名称，隐藏嵌入页的大标题，保留副标题与操作按钮 */
+.zv-config-tabs :deep(.zv-page-title) {
+  display: none;
+}
 </style>
