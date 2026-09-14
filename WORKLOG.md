@@ -2653,3 +2653,29 @@
 - 教训
   WU COM 编程必须显式 Download——Install 不会自动下载（部分场景除外），
   且错误会以"安装失败"的形态出现，容易误判为权限/策略问题。
+
+
+## [2026-09-14] GPO 部署包 onedir 组装完成（deploy.bat versions 布局改造 + 全新装机演练）
+
+- Where things stand
+  GPO 批量部署链路修复并实测 ✅：完整构建（含验收 0 失败）→ 本机删除服务
+  模拟全新终端 → deploy.bat --silent 全新部署 → 服务以 current\Z-View.exe
+  重建 AUTO_START Running → junction → versions\1.9.13 → 心跳 40s 内恢复。
+
+- 本轮改动（三文件协同）
+  ① GPO部署包/deploy.bat：onedir 布局安装——precheck 校验 _internal/version.txt；
+     copy 阶段 exe+version.txt 装入 versions\<ver>\、_internal 用 robocopy
+     （exit<8 为成功）、updater 随包；current junction 无条件 rmdir 后重建
+     （悬空 junction 的 if exist 判定不可靠，沙箱实测抓到）；服务/防火墙改指
+     current\Z-View.exe（与 Agent 自升级/updater 布局一致）。
+  ② build_agent.ps1：同步段补 _internal 树 + version.txt（从 zvagent/__init__
+     解析版本）+ updater\ZViewUpdater.exe（缺失即构建失败）。
+  ③ verify_release_package.ps1：新增 version.txt/_internal 完整性（文件数下限
+     + python3*.dll glob）/updater/版本一致性（version.txt vs zvagent 声明）校验；
+     python313.dll 硬编码改为 glob（实际构建是 3.12，硬编码会误报）。
+  ④ 模板中 39MB 陈旧 onefile Z-View.exe 从 git 移除。
+
+- 教训
+  junction 的 if exist 判定跟随目标（悬空时不可靠）——刷新 junction 必须
+  无条件 rmdir 再重建；沙箱幂等重跑 + 悬空恢复两个场景值得成为部署脚本
+  改动的标准测试项。

@@ -120,6 +120,22 @@ Write-Host "==> Sync deployment package"
 $ReleasePackageDir = Join-Path $DistDir "GPO部署包"
 Copy-Item -LiteralPath $PackageDir -Destination $ReleasePackageDir -Recurse -Force
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $ReleasePackageDir "Z-View.exe") -Force
+# V1.9.13 onedir 布局：发布包根 = Z-View.exe + _internal\ + updater\ + version.txt
+# （deploy.bat 依赖 version.txt 解析版本号并安装到 versions\<ver>\ + current junction）
+Copy-Item -LiteralPath (Join-Path $DistDir "Z-View\_internal") -Destination (Join-Path $ReleasePackageDir "_internal") -Recurse -Force
+$InitSource = Get-Content -LiteralPath (Join-Path $ProjectRoot "zvagent\__init__.py") -Raw
+if ($InitSource -notmatch '__version__\s*=\s*"([0-9][^"]*)"') {
+    throw "Unable to resolve agent version from zvagent/__init__.py"
+}
+$AgentVersion = $Matches[1]
+Set-Content -LiteralPath (Join-Path $ReleasePackageDir "version.txt") -Value $AgentVersion -Encoding Ascii
+Write-Host ("==> Agent version: {0}" -f $AgentVersion)
+$UpdaterSource = Join-Path $ProjectRoot "dist_updater\ZViewUpdater.exe"
+if (-not (Test-Path -LiteralPath $UpdaterSource -PathType Leaf)) {
+    throw "Updater build missing: $UpdaterSource (python -m PyInstaller --onefile --name ZViewUpdater --paths . updater/updater.py --distpath dist_updater --workpath build_updater_work --specpath build_updater_work)"
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $ReleasePackageDir "updater") | Out-Null
+Copy-Item -LiteralPath $UpdaterSource -Destination (Join-Path $ReleasePackageDir "updater\ZViewUpdater.exe") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $DistDir "config.json") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $ReleasePackageDir "config.json") -Force
 

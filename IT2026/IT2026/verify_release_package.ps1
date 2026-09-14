@@ -73,6 +73,10 @@ foreach ($Entry in $ProjectFiles.GetEnumerator()) {
 
 $PackageFiles = [ordered]@{
     "Agent 可执行文件" = "Z-View.exe"
+    "Agent 版本清单" = "version.txt"
+    "运行时基础库" = "_internal\base_library.zip"
+    "运行时配置" = "_internal\config.json"
+    "Updater" = "updater\ZViewUpdater.exe"
     "部署配置" = "config.json"
     "交互安装脚本" = "install.bat"
     "GPO 部署脚本" = "deploy.bat"
@@ -86,6 +90,41 @@ $PackageFiles = [ordered]@{
 }
 foreach ($Entry in $PackageFiles.GetEnumerator()) {
     Test-RequiredFile -Path (Join-Path $PackageDir $Entry.Value) -Description $Entry.Key | Out-Null
+}
+
+# 中文注释：onedir 布局核心校验——_internal 必须是真实目录（deploy.bat 按
+# versions\<ver>\ + current junction 安装，缺 _internal 的单文件包无法运行）。
+$InternalDir = Join-Path $PackageDir "_internal"
+if (-not (Test-Path -LiteralPath $InternalDir -PathType Container)) {
+    Add-VerificationError "缺少 onedir 运行时目录: $InternalDir"
+} else {
+    $InternalFileCount = (Get-ChildItem -LiteralPath $InternalDir -Recurse -File | Measure-Object).Count
+    if ($InternalFileCount -lt 100) {
+        Add-VerificationError ("_internal 目录文件数异常（{0} < 100），疑似不完整拷贝。" -f $InternalFileCount)
+    } else {
+        Write-Host ("[PASS] onedir 运行时目录完整: _internal ({0:N0} 个文件)" -f $InternalFileCount)
+    }
+    $PythonDll = Get-ChildItem -LiteralPath $InternalDir -File -Filter "python3*.dll" | Select-Object -First 1
+    if ($PythonDll) {
+        Write-Host ("[PASS] 运行时入口 DLL: {0}" -f $PythonDll.Name)
+    } else {
+        Add-VerificationError "_internal 缺少 python3*.dll（运行时入口 DLL）"
+    }
+}
+
+# 中文注释：version.txt 必须与 zvagent/__init__.py 声明的版本一致，防串包。
+$VersionTxtPath = Join-Path $PackageDir "version.txt"
+$InitPath = Join-Path $ProjectRoot "zvagent\__init__.py"
+if ((Test-Path -LiteralPath $VersionTxtPath -PathType Leaf) -and (Test-Path -LiteralPath $InitPath -PathType Leaf)) {
+    $PackagedVersion = (Get-Content -LiteralPath $VersionTxtPath -Raw).Trim()
+    $InitSource = Get-Content -LiteralPath $InitPath -Raw
+    if ($InitSource -match '__version__\s*=\s*"([0-9][^"]*)"') {
+        if ($PackagedVersion -ne $Matches[1]) {
+            Add-VerificationError ("version.txt ({0}) 与 zvagent 声明版本 ({1}) 不一致。" -f $PackagedVersion, $Matches[1])
+        } else {
+            Write-Host ("[PASS] 版本一致: {0}" -f $PackagedVersion)
+        }
+    }
 }
 
 # 中文注释：配置只校验必需结构，不输出 token，避免验收日志泄露凭据。

@@ -45,10 +45,24 @@ if not exist "%~dp0%EXE_NAME%" (
     call :log_error "missing file: %~dp0%EXE_NAME%"
     goto :deploy_failed
 )
+if not exist "%~dp0_internal" (
+    call :log_error "missing dir: %~dp0_internal (onedir 布局必须随包分发)"
+    goto :deploy_failed
+)
+if not exist "%~dp0version.txt" (
+    call :log_error "missing file: %~dp0version.txt"
+    goto :deploy_failed
+)
 if not exist "%~dp0config.json" (
     call :log_error "missing file: %~dp0config.json"
     goto :deploy_failed
 )
+set /p AGENT_VERSION=<"%~dp0version.txt"
+if "%AGENT_VERSION%"=="" (
+    call :log_error "version.txt is empty"
+    goto :deploy_failed
+)
+call :log_info "deploying agent version=%AGENT_VERSION% (onedir layout)"
 
 set "CURRENT_STAGE=prepare"
 call :ensure_directory "%INSTALL_DIR%"
@@ -65,12 +79,47 @@ call :cleanup_stale_runtime_state
 call :cleanup_invalid_port_9000_owners
 
 set "CURRENT_STAGE=copy"
+rem V1.9.13 onedir 布局：exe + _internal 装到 versions\<ver>\，current junction 指向
+rem 该目录；服务/防火墙引用 current\Z-View.exe（与 Agent 自升级/updater 布局一致）。
+set "VERSION_DIR=%INSTALL_DIR%\versions\%AGENT_VERSION%"
+call :ensure_directory "%INSTALL_DIR%\versions"
+if errorlevel 1 goto :deploy_failed
+call :ensure_directory "%VERSION_DIR%"
+if errorlevel 1 goto :deploy_failed
 call :log_file_fingerprint "source exe before copy" "%~dp0%EXE_NAME%"
-call :copy_with_verify "%~dp0%EXE_NAME%" "%INSTALL_DIR%\%EXE_NAME%"
+call :copy_with_verify "%~dp0%EXE_NAME%" "%VERSION_DIR%\%EXE_NAME%"
+if errorlevel 1 goto :deploy_failed
+call :copy_with_verify "%~dp0version.txt" "%VERSION_DIR%\version.txt"
 if errorlevel 1 goto :deploy_failed
 call :copy_with_verify "%~dp0config.json" "%INSTALL_DIR%\config.json"
 if errorlevel 1 goto :deploy_failed
-call :log_file_fingerprint "installed exe after copy" "%INSTALL_DIR%\%EXE_NAME%"
+rem _internal 目录树（约 700 个文件）用 robocopy：自带重试，exit code < 8 均为成功
+robocopy "%~dp0_internal" "%VERSION_DIR%\_internal" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:2 >nul 2>&1
+if not errorlevel 8 (
+    call :log_info "copied _internal tree to %VERSION_DIR%\_internal"
+) else (
+    call :log_error "robocopy failed for _internal (exit %errorlevel%)"
+    goto :deploy_failed
+)
+if exist "%~dp0updater\ZViewUpdater.exe" (
+    call :ensure_directory "%VERSION_DIR%\updater"
+    call :copy_with_verify "%~dp0updater\ZViewUpdater.exe" "%VERSION_DIR%\updater\ZViewUpdater.exe"
+    if errorlevel 1 goto :deploy_failed
+)
+rem 刷新 current junction（rmdir 只删链接本身，不动目标目录；对悬空/不存在的
+rem junction 同样安全——不能先 if exist 判断，悬空链接的 exist 判定不可靠）
+rmdir "%INSTALL_DIR%\current" >nul 2>&1
+if exist "%INSTALL_DIR%\current\" (
+    call :log_error "current exists and is not a junction; remove manually: %INSTALL_DIR%\current"
+    goto :deploy_failed
+)
+mklink /J "%INSTALL_DIR%\current" "%VERSION_DIR%" >nul 2>&1
+if errorlevel 1 (
+    call :log_error "failed to create current junction -> %VERSION_DIR%"
+    goto :deploy_failed
+)
+call :log_info "current junction -> versions\%AGENT_VERSION%"
+call :log_file_fingerprint "installed exe after copy" "%VERSION_DIR%\%EXE_NAME%"
 call :sync_virtual_display_payloads
 call :cleanup_legacy_binaries
 
@@ -317,7 +366,7 @@ exit /b 0
 
 :create_or_update_service
 call :log_info "creating Windows service"
-sc create "%SERVICE_NAME%" binPath= "\"%INSTALL_DIR%\%EXE_NAME%\" --service-host" start= auto obj= LocalSystem DisplayName= "%SERVICE_DISPLAY_NAME%" >nul 2>&1
+sc create "%SERVICE_NAME%" binPath= "\"%INSTALL_DIR%\current\%EXE_NAME%\" --service-host" start= auto obj= LocalSystem DisplayName= "%SERVICE_DISPLAY_NAME%" >nul 2>&1
 if errorlevel 1 (
     call :log_error "failed to create Windows service"
     exit /b 1
@@ -336,7 +385,7 @@ exit /b 0
 :configure_firewall
 netsh advfirewall firewall delete rule name="CMDB Agent" >nul 2>&1
 netsh advfirewall firewall delete rule name="Z-View Agent" >nul 2>&1
-netsh advfirewall firewall add rule name="Z-View Agent" dir=in action=allow program="%INSTALL_DIR%\%EXE_NAME%" enable=yes profile=any >nul 2>&1
+netsh advfirewall firewall add rule name="Z-View Agent" dir=in action=allow program="%INSTALL_DIR%\current\%EXE_NAME%" enable=yes profile=any >nul 2>&1
 if errorlevel 1 (
     call :log_warn "firewall rule creation failed"
     exit /b 0
