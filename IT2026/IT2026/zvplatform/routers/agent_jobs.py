@@ -22,12 +22,16 @@ from zvplatform.repositories.log_repository import insert_system_activity_log
 router = APIRouter(tags=["agent-jobs"])
 
 _TABLE = "agent_jobs"
-_VALID_STATES = ("pending", "dispatched", "succeeded", "failed")
+# V1.9.13：running 为合法中间态（async 任务如 wu_install 执行中），终态不可回退
+_VALID_STATES = ("pending", "dispatched", "running", "succeeded", "failed")
 # V1.9.x 安全边界：服务端任务类型白名单（与 Agent 端 handler 注册表对应）
 _KNOWN_JOB_TYPES = ("command", "report", "wu_diag", "wu_install", "wu_collect")
 _MAX_PENDING_PER_ASSET = 10
 _JOB_EXPIRY_HOURS = 24  # pending 超时未下发即过期（陈旧任务不应执行）
 _REDISPATCH_MINUTES = 30  # dispatched 超时无结果 → 回到 pending 重试
+# running 任务回收窗口：Agent 端 wu_install 超时 3600s，取 2h 兜底
+# （Agent 死在执行中时任务不至永久卡 running；正常运行的长任务不受影响）
+_RUNNING_RECLAIM_MINUTES = 120
 
 
 def ensure_agent_jobs_table(conn) -> None:
@@ -130,6 +134,14 @@ def fetch_pending_jobs(conn, asset_id: int, limit: int = 5) -> list[dict]:
             .replace("%s", "%s"),
             (),
         )
+        # V1.9.13：running 任务超 2h 无终态 → 回到 pending（Agent 执行中死亡的兜底；
+        # 正常长任务不受影响——Agent 端安装超时 3600s < 2h）
+        cursor.execute(
+            f"UPDATE {_TABLE} SET state = 'pending', updated_at = NOW() "
+            f"WHERE state = 'running' "
+            f"AND updated_at < NOW() - INTERVAL {_RUNNING_RECLAIM_MINUTES} MINUTE",
+            (),
+        )
         cursor.execute(
             f"UPDATE {_TABLE} SET state = 'expired' "
             f"WHERE asset_id = %s AND state = 'pending' "
@@ -169,8 +181,14 @@ def fetch_pending_jobs(conn, asset_id: int, limit: int = 5) -> list[dict]:
 
 
 @router.get("/api/v1/console/agent-jobs")
-def list_agent_jobs(request: Request, asset_id: Optional[int] = None, limit: int = 50):
-    """任务列表（admin）。"""
+def list_agent_jobs(
+    request: Request,
+    asset_id: Optional[int] = None,
+    state: Optional[str] = None,
+    job_type: Optional[str] = None,
+    limit: int = 50,
+):
+    """任务列表（admin）。可按 asset_id / state / job_type 过滤。"""
     require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
     conn = create_connection()
     if not conn:
@@ -179,13 +197,23 @@ def list_agent_jobs(request: Request, asset_id: Optional[int] = None, limit: int
         ensure_agent_jobs_table(conn)
         cursor = conn.cursor(dictionary=True)
         try:
+            where, params = [], []
             if asset_id:
-                cursor.execute(
-                    f"SELECT * FROM {_TABLE} WHERE asset_id = %s ORDER BY id DESC LIMIT %s",
-                    (asset_id, min(limit, 200)),
-                )
-            else:
-                cursor.execute(f"SELECT * FROM {_TABLE} ORDER BY id DESC LIMIT %s", (min(limit, 200),))
+                where.append("j.asset_id = %s")
+                params.append(asset_id)
+            if state:
+                where.append("j.state = %s")
+                params.append(state)
+            if job_type:
+                where.append("j.job_type = %s")
+                params.append(job_type)
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            cursor.execute(
+                f"SELECT j.*, a.hostname FROM {_TABLE} j "
+                f"LEFT JOIN assets a ON a.id = j.asset_id {where_sql} "
+                f"ORDER BY j.id DESC LIMIT %s",
+                (*params, min(limit, 200)),
+            )
             rows = cursor.fetchall() or []
             return {"jobs": rows, "total": len(rows)}
         finally:

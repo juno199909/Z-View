@@ -115,6 +115,12 @@ const routes = [
         component: () => import('@/views/terminal/PatchManagement.vue'),
         meta: { title: '补丁管理' }
       },
+      {
+        path: '/jobs',
+        name: 'JobCenter',
+        component: () => import('@/views/terminal/JobCenter.vue'),
+        meta: { title: '任务中心' }
+      },
           {
             path: 'software-center',
             name: 'SoftwareCenter',
