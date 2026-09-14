@@ -2758,3 +2758,30 @@
   ① 嵌套层级漂移是编辑事故高发区——分发/continue 类结构性代码改动后必须
      对照原版缩进（git show <基线commit>）核验。
   ② 埋点上线当轮就抓到一个存量结构缺陷——观测投入直接转化为缺陷发现。
+
+
+## [2026-09-14] 已安装软件大小不显示：三层键名/字段错位修复
+
+- Where things stand
+  终端详情"已安装软件"大小列恢复显示 ✅（asset 28 全量重报后 94/125 条有值，
+  如 Edge 4013MB / Acrobat 2734MB；其余为注册表无 EstimatedSize 的软件）。
+
+- 三层错位（全链路诊断）
+  ① API 层：/software/all 只 SELECT s.size（从未被写入，全 NULL），
+     前端读 row.size_mb → 恒 undefined → '-'。
+  ② 服务端 handler：software.get('size') 期望带单位字符串（"1.5 MB"），
+     而 Agent payload 把数值塞进 "size" 键（zvagent/heartbeat.py:365 历史键名），
+     无单位 → 解析分支全不命中 → size_mb=0。
+  ③ 采集端（zvagent/collectors/software.py）本就正确产出 size_mb（EstimatedSize/1024）。
+
+- 修复
+  ① /software/all SELECT 补 s.size_mb（assets_api.py:3605）。
+  ② handler 三级兼容：size_mb 数值 → size 数值 → size 带单位字符串
+     （agent_heartbeat.py:604，兼容新旧 Agent）。
+  ③ Agent payload 键名改正 size→size_mb（zvagent/heartbeat.py:365，随下次构建）。
+  验证：asset 28 重启触发全量重报，94/125 条回填真实大小。
+
+- 教训
+  键名错位链（采集 size_mb → payload size → handler size → API size → 前端 size_mb）
+  跨越四层，任何一环的类型/键名不匹配都被"默认值 0/None"静默吞掉——
+  这类断链要沿数据流逐层验证真实值，而不是只看代码"看起来对"。

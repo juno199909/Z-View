@@ -603,21 +603,31 @@ def agent_heartbeat(data: dict, request: Request):
 
             for software in software_list:
                 try:
-                    # 处理size字段：将字符串"1.5 MB"转换为数字
-                    size_str = software.get('size', '')
-                    size_mb = 0
-                    if size_str:
-                        try:
-                            if 'KB' in size_str:
-                                size_mb = float(size_str.replace('KB', '').strip()) / 1024
-                            elif 'MB' in size_str:
-                                size_mb = float(size_str.replace('MB', '').strip())
-                            elif 'GB' in size_str:
-                                size_mb = float(size_str.replace('GB', '').strip()) * 1024
-                            else:
-                                size_mb = 0
-                        except:
-                            size_mb = 0
+                    # 处理size字段：
+                    # - Agent 采集端（zvagent/collectors/software.py）产出 "size_mb" 数值
+                    # - 但上报 payload（zvagent/heartbeat.py:365）把数值塞进 "size" 键
+                    #   （历史遗留键名）——因此这里依次兼容：size_mb 数值 → size 数值 →
+                    #   size 带单位字符串（"1.5 MB"/"512 KB"/"2 GB"，最旧格式）
+                    size_mb = 0.0
+                    raw = software.get('size_mb')
+                    if raw is None:
+                        raw = software.get('size')
+                    if raw is not None:
+                        if isinstance(raw, (int, float)):
+                            size_mb = float(raw) or 0.0
+                        else:
+                            size_str = str(raw)
+                            try:
+                                if 'GB' in size_str:
+                                    size_mb = float(size_str.replace('GB', '').strip()) * 1024
+                                elif 'MB' in size_str:
+                                    size_mb = float(size_str.replace('MB', '').strip())
+                                elif 'KB' in size_str:
+                                    size_mb = float(size_str.replace('KB', '').strip()) / 1024
+                                else:
+                                    size_mb = float(size_str) or 0.0
+                            except (ValueError, TypeError):
+                                size_mb = 0.0
 
                     # 限制字段长度，避免数据库错误
                     software_name = (software.get('name') or '')[:255]

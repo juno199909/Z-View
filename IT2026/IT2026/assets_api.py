@@ -3610,6 +3610,7 @@ def get_all_software(asset_id: Optional[int] = Query(default=None)):
                 s.vendor,
                 s.install_date,
                 s.size,
+                s.size_mb,
                 a.id as asset_id,
                 a.hostname,
                 a.ip_address

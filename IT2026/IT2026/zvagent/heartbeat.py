@@ -362,7 +362,9 @@ def _software_report_loop():
                         "version": item.get("version"),
                         "vendor": item.get("publisher") or item.get("vendor"),
                         "install_date": item.get("install_date"),
-                        "size": item.get("size_mb") or item.get("size"),
+                        # V1.9.21：键名修正——此前数值塞进 "size" 键（历史遗留），服务端
+                        # 需做数值/字符串双兼容解析；现直接用语义正确的 "size_mb"
+                        "size_mb": item.get("size_mb") or item.get("size"),
                     }
                     for item in software
                     if item.get("name")
