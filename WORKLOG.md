@@ -3025,3 +3025,18 @@
   ② 服务端同步强制：单删 confirm_text Query 参数、批删 body confirm_text
      字段，不等于"确认删除"返回 400——防绕过前端直接调 API。
 - 验证：缺参/错词均 400、正确文本硬删成功（进程内四项全过）；前端构建通过。
+
+
+## [2026-09-14] 批量操作 500 修复：ensure_batch_tables 调用点指向错误的模块
+
+- 根因
+  批量历史（batch.py:195）与批量执行（batch.py:92）两处 lazy import 从
+  zvplatform.services.batch_service 导入 ensure_batch_tables——该函数从未
+  存在于 batch_service（WORKLOG 旧记录：迁移切割中定义丢失，当时修复只是
+  把函数重写进了 batch.py 本地 27 行，两处调用点的错误 import 没有一并
+  修正）→ ImportError → 批量历史/批量执行双双 500。
+- 修复
+  两处调用点改为直接调用本文件内的 ensure_batch_tables(conn)（幂等建表，
+  27 行定义），删除错误的 lazy import。
+- 验证
+  assets-api 重启后进程内直调 get_batch_history：返回 12 条历史（此前 500）。

@@ -89,8 +89,7 @@ def execute_batch(payload: BatchExecuteRequest, request: Request):
 
     cursor = None
     try:
-        from zvplatform.services.batch_service import ensure_batch_tables as _ebt
-        _ebt(conn)
+        ensure_batch_tables(conn)
 
         command_text = build_batch_command(operation_type, parameters)
         parameters_text = build_batch_parameters_text(operation_type, parameters)
@@ -192,8 +191,7 @@ def get_batch_history(
 
     cursor = None
     try:
-        from zvplatform.services.batch_service import ensure_batch_tables as _ebt
-        _ebt(conn)
+        ensure_batch_tables(conn)
         cursor = conn.cursor(dictionary=True)
 
         where = []
