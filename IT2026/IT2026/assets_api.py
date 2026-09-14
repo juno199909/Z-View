@@ -2817,81 +2817,168 @@ def update_asset(asset_id: int, data: dict, request: Request):
         conn.close()
 
 
+# 硬删除时随资产一并清除的关联数据表（V1.9.23 用户决策：手动删除 = 彻底删除）。
+# system_activity_logs 为全局审计，不在清除范围内；删除动作本身写入该表。
+ASSET_HARD_DELETE_TABLES = (
+    "agent_credentials", "agent_heartbeat", "agent_jobs", "agent_patches",
+    "agent_tokens", "agent_upgrade_history", "alert_records", "alerts",
+    "asset_changes", "asset_software", "batch_operation_results",
+    "file_anomaly_events", "incidents", "network_interfaces",
+    "network_quality_stats", "network_state", "network_traffic_stats",
+    "process_launch_logs", "raw_data", "remote_sessions", "security_events",
+    "security_policy_exec_results", "software_compliance_results",
+    "software_policy_logs", "software_task_results", "usb_devices",
+    "usb_events", "file_protect_baselines",
+)
+
+
+def _hard_delete_asset_data(cursor, asset_id: int) -> int:
+    """硬删除资产的全部关联数据，返回删除总行数。单表失败不影响其余表。"""
+    total = 0
+    for table in ASSET_HARD_DELETE_TABLES:
+        try:
+            cursor.execute(f"DELETE FROM {table} WHERE asset_id = %s", (asset_id,))
+            total += max(cursor.rowcount, 0)
+        except Exception as exc:
+            safe_console_print(f"[Asset] hard-delete {table} asset_id={asset_id} failed: {exc}")
+    return total
+
+
+def _audit_asset_delete(cursor, asset_id: int, hostname, ip_address, operator, message: str) -> None:
+    """资产删除写入操作日志（P0 审计：删除为高风险操作，须可追溯）。"""
+    try:
+        payload = SystemActivityLogCreate(
+            source_type="console",
+            module="assets",
+            category="资产管理",
+            action="delete",
+            level="warning",
+            asset_id=asset_id,
+            hostname=hostname,
+            ip_address=ip_address,
+            operator_name=operator,
+            title="资产删除",
+            message=message,
+        )
+        insert_system_activity_log(cursor, payload)
+    except Exception as exc:
+        safe_console_print(f"[Asset] audit log failed asset_id={asset_id}: {exc}")
+
+
 @app.delete("/api/v1/assets/{asset_id}")
-def delete_asset(asset_id: int):
-    """删除资产（软删除）"""
+def delete_asset(asset_id: int, request: Request):
+    """删除资产（硬删除，V1.9.23 用户决策）。
+
+    资产行与全部关联数据（心跳/软件清单/告警/事件/远控会话/设备凭据等）
+    一并物理删除，删除动作写入操作日志（审计）。终端若仍装有 Agent，
+    下个心跳将按新资产自动重建。
+    """
+    operator = None
+    try:
+        operator = get_request_username(request)
+    except Exception:
+        operator = None
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
+    cursor = None
     try:
-        cursor = conn.cursor()
-
-        # 检查资产是否存在
-        cursor.execute("SELECT id FROM assets WHERE id = %s AND deleted_at IS NULL", (asset_id,))
-        if not cursor.fetchone():
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, hostname, ip_address FROM assets WHERE id = %s", (asset_id,))
+        asset = cursor.fetchone()
+        if not asset:
             raise HTTPException(status_code=404, detail="Asset not found")
+        cursor.close()
 
-        # 软删除资产
-        cursor.execute("UPDATE assets SET deleted_at = NOW() WHERE id = %s", (asset_id,))
-
-        # 删除关联的软件清单
-        cursor.execute("DELETE FROM asset_software WHERE asset_id = %s", (asset_id,))
-
+        cursor = conn.cursor()
+        deleted_rows = _hard_delete_asset_data(cursor, asset_id)
+        cursor.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
+        deleted_rows += max(cursor.rowcount, 0)
+        _audit_asset_delete(
+            cursor, asset_id, asset.get("hostname"), asset.get("ip_address"),
+            operator, f"硬删除资产 {asset.get('hostname')}(id={asset_id})，含关联数据 {deleted_rows} 行",
+        )
         conn.commit()
 
-        safe_console_print(f"[Asset] Deleting asset_id={asset_id} and related software records")
+        safe_console_print(f"[Asset] Hard-deleted asset_id={asset_id} hostname={asset.get('hostname')} rows={deleted_rows}")
 
-        return {"message": "Asset deleted successfully"}
+        return {"message": "Asset deleted successfully (hard delete)", "deleted_rows": deleted_rows}
 
+    except HTTPException:
+        conn.rollback()
+        raise
     except Error as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
         conn.close()
 
 
 @app.post("/api/v1/assets/batch-delete")
 def batch_delete_assets(request: dict):
-    """批量删除资产（软删除）"""
+    """批量删除资产（硬删除，V1.9.23 用户决策，语义与单个删除一致）"""
     ids = request.get('ids', [])
 
     if not ids:
         raise HTTPException(status_code=400, detail="No asset IDs provided")
 
+    operator = None
+    try:
+        operator = request.get('operator')
+    except Exception:
+        operator = None
+
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
+    cursor = None
     try:
-        cursor = conn.cursor()
-
-        # 批量软删除
+        cursor = conn.cursor(dictionary=True)
         placeholders = ','.join(['%s'] * len(ids))
         cursor.execute(
-            f"UPDATE assets SET deleted_at = NOW() WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+            f"SELECT id, hostname, ip_address FROM assets WHERE id IN ({placeholders})",
             tuple(ids)
         )
+        assets = cursor.fetchall()
+        if not assets:
+            raise HTTPException(status_code=404, detail="No matching assets")
+        cursor.close()
 
-        # 删除关联的软件清单（与单个删除保持一致，避免孤儿记录）
-        cursor.execute(
-            f"DELETE FROM asset_software WHERE asset_id IN ({placeholders})",
-            tuple(ids)
-        )
+        cursor = conn.cursor()
+        deleted_rows = 0
+        deleted_assets = []
+        for asset in assets:
+            deleted_rows += _hard_delete_asset_data(cursor, asset["id"])
+            cursor.execute("DELETE FROM assets WHERE id = %s", (asset["id"],))
+            deleted_rows += max(cursor.rowcount, 0)
+            deleted_assets.append(f"{asset.get('hostname')}(id={asset['id']})")
+            _audit_asset_delete(
+                cursor, asset["id"], asset.get("hostname"), asset.get("ip_address"),
+                operator, f"批量硬删除资产 {asset.get('hostname')}(id={asset['id']})",
+            )
         conn.commit()
-        deleted_count = cursor.rowcount
+
+        safe_console_print(f"[Asset] Batch hard-deleted {len(assets)} assets, rows={deleted_rows}")
 
         return {
-            "message": f"Successfully deleted {deleted_count} assets",
-            "deleted_count": deleted_count
+            "message": f"Successfully hard-deleted {len(assets)} assets",
+            "deleted_count": len(assets),
+            "deleted_rows": deleted_rows,
         }
 
+    except HTTPException:
+        conn.rollback()
+        raise
     except Error as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
         conn.close()
 
 
