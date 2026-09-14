@@ -2399,21 +2399,13 @@ def get_assets(
             FROM assets a
             LEFT JOIN asset_groups g ON a.group_id = g.id
             LEFT JOIN agent_heartbeat h ON h.id = (
-                SELECT h2.id
-                FROM agent_heartbeat h2
-                WHERE h2.asset_id = a.id
-                ORDER BY h2.heartbeat_time DESC,
-                         CASE
-                             WHEN COALESCE(h2.disk_info, '') <> ''
-                               OR COALESCE(h2.logged_users, '') <> ''
-                               OR COALESCE(h2.process_count, 0) > 0
-                               OR COALESCE(h2.cpu_usage, 0) <> 0
-                               OR COALESCE(h2.memory_usage, 0) <> 0
-                               OR COALESCE(h2.disk_usage, 0) <> 0
-                             THEN 0 ELSE 1
-                         END,
-                         h2.id DESC
-                LIMIT 1
+                -- V1.9.21 性能修复：此前相关子查询按 heartbeat_time DESC + 6 个
+                -- COALESCE 表达式排序（索引失效，每行资产对 8000+ 条历史心跳
+                -- filesort，33 万行表实测列表 SQL ~500ms）。id 自增即时间序，
+                -- MAX(h2.id) 走 (asset_id, id) 复合索引直接定位，实测 50ms。
+                -- 1.9.21 起每条心跳都带 disk_info，原 CASE"优先有明细的心跳"
+                -- 已无存在必要；旧版空心跳由前端 diskList 空回退综合值兜底。
+                SELECT MAX(h2.id) FROM agent_heartbeat h2 WHERE h2.asset_id = a.id
             )
             WHERE {where_sql}
             ORDER BY a.id DESC

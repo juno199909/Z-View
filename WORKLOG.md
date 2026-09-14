@@ -2821,3 +2821,24 @@
 - 过程要点
   error 透传修复上线当轮即暴露 report 任务的 TypeError 真因——失败详情
   可见化是排障效率的杠杆。
+
+
+## [2026-09-14] 终端列表加载慢：心跳相关子查询 filesort 修复（12 倍）
+
+- Where things stand
+  终端列表端点实测 104-148ms（修复前仅 SQL 就 500-620ms），实时 CPU/磁盘、
+  在线状态、关键词过滤全部正常。
+
+- 根因
+  /api/v1/assets 的 data_sql 用相关子查询取每台终端最新心跳：
+    LEFT JOIN agent_heartbeat h ON h.id = (
+      SELECT h2.id FROM agent_heartbeat h2 WHERE h2.asset_id = a.id
+      ORDER BY h2.heartbeat_time DESC, CASE 6×COALESCE..., h2.id DESC LIMIT 1)
+  排序表达式无法走索引 → 每行资产对 33 万行心跳表（单资产 8000+ 条）
+  filesort，实测 SQL ~500ms。
+
+- 修复（assets_api.py:2401）
+  子查询改为 SELECT MAX(h2.id) ... WHERE h2.asset_id = a.id——id 自增即时间序，
+  走 (asset_id, id) 复合索引直接定位，实测 50ms。原 CASE"优先有明细的心跳"
+  已无存在必要（1.9.21 起每条心跳都带 disk_info），旧版空心跳由前端
+  diskList 空回退综合 disk_usage 环兜底。
