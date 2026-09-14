@@ -214,12 +214,26 @@ def collect_system_status() -> dict:
     except Exception:
         pass
     try:
-        # 取系统盘使用率
+        # 逐盘使用率（V1.9.21：此前只取 C: 的综合值，用户要求每盘单独显示百分比）
+        disks = []
         for part in psutil.disk_partitions(all=False):
-            if os.name == "nt" and part.device.lower().startswith("c:"):
+            try:
                 usage = psutil.disk_usage(part.mountpoint)
-                status["disk_percent"] = usage.percent
-                break
+                if usage.total <= 0:
+                    continue  # 空光驱/虚拟挂载点
+                disks.append({
+                    "device": part.device,
+                    "mountpoint": part.mountpoint,
+                    "total_mb": round(usage.total / (1024 * 1024), 1),
+                    "used_mb": round(usage.used / (1024 * 1024), 1),
+                    "free_mb": round(usage.free / (1024 * 1024), 1),
+                    "percent": usage.percent,
+                })
+                if os.name == "nt" and part.device.lower().startswith("c:") and not status["disk_percent"]:
+                    status["disk_percent"] = usage.percent
+            except Exception:
+                continue
+        status["disks"] = disks
     except Exception:
         pass
     return status

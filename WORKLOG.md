@@ -2785,3 +2785,21 @@
   键名错位链（采集 size_mb → payload size → handler size → API size → 前端 size_mb）
   跨越四层，任何一环的类型/键名不匹配都被"默认值 0/None"静默吞掉——
   这类断链要沿数据流逐层验证真实值，而不是只看代码"看起来对"。
+
+
+## [2026-09-14] 磁盘逐盘显示 + 软件大小 GB 自适应（1.9.21）
+
+- Where things stand
+  ① 终端详情磁盘区从单一 C: 环改为逐盘环（每盘独立百分比 + 已用/总量），
+     双终端 disk_info 已入库验证（28: C:54% + D:；2213: C:25.8% + D:）。
+  ② 软件大小单位自适应：>=1024MB 显 GB、>=1MB 显 MB、<1MB 显 KB
+     （新增 utils/format.js formatSizeMB，终端详情已安装软件列已接入）。
+  ③ Agent payload 的 size_mb 键名修正随 1.9.21 生效，asset 28 全量重报
+     94/125 条回填真实大小。
+
+- 实现要点
+  ① collect_system_status 新增 disks 逐盘采集（psutil.disk_partitions，
+     跳过空光驱/零容量虚拟挂载点），心跳载荷带 disk_info——服务端
+     agent_heartbeat.disk_info 入库与详情接口解析早已支持，只缺载荷。
+  ② 前端 fallback：disk_info 为空时回退旧的综合 disk_usage 环（兼容旧版本
+     Agent 数据）。

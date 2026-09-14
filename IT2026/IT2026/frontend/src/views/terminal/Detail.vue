@@ -71,7 +71,19 @@
           </div>
           <div class="zv-metric-label">内存</div>
         </div>
-        <div class="zv-metric-box">
+        <div class="zv-metric-box" v-for="disk in diskList" :key="disk.device">
+          <div class="zv-metric-ring" :style="metricRing(disk.percent, $warning)">
+            <svg viewBox="0 0 60 60" class="zv-ring-svg">
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#e2e8f0" stroke-width="5" />
+              <circle cx="30" cy="30" r="26" fill="none" stroke="#f59e0b" stroke-width="5" stroke-linecap="round"
+                :stroke-dasharray="`${(disk.percent || 0) * 1.63} 163`" transform="rotate(-90 30 30)" />
+            </svg>
+            <div class="zv-ring-num">{{ disk.percent || 0 }}%</div>
+          </div>
+          <div class="zv-metric-label">磁盘 {{ diskDriveLetter(disk.device) }}</div>
+          <div class="zv-disk-sub">{{ formatSizeMB(disk.used_mb) }} / {{ formatSizeMB(disk.total_mb) }}</div>
+        </div>
+        <div class="zv-metric-box" v-if="!diskList.length">
           <div class="zv-metric-ring" :style="metricRing(heartbeat.disk_usage, $warning)">
             <svg viewBox="0 0 60 60" class="zv-ring-svg">
               <circle cx="30" cy="30" r="26" fill="none" stroke="#e2e8f0" stroke-width="5" />
@@ -97,7 +109,7 @@
         <el-table-column prop="vendor" label="厂商" min-width="160" show-overflow-tooltip />
         <el-table-column prop="install_date" label="安装日期" width="140" />
         <el-table-column label="大小" width="100">
-          <template #default="{ row }">{{ row.size_mb ? row.size_mb + ' MB' : '-' }}</template>
+          <template #default="{ row }">{{ formatSizeMB(row.size_mb) }}</template>
         </el-table-column>
       </el-table>
     </div>
@@ -235,12 +247,22 @@ import { remoteScan } from '@/api/security'
 import WebRemoteDesktop from '@/components/WebRemoteDesktop.vue'
 import AssetInfoPanel from '@/views/asset/components/AssetInfoPanel.vue'
 import NetworkPanel from '@/views/terminal/components/NetworkPanel.vue'
+import { formatSizeMB } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
 const activeTab = ref('monitor')
 const detail = ref({})
 const heartbeat = ref(null)
+// 逐盘磁盘明细（Agent 心跳 disk_info：device/total_mb/used_mb/free_mb/percent）
+const diskList = computed(() => {
+  const info = heartbeat.value?.disk_info
+  return Array.isArray(info) ? info : []
+})
+const diskDriveLetter = (device) => {
+  const s = String(device || '')
+  return s.length >= 2 ? s.slice(0, 2) : s || '?'
+}
 const softwareList = ref([])
 const softwareLoading = ref(false)
 const showRemoteDesktop = ref(false)
@@ -545,6 +567,7 @@ onMounted(() => { loadDetail(); loadSoftware() })
 }
 
 .zv-metric-label { font-size: 13px; color: $text-secondary; }
+.zv-disk-sub { font-size: 11px; color: $text-secondary; margin-top: 2px; white-space: nowrap; }
 
 .zv-status-chip {
   display: inline-flex; align-items: center; gap: 6px;

@@ -159,6 +159,8 @@ def _heartbeat_loop():
                 "cpu_usage": status.get("cpu_percent", 0),
                 "memory_usage": status.get("memory_percent", 0),
                 "disk_usage": status.get("disk_percent", 0),
+                # V1.9.21：逐盘明细（服务端 agent_heartbeat.disk_info 入库 + 详情接口已支持）
+                "disk_info": status.get("disks", []),
                 "process_count": len(psutil.pids()),
                 "logged_users": os.getlogin() if hasattr(os, "getlogin") else "",
                 "status": "online",
