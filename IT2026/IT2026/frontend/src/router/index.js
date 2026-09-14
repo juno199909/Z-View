@@ -48,7 +48,7 @@ const routes = [
         path: '/alert',
         name: 'Alert',
         component: () => import('@/views/alert/Alert.vue'),
-        meta: { title: '告警中心', icon: 'Bell' }
+        meta: { title: '终端日志', icon: 'Bell' }
       },
       {
         path: '/alert/notify',
@@ -66,7 +66,7 @@ const routes = [
         path: '/incidents',
         name: 'Incidents',
         component: () => import('@/views/alert/Incidents.vue'),
-        meta: { title: '事件列表' }
+        meta: { title: '告警中心' }
       },
       {
         path: '/log',

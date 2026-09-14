@@ -2,8 +2,8 @@
   <div class="zv-page">
     <div class="zv-page-header">
       <div>
-        <h2 class="zv-page-title">事件列表</h2>
-        <div class="zv-page-subtitle">活跃告警按终端聚合为事件（每终端一个开放事件），全部恢复自动关单</div>
+        <h2 class="zv-page-title">告警中心</h2>
+        <div class="zv-page-subtitle">活跃告警按终端聚合为告警事件（每终端一个开放事件），全部恢复自动关单</div>
       </div>
       <div class="zv-page-actions">
         <el-radio-group v-model="statusFilter" @change="loadIncidents">
