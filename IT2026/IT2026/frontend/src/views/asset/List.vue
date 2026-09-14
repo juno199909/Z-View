@@ -255,26 +255,53 @@ const handleCreate = () => router.push('/asset/create')
 const handleView = (id) => router.push(`/asset/detail/${id}`)
 const handleEdit = (id) => router.push(`/asset/detail/${id}?edit=true`)
 
+const CONFIRM_TEXT = '确认删除'
+
 const handleDelete = async (id) => {
   try {
-    await ElMessageBox.confirm('确定删除这条资产吗？', '提示', { type: 'warning' })
-    await deleteAsset(id)
+    const { value } = await ElMessageBox.prompt(
+      '此操作将**彻底删除**该资产及其全部关联数据（心跳、软件清单、告警、远控会话、设备凭据等），不可恢复；'
+      + '若终端仍装有 Agent，下个心跳会以全新资产自动重建。'
+      + '<br/><br/>请输入 <b>确认删除</b> 以继续：',
+      '危险操作 · 删除资产',
+      {
+        type: 'warning',
+        confirmButtonText: '彻底删除',
+        cancelButtonText: '取消',
+        inputPattern: new RegExp(`^${CONFIRM_TEXT}$`),
+        inputErrorMessage: `请输入"${CONFIRM_TEXT}"以继续`,
+        dangerouslyUseHTMLString: true,
+      }
+    )
+    await deleteAsset(id, value)
     ElMessage.success('删除成功')
     loadData()
   } catch (error) {
-    if (error !== 'cancel') console.error('删除失败:', error)
+    if (error !== 'cancel' && error !== 'close') console.error('删除失败:', error)
   }
 }
 
 const handleBatchDelete = async () => {
   try {
-    await ElMessageBox.confirm(`确定删除选中的 ${selectedIds.value.length} 条资产吗？`, '提示', { type: 'warning' })
-    await batchDeleteAssets(selectedIds.value)
+    const { value } = await ElMessageBox.prompt(
+      `此操作将**彻底删除**选中的 ${selectedIds.value.length} 条资产及其全部关联数据（心跳、软件清单、告警、远控会话、设备凭据等），不可恢复。`
+      + '<br/><br/>请输入 <b>确认删除</b> 以继续：',
+      '危险操作 · 批量删除',
+      {
+        type: 'warning',
+        confirmButtonText: '彻底删除',
+        cancelButtonText: '取消',
+        inputPattern: new RegExp(`^${CONFIRM_TEXT}$`),
+        inputErrorMessage: `请输入"${CONFIRM_TEXT}"以继续`,
+        dangerouslyUseHTMLString: true,
+      }
+    )
+    await batchDeleteAssets(selectedIds.value, value)
     selectedIds.value = []
     ElMessage.success('删除成功')
     loadData()
   } catch (error) {
-    if (error !== 'cancel') console.error('批量删除失败:', error)
+    if (error !== 'cancel' && error !== 'close') console.error('批量删除失败:', error)
   }
 }
 

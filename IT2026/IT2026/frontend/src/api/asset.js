@@ -45,10 +45,11 @@ export function updateAsset(id, data) {
   })
 }
 
-export function deleteAsset(id) {
+export function deleteAsset(id, confirmText) {
   return request({
     url: `/assets/${id}`,
-    method: 'delete'
+    method: 'delete',
+    params: { confirm_text: confirmText }
   })
 }
 
@@ -91,11 +92,11 @@ export function getAssetUptime(id, params) {
   })
 }
 
-export function batchDeleteAssets(ids) {
+export function batchDeleteAssets(ids, confirmText) {
   return request({
     url: '/assets/batch-delete',
     method: 'post',
-    data: { ids }
+    data: { ids, confirm_text: confirmText }
   })
 }
 

@@ -2866,13 +2866,16 @@ def _audit_asset_delete(cursor, asset_id: int, hostname, ip_address, operator, m
 
 
 @app.delete("/api/v1/assets/{asset_id}")
-def delete_asset(asset_id: int, request: Request):
+def delete_asset(asset_id: int, request: Request, confirm_text: Optional[str] = Query(None)):
     """删除资产（硬删除，V1.9.23 用户决策）。
 
+    需携带 confirm_text="确认删除"（二次确认，防误删/防误调用）。
     资产行与全部关联数据（心跳/软件清单/告警/事件/远控会话/设备凭据等）
     一并物理删除，删除动作写入操作日志（审计）。终端若仍装有 Agent，
     下个心跳将按新资产自动重建。
     """
+    if confirm_text != "确认删除":
+        raise HTTPException(status_code=400, detail='请输入"确认删除"以继续删除')
     operator = None
     try:
         operator = get_request_username(request)
@@ -2924,6 +2927,10 @@ def batch_delete_assets(request: dict):
 
     if not ids:
         raise HTTPException(status_code=400, detail="No asset IDs provided")
+
+    # V1.9.23：二次确认（与单个删除一致），防误删/防误调用
+    if request.get('confirm_text') != "确认删除":
+        raise HTTPException(status_code=400, detail='请输入"确认删除"以继续删除')
 
     operator = None
     try:
