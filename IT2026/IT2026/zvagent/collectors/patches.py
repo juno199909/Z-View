@@ -186,6 +186,18 @@ try {
     if (@($coll).Count -eq 0) {
         $out.note = "no installable updates matched"
     } else {
+        # V1.9.13 修复：先下载后安装。此前直接 Install()，WU 返回
+        # 0x80246007 (WU_E_DM_NOTDOWNLOADED) —— 更新未下载导致安装必败。
+        $downloader = $session.CreateUpdateDownloader()
+        $downloader.Updates = $coll
+        $dl = $downloader.Download()
+        $out.download_result = $dl.ResultCode
+        $out.download_hresult = $dl.HResult
+        if ($dl.ResultCode -notin @(2, 3)) {
+            $out.error = "download failed: result_code=$($dl.ResultCode) hresult=$($dl.HResult)"
+            $out | ConvertTo-Json -Depth 4
+            return
+        }
         $installer = $session.CreateUpdateInstaller()
         $installer.Updates = $coll
         $res = $installer.Install()

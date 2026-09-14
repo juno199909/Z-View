@@ -2624,3 +2624,32 @@
   - 诊断手段备注：print 到重定向文件是块缓冲（8KB 才落盘）， Select-String 对
     混合编码日志会漏检——用字节级检索（bytes.count）才可靠；行为验证（任务
     状态流转）比日志标记更权威。
+
+
+## [2026-09-13] wu_install 实测闭环：发现并修复"漏下载阶段"缺陷（1.9.13）
+
+- Where things stand
+  任务通道五类任务中最后一个未实测的 wu_install 全链路真实安装成功 ✅。
+  KB2267602（Defender 定义更新）下发 → 后台下载（download_result=2）→
+  安装（result_code=2, hresult=0）→ deferred 结果上报 → 服务端 succeeded
+  落库。1.9.13 已发布，双终端经升级管道自动 COMMITTED。
+
+- 本轮发现与修复
+  ① wu_install 脚本直接调 installer.Install()，漏了下载阶段——WU 返回
+     0x80240022 (ALL_UPDATES_INSTALL_FAILED) / 0x80246007 (WU_E_DM_NOTDOWNLOADED，
+     更新未下载)，安装必败。修复：先 CreateUpdateDownloader().Download()（记录
+     download_result/hresult），成功（result_code 2/3）才 Install。
+  ② 首次实测即验证了 async/deferred 全链路：handler 返回 _async → 后台线程
+     执行 → push_deferred_result → 心跳捎带上报 → 服务端终态落库，failed 与
+     succeeded 两路都实测通过。
+  ③ 已知小缺口（未修）：中间态 "running" 不在服务端 _VALID_STATES，上报被
+     静默忽略（任务保持 dispatched 直到终态）——可接受，但记录在案。
+
+- 版本与部署
+  1.9.13：隔离构建 --clean → 签名 Valid → package_agent.py → 发布
+  agent_upgrade/1.9.13 → 双终端自动升级 COMMITTED（28: 14:35:46，
+  2213: 14:35:53）。build_agent.ps1 全流水线（含 GPO 包 + 静态验收）首次跑通。
+
+- 教训
+  WU COM 编程必须显式 Download——Install 不会自动下载（部分场景除外），
+  且错误会以"安装失败"的形态出现，容易误判为权限/策略问题。
