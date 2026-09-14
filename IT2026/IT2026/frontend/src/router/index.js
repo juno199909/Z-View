@@ -84,12 +84,15 @@ const routes = [
         path: '/log/config',
         component: () => import('@/views/log/ConfigCenter.vue'),
         children: [
-          { path: '', redirect: 'retention' },
+          { path: '', redirect: '/log/config/retention' },
           { path: 'retention', name: 'LogRetention', component: () => import('@/views/log/RetentionConfig.vue'), meta: { title: '日志留存' } },
           { path: 'notify', name: 'LogNotify', component: () => import('@/views/alert/NotifyConfig.vue'), meta: { title: '通知配置' } },
           { path: 'threshold', name: 'LogThreshold', component: () => import('@/views/alert/ThresholdConfig.vue'), meta: { title: '告警配置' } },
         ]
       },
+      // 兼容重定向：旧直链/手输路径（日志留存已并入日志配置页签）
+      { path: '/retention', redirect: '/log/config/retention' },
+      { path: '/log/retention', redirect: '/log/config/retention' },
       {
         path: '/system/users',
         name: 'SystemUsers',
