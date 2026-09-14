@@ -2903,3 +2903,21 @@
      + 监控中心菜单项"日志配置"。
   验证：进程内四项（GET 现状/非法值 400/保存回读/run 清理）全过；前端构建
   通过，路由与懒加载分块均进 dist。
+
+
+## [2026-09-14] 事件描述可读化：标题改为真实故障内容（替代类型键模板）
+
+- Where things stand
+  事件列表"事件描述"列此前显示"主机名：1 条活跃告警（offline）"——只有数量
+  与机器类型键，运维看不到具体故障；真实故障描述（summary）页面不展示。
+  修复后标题 = 按严重级排序的告警 message（去重、最多 3 条、单条截 80 字），
+  超出显示"等 N 条告警"，例如："CPU使用率达到 95.7%；网络丢包率持续达到
+  25.0%；内存使用率 88% 等 4 条告警"。已存在事件的 title/summary 随每轮
+  sync 一并刷新（此前只在创建时写入一次）。
+
+- 实现要点（incident_service.sync_incidents）
+  ① 标题去主机名前缀（终端已有独立列，恢复通知也不依赖 title 中的主机名——
+     _wecom_recovery_content 自带 hostname + count）；
+  ② summary 与 title 同源维护，不再只是首条 message；
+  ③ 恢复通知格式不受影响（已核对 _wecom_recovery_content）。
+  验证：sync no-op 无异常；标题构建模拟输出符合预期；assets-api 已重启加载。

@@ -112,19 +112,42 @@ def sync_incidents(conn) -> dict:
         now = datetime.now()
 
         # 4. 有活跃告警的资产：开新 / 挂靠更新
+        sev_order = {"critical": 0, "warning": 1, "info": 2}
         for asset_id, alerts in active_by_asset.items():
             severities = [a.get("severity") or "warning" for a in alerts]
             top_severity = _max_severity(severities)
             types = sorted({str(a.get("alert_type")) for a in alerts})
             hostname = hostnames.get(asset_id) or str(asset_id)
-            title = f"{hostname}：{len(alerts)} 条活跃告警（{', '.join(types)}）"
+
+            # V1.9.23：事件描述改用真实故障内容——按严重级排序取告警 message
+            # （去重、最多 3 条、单条截 80 字），替代原"主机名：N 条活跃告警
+            # （类型键）"（主机名已有独立列、类型键对运维不可读）。summary 同步
+            # 维护，且已存在事件的 title/summary 一并刷新（此前只在创建时写入）。
+            ordered = sorted(
+                alerts,
+                key=lambda a: sev_order.get(a.get("severity") or "warning", 1),
+            )
+            msgs: list = []
+            for a in ordered:
+                msg = " ".join(str(a.get("message") or "").split()) or str(a.get("alert_type"))
+                if msg and msg not in msgs:
+                    msgs.append(msg[:80])
+                if len(msgs) >= 3:
+                    break
+            title = "；".join(msgs) if msgs else f"{len(alerts)} 条活跃告警"
+            if len(alerts) > len(msgs):
+                title += f" 等 {len(alerts)} 条告警"
+            if len(title) > 200:
+                title = title[:197] + "..."
+            summary = "；".join(msgs) or title
+
             existing = open_by_asset.get(asset_id)
             if existing:
                 cursor.execute(
                     f"UPDATE {_INCIDENTS_TABLE} SET alert_count = %s, severity = %s, "
-                    f"alert_types = %s, last_alert_at = %s WHERE id = %s",
+                    f"alert_types = %s, last_alert_at = %s, title = %s, summary = %s WHERE id = %s",
                     (len(alerts), top_severity, json.dumps(types, ensure_ascii=False),
-                     now, existing["id"]),
+                     now, title, summary, existing["id"]),
                 )
                 result["updated"] += 1
             else:
@@ -137,7 +160,7 @@ def sync_incidents(conn) -> dict:
                     f"VALUES (%s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s)",
                     (incident_id, asset_id, hostname, title, top_severity,
                      len(alerts), json.dumps(types, ensure_ascii=False),
-                     alerts[0].get("message"), now, now),
+                     summary, now, now),
                 )
                 result["opened"] += 1
 
