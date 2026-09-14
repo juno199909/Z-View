@@ -97,23 +97,23 @@ const routes = [
         name: 'Terminal',
         meta: { title: '终端管理', icon: 'Monitor' },
         children: [
-          {
-            path: 'overview',
-            name: 'TerminalOverview',
-            component: () => import('@/views/terminal/Overview.vue'),
-            meta: { title: '终端概览' }
-          },
       {
-        path: '/terminal/agent-deploy',
-        name: 'AgentDeploy',
-        component: () => import('@/views/terminal/AgentDeploy.vue'),
-        meta: { title: '终端部署' }
+        path: 'overview',
+        name: 'TerminalOverview',
+        component: () => import('@/views/terminal/Overview.vue'),
+        meta: { title: '终端概览' }
       },
       {
         path: '/patches',
         name: 'PatchManagement',
         component: () => import('@/views/terminal/PatchManagement.vue'),
         meta: { title: '补丁管理' }
+      },
+      {
+        path: 'detail/:id',
+        name: 'TerminalDetail',
+        component: () => import('@/views/terminal/Detail.vue'),
+        meta: { title: '终端详情' }
       },
       {
         path: '/jobs',

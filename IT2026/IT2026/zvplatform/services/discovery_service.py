@@ -58,6 +58,7 @@ except Exception as snmp_import_error:
 from zvplatform.settings import get_settings
 _settings = get_settings()
 
+DISCOVERY_MAX_TASKS = 100  # V1.9.20 修复：逻辑自 assets_api 抽出时常量未随迁，cleanup 每次调用 NameError
 DISCOVERY_TASKS: Dict[str, Dict[str, Any]] = {}
 DISCOVERY_TASK_LOCK = threading.Lock()
 PING_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
