@@ -2679,3 +2679,30 @@
   junction 的 if exist 判定跟随目标（悬空时不可靠）——刷新 junction 必须
   无条件 rmdir 再重建；沙箱幂等重跑 + 悬空恢复两个场景值得成为部署脚本
   改动的标准测试项。
+
+
+## [2026-09-14] 远控抓帧 A/B 实测：dxgi 在本机病态回退 mss（1.9.15）+ 1080p 复测
+
+- Where things stand
+  基线报告落地后完成 dxgi-first A/B 实验：本机（VMware VM，4 个虚拟显示
+  适配器并存）dxgi 路径每帧代价极高（motion Agent CPU 10 核 vs mss 0.31 核），
+  1.9.15 回退 mss 优先并新增 ZVIEW_RD_DXGI_FIRST=1 开关。1080p 复测证明
+  像素吞吐无回退（32.0 vs 27.0 Mpix/s），FPS 下降纯系分辨率变化。
+
+- 本轮改动
+  ① Capture/desktop_capture.py：_backend_fail_streak 连续失败计数 + 冷却
+     指数递增（基线×2^min(streak-1,6)，60s 封顶，成功即清零）——为 dxgi 优先
+     提供 headless 保护，普适改进。
+  ② remote_desktop_engine_v2.py：ScreenCapturer 维持 mss 优先，新增
+     ZVIEW_RD_DXGI_FIRST=1 环境开关（dxcam 正常的独显/物理机可启用 dxgi-first）。
+  ③ 1.9.14/1.9.15 双终端经升级管道自动 COMMITTED。
+
+- 实测数据（1080p motion，mss 优先）
+  H264: 15.46fps / 6.7KB / 0.31 核；JPEG: 15.23fps / 62.4KB / 0.36 核。
+  两种编码都被 mss 62ms 抓帧卡在 ~15fps——瓶颈在抓帧不在编码。
+
+- 关键教训
+  ① A/B 实测比理论推断可靠：dxgi 理论上优于 mss，但驱动层代价可以让一切
+     归零——性能优化必须带对照组。
+  ② 跨会话对比测量必须核对分辨率（本次 1280x692→1920x1080 变化差点误判
+     为性能回退）；像素吞吐（Mpix/s）是分辨率无关的归一指标。

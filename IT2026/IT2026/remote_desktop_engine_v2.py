@@ -916,13 +916,22 @@ class DisabledRemoteFileTransferManager:
 class ScreenCapturer(DesktopFrameCapturer):
     """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
 
-    后端优先级：mss(GDI) 优先——它在 headless/VMware/无显示基底场景下仍能稳定抓到
-    桌面最后合成图（兼容 Win9x 时代的 GDI BitBlt 路径），不像 dxgi 那样依赖 DWM
-    持续产出新帧。dxgi 仅在物理显示器正常附着时作为备选（更高刷新率时质量更好）。
+    后端优先级：mss(GDI) 优先——2026-09-14 A/B 实测结论（docs/远控性能基线）：
+    本机（Broadcom 显示驱动）dxgi 路径虽"成功"但每帧代价极高（motion 场景
+    Agent CPU 10 核 vs mss 0.31 核，FPS 22 vs 30），mss 是该类机器的最优解。
+    dxgi 首选可通过 ZVIEW_RD_DXGI_FIRST=1 显式开启（供 dxcam 正常的
+    独显/物理机复测），配合 retry_after 冷却（连续失败指数递增）自动回退 mss。
     """
 
     def __init__(self):
-        super().__init__(backend_order=("mss", "gdi", "dxgi", "wgc", "dwm", "imagegrab", "pyautogui"))
+        dxgi_first = os.environ.get("ZVIEW_RD_DXGI_FIRST", "").strip().lower() in ("1", "true", "yes")
+        if dxgi_first:
+            order = ("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui")
+            note = "dxgi-first (ZVIEW_RD_DXGI_FIRST)"
+        else:
+            order = ("mss", "gdi", "dxgi", "wgc", "dwm", "imagegrab", "pyautogui")
+            note = "headless-safe: mss first, fast-bitblt"
+        super().__init__(backend_order=order)
         try:
             # CAPTUREBLT 标志为捕获分层窗口而设，BitBlt 慢 3-5 倍；
             # 远控 60fps 场景去掉它（分层窗口脉冲窗口 1px 透明，无需捕获）
@@ -930,7 +939,7 @@ class ScreenCapturer(DesktopFrameCapturer):
             _mss_win.CAPTUREBLT = 0
         except Exception:
             pass
-        print("[RemoteDesktop] Screen capturer initialized (headless-safe: mss first, fast-bitblt)")
+        print(f"[RemoteDesktop] Screen capturer initialized ({note})")
 
 
 class DisplayResolutionManager:

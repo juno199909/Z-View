@@ -343,6 +343,8 @@ class DesktopFrameCapturer:
         )
         self.backend_order = self._default_backend_order
         self._backend_retry_after: dict[str, float] = {}
+        # V1.9.14：每后端连续失败计数（冷却指数递增用），成功即清零
+        self._backend_fail_streak: dict[str, int] = {}
         self._backend_last_failure: dict[str, str] = {}
         self._backend_last_error: dict[str, str] = {}
         self._backend_last_attempt_at: dict[str, float] = {}
@@ -1453,6 +1455,12 @@ class DesktopFrameCapturer:
             cooldown_seconds = max(cooldown_seconds, 4.0)
         elif normalized_classification in {"dxgi_timeout", "no_frame"}:
             cooldown_seconds = max(cooldown_seconds, 2.0)
+        # V1.9.14：连续失败冷却指数递增（dxgi 优先策略的 headless 保护——
+        # 持续失败时避免每轮 grab 都重复相机重建；成功一次即重置）
+        streak = int(self._backend_fail_streak.get(backend_name, 0)) + 1
+        self._backend_fail_streak[backend_name] = streak
+        if streak > 1:
+            cooldown_seconds = min(cooldown_seconds * (2 ** min(streak - 1, 6)), 60.0)
         self._backend_retry_after[backend_name] = time.monotonic() + cooldown_seconds
 
     def _build_recovery_hint(
@@ -1726,6 +1734,8 @@ class DesktopFrameCapturer:
         self.failure_count = 0
         self.last_failure_reason = None
         self._last_recovery_hint = {}
+        if normalized_backend_name:
+            self._backend_fail_streak[normalized_backend_name] = 0
 
     def _record_capture_failure(self, errors: list[str]):
         self.failure_count += 1
