@@ -1125,7 +1125,13 @@ DATA_RETENTION_DAYS = {
     "security_policy_exec_results": 180,
     "remote_sessions": 90,
     "usb_events": 180,
+    # V1.9.21 全库体检补充：两张最大表此前不在留存策略内
+    # agent_heartbeat 33 万行（66% 超 30 天）、asset_changes 26 万行（审计 180 天）
+    "agent_heartbeat": 30,
+    "asset_changes": 180,
 }
+# 分批删除：首次清理 20+ 万行时避免单事务锁表/回滚段膨胀
+RETENTION_DELETE_BATCH = 20000
 RETENTION_CHECK_INTERVAL_SECONDS = 6 * 3600  # 每 6 小时检查一次
 DATA_RETENTION_THREAD = None
 DATA_RETENTION_STARTED = False
@@ -1148,14 +1154,26 @@ def run_data_retention_cleanup() -> dict:
                 time_col = "executed_at"
             elif table == "remote_sessions":
                 time_col = "disconnected_at"
+            elif table == "agent_heartbeat":
+                time_col = "heartbeat_time"
+            elif table == "asset_changes":
+                time_col = "changed_at"
             else:
                 time_col = "created_at"
             try:
-                cursor.execute(
-                    f"DELETE FROM {table} WHERE {time_col} < DATE_SUB(NOW(), INTERVAL %s DAY)",
-                    (days,),
-                )
-                deleted[table] = cursor.rowcount
+                # 分批删除：单批 RETENTION_DELETE_BATCH，循环直至删净
+                table_deleted = 0
+                while True:
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE {time_col} < DATE_SUB(NOW(), INTERVAL %s DAY) LIMIT {RETENTION_DELETE_BATCH}",
+                        (days,),
+                    )
+                    batch = cursor.rowcount
+                    table_deleted += batch
+                    if batch < RETENTION_DELETE_BATCH:
+                        break
+                conn.commit()
+                deleted[table] = table_deleted
             except Exception as exc:
                 deleted[table] = f"error: {exc}"
         conn.commit()
@@ -3161,7 +3179,9 @@ def get_asset_changes_route(asset_id: int, page: int = 1, page_size: int = 20):
                    source_type, operator_name, created_at
             FROM asset_changes
             WHERE asset_id = %s
-            ORDER BY created_at DESC
+            -- ORDER BY 用 changed_at（与 created_at 值恒等）：命中复合索引
+            -- idx_asset_id(asset_id, changed_at)，避免每资产 filesort
+            ORDER BY changed_at DESC
             LIMIT %s OFFSET %s
         """, (asset_id, page_size, offset))
         rows = cursor.fetchall()

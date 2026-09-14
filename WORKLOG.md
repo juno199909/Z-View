@@ -2842,3 +2842,31 @@
   走 (asset_id, id) 复合索引直接定位，实测 50ms。原 CASE"优先有明细的心跳"
   已无存在必要（1.9.21 起每条心跳都带 disk_info），旧版空心跳由前端
   diskList 空回退综合 disk_usage 环兜底。
+
+
+## [2026-09-14] 全库表体检：留存策略补全 + 变更历史排序走索引 + 空间回收
+
+- 体检结论（78 表）
+  索引覆盖总体良好（核心查询路径此前已逐一优化）。三个问题：
+  ① agent_heartbeat（33.3 万行，99.6MB）不在留存策略内，66% 数据超 30 天；
+  ② asset_changes（26.1 万行）同样不在留存策略内；
+  ③ 变更历史查询 ORDER BY created_at（无索引），而表上已有
+     idx_asset_id(asset_id, changed_at) 复合索引且 changed_at 与 created_at
+     值恒等——排序改用 changed_at 即命中索引（EXPLAIN: ref + Backward
+     index scan，无 filesort）。
+
+- 修复（assets_api.py）
+  ① DATA_RETENTION_DAYS 补 agent_heartbeat: 30（heartbeat_time）、
+     asset_changes: 180（changed_at，审计留存与 activity_logs 对齐）；
+  ② 留存清理改分批删除（2 万/批循环），避免首启清理 22 万行的大事务；
+  ③ 变更历史查询 ORDER BY created_at → changed_at。
+
+- 执行结果
+  平台重启时 worker 启动钩子自动完成首轮清理：agent_heartbeat 333,328 →
+  113,764 行（>30 天: 0，保留 8/21 起全量）；OPTIMIZE TABLE 回收后
+  data 99.6MB → 9.5MB；asset_changes 全量在 180 天窗口内（无需删）。
+  后续每 6h 自动清理，表体量将稳定在 ~11 万行（30 天 × 双终端心跳）。
+
+- 备注与建议（未动手，交用户决策）
+  backup_20260717_* 备份表组（含 13.8 万行旧心跳，~55MB）为 7/17 手工备份，
+  确认无用后可 DROP；GLB_*/USA_* 金融实验表非本项目数据未动。
