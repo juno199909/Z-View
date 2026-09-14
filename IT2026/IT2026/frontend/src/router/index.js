@@ -82,9 +82,13 @@ const routes = [
       },
       {
         path: '/log/config',
-        name: 'LogConfig',
         component: () => import('@/views/log/ConfigCenter.vue'),
-        meta: { title: '日志配置' }
+        children: [
+          { path: '', redirect: 'retention' },
+          { path: 'retention', name: 'LogRetention', component: () => import('@/views/log/RetentionConfig.vue'), meta: { title: '日志留存' } },
+          { path: 'notify', name: 'LogNotify', component: () => import('@/views/alert/NotifyConfig.vue'), meta: { title: '通知配置' } },
+          { path: 'threshold', name: 'LogThreshold', component: () => import('@/views/alert/ThresholdConfig.vue'), meta: { title: '告警配置' } },
+        ]
       },
       {
         path: '/system/users',
