@@ -1331,6 +1331,14 @@ class RemoteDesktopSession:
         self._h264_acked_seq = 0
         self._h264_keyframe_requested = False
         self._h264_stats = {"frames": 0, "bytes": 0, "drops_backpressure": 0}
+        # P0 全链路监测（FPS/RTT/ACK/Inflight/Input Latency，2026-09-14）：
+        # 10s 窗口计数 + 各阶段 EMA，由 _emit_pipeline_stats 周期输出
+        self._pipeline_emit_at = 0.0
+        self._stats_win = {"frames": 0, "bytes": 0, "skipped": 0, "empty": 0}
+        self._stats_tick_ms_ema = 0.0
+        self._ack_rtt_ms_avg = 0.0
+        self._h264_send_times = {}
+        self._input_inj_ms_avg = 0.0
         self._h264_last_pil = None  # 上一帧 RGB 缓存：助手报画面未变时用其编码微小增量，保持恒定帧率
         self.h264_activated_at = 0.0  # H.264 激活时间：用于检测观看端是否真的在消费（旧版前端兼容降级）
         self._h264_scale = 1.0  # 动态分辨率：弱机自动降采样保帧率
@@ -1996,20 +2004,29 @@ class RemoteDesktopSession:
                     and self._h264_acked_seq == 0
                     and time.time() - self.h264_activated_at > 12.0
                 ):
-                    # 观看端 5 秒内未确认任何 H.264 帧（旧版前端不认识 0x03 帧）
+                    # 观看端 12 秒内未确认任何 H.264 帧（旧版前端不认识 0x03 帧）
                     # → 自动回退 JPEG，保证旧缓存浏览器也能看到画面
                     self.h264_active = False
                     self._close_h264_encoder()
                     self._log_session_event("codec", "switch to jpeg (no h264 ack from viewer)")
                     asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "jpeg"}))
+
+                # H.264 包分发（循环级独立分支——V1.9.19 修复：此前被错误嵌套进上面的
+                # no-ack 回退块内，健康会话（acked>0）的 h264_packets 落到 frame 路径
+                # 触发 KeyError 'data'，capture_loop 整条死亡；本地 h264 流由此从未
+                # 在该结构下正常工作过）
                 if helper_result.get("h264_packets") is not None:
                     for h264_msg in helper_result["h264_packets"]:
                         self._enqueue_frame(h264_msg)
                     self.frame_count += len(helper_result["h264_packets"])
+                    self._stats_win["frames"] += len(helper_result["h264_packets"])
+                    self._stats_win["bytes"] += int(helper_result.get("frame_size") or 0)
                     self.last_frame_sent_at = time.time()
                     frame_size = int(helper_result.get("frame_size") or 0)
                     self._update_capture_pressure(0.0, frame_size)
                     elapsed = time.perf_counter() - loop_started_at
+                    self._stats_note_tick(elapsed)
+                    self._emit_pipeline_stats(profile)
                     frame_interval = 1.0 / profile["fps"]
                     await self._sleep_until_next_tick(max(0, frame_interval - elapsed))
                     continue
@@ -2028,6 +2045,7 @@ class RemoteDesktopSession:
                         break
 
                     if helper_result.get("empty"):
+                        self._stats_win["empty"] += 1
                         await self._handle_capture_empty(
                             profile,
                             capture_source=(
@@ -2041,6 +2059,7 @@ class RemoteDesktopSession:
                         self.capture_empty_count = 0
                         self.last_capture_empty_at = 0.0
                         self.skipped_frame_count += 1
+                        self._stats_win["skipped"] += 1
                         unchanged_for = max(0.0, frame_observed_at - self.last_visual_change_at)
                         input_after_visual = self.last_input_at > self.last_visual_change_at
                         if (
@@ -2076,6 +2095,17 @@ class RemoteDesktopSession:
                                 self.last_frame_sent_at = time.time()
                     else:
                         frame = helper_result.get("frame") or {}
+                        if "data" not in frame:
+                            # 异常结果（无帧数据）：按空帧处理，避免 KeyError 中断整条管线
+                            self._log_session_event(
+                                "capture_loop",
+                                f"frame without data keys={sorted(frame.keys()) if isinstance(frame, dict) else type(frame).__name__}",
+                            )
+                            self._stats_note_tick(time.perf_counter() - loop_started_at)
+                            self._emit_pipeline_stats(profile)
+                            frame_interval = 1.0 / profile["fps"]
+                            await self._sleep_until_next_tick(frame_interval)
+                            continue
                         self.capture_empty_count = 0
                         self.last_capture_empty_at = 0.0
                         self.last_frame_signature = helper_result.get("signature")
@@ -2101,9 +2131,13 @@ class RemoteDesktopSession:
 
                         self.frame_count += 1
                         self.last_frame_sent_at = time.time()
+                        self._stats_win["frames"] += 1
+                        self._stats_win["bytes"] += int(frame.get("size") or 0)
                     elapsed = time.perf_counter() - loop_started_at
                     frame_interval = 1.0 / profile["fps"]
                     sleep_time = max(0, frame_interval - elapsed)
+                    self._stats_note_tick(elapsed)
+                    self._emit_pipeline_stats(profile)
                     await self._sleep_until_next_tick(sleep_time)
                     continue
 
@@ -2121,16 +2155,21 @@ class RemoteDesktopSession:
                 elapsed = time.perf_counter() - loop_started_at
                 frame_interval = 1.0 / profile['fps']
                 sleep_time = max(0, frame_interval - elapsed)
+                self._stats_note_tick(elapsed)
+                self._emit_pipeline_stats(profile)
                 await self._sleep_until_next_tick(sleep_time)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # P0：带 traceback 记录（此前只记 str(e)，dict 取键类错误无法定位行号）
                 self._log_session_event(
                     "capture_loop",
-                    f"fatal type={type(e).__name__} error={e}",
+                    f"fatal type={type(e).__name__} error={e} "
+                    f"at={traceback.extract_tb(e.__traceback__)[-1]!r}" if e.__traceback__ else f"fatal type={type(e).__name__} error={e}",
                 )
                 print(f"[RemoteDesktop] Capture loop error: {e}")
+                print(traceback.format_exc())
                 break
         self._log_session_event("capture_loop", "stopped")
 
@@ -2986,6 +3025,60 @@ class RemoteDesktopSession:
         prev = float(getattr(self, "_h264_encode_ms_avg", 0.0) or 0.0)
         self._h264_encode_ms_avg = round(prev * 0.7 + ms * 0.3, 1) if prev else round(ms, 1)
 
+    def _note_input_inj_ms(self, ms: float) -> None:
+        """P0 监测：输入注入耗时 EMA（收到控制消息 → SendInput 完成）。"""
+        prev = float(self._input_inj_ms_avg or 0.0)
+        self._input_inj_ms_avg = round(prev * 0.8 + ms * 0.2, 1) if prev else round(ms, 1)
+
+    def _stats_note_tick(self, elapsed: float) -> None:
+        """P0 监测：抓帧循环单次迭代耗时（含抓帧+编码）EMA。"""
+        ms = elapsed * 1000.0
+        prev = self._stats_tick_ms_ema
+        self._stats_tick_ms_ema = round(prev * 0.8 + ms * 0.2, 1) if prev else round(ms, 1)
+
+    def _emit_pipeline_stats(self, profile: dict) -> None:
+        """P0 全链路监测：每 10s 输出一行管线统计到 agent-runtime.log。
+
+        覆盖 FPS/RTT(ACK)/Inflight/Input Latency/编码耗时/带宽——即基线报告
+        第三章第 3 条观测断点的补齐。
+        """
+        now = time.monotonic()
+        if self._pipeline_emit_at == 0.0:
+            self._pipeline_emit_at = now
+            return
+        window = now - self._pipeline_emit_at
+        if window < 10.0:
+            return
+        try:
+            win = self._stats_win
+            fps_actual = win["frames"] / window
+            frame_kb = (win["bytes"] / win["frames"] / 1024.0) if win["frames"] else 0.0
+            net_kbps = win["bytes"] * 8 / window / 1000.0
+            inflight = self._h264_sent_seq - self._h264_acked_seq
+            acks = sum(1 for t in self._h264_ack_times if now - t <= 3.0)
+            ack_rate = acks / 3.0
+            codec = "h264" if self.h264_active else "jpeg"
+            backend = getattr(self.capturer, "capture_backend", "") or getattr(self, "capture_host_backend", "")
+            self._log_session_event(
+                "stats",
+                (
+                    f"codec={codec} backend={backend} fps_req={profile['fps']} "
+                    f"fps={fps_actual:.1f} tick_ms={self._stats_tick_ms_ema} "
+                    f"frame_kb={frame_kb:.1f} net_kbps={net_kbps:.0f} "
+                    f"inflight={inflight} ack_rate={ack_rate:.1f} ack_rtt_ms={self._ack_rtt_ms_avg} "
+                    f"enc_ms={float(getattr(self, '_h264_encode_ms_avg', 0.0) or 0.0)} "
+                    f"input_inj_ms={self._input_inj_ms_avg} "
+                    f"drops_bp={self._h264_stats['drops_backpressure']} "
+                    f"frames_total={self._h264_stats['frames']} "
+                    f"win_frames={win['frames']} skipped={win['skipped']} empty={win['empty']}"
+                ),
+            )
+        except Exception as exc:
+            self._log_session_event("stats", f"emit failed type={type(exc).__name__} error={exc}")
+        finally:
+            self._stats_win = {"frames": 0, "bytes": 0, "skipped": 0, "empty": 0}
+            self._pipeline_emit_at = now
+
     def _evaluate_h264_qos(self, profile: dict) -> None:
         """QoS 动态质量：仅由真实背压（inflight 积压）驱动降档。
 
@@ -3144,7 +3237,9 @@ class RemoteDesktopSession:
                             loop.call_soon_threadsafe(self._capture_wakeup.set)
                             return
                     try:
+                        _t0 = time.perf_counter()
                         self.handle_mouse(pending)
+                        self._note_input_inj_ms((time.perf_counter() - _t0) * 1000.0)
                     except Exception as exc:
                         self._log_session_event(
                             "input_executor",
@@ -3156,7 +3251,9 @@ class RemoteDesktopSession:
 
         def _safe_mouse():
             try:
+                _t0 = time.perf_counter()
                 self.handle_mouse(message)
+                self._note_input_inj_ms((time.perf_counter() - _t0) * 1000.0)
             except Exception as exc:
                 self._log_session_event(
                     "input_executor",
@@ -3173,7 +3270,9 @@ class RemoteDesktopSession:
 
         def _safe_keyboard():
             try:
+                _t0 = time.perf_counter()
                 self.handle_keyboard(message)
+                self._note_input_inj_ms((time.perf_counter() - _t0) * 1000.0)
             except Exception as exc:
                 self._log_session_event(
                     "input_executor",
@@ -3248,7 +3347,14 @@ class RemoteDesktopSession:
                 acked = int(message.get('seq') or 0)
                 if acked > self._h264_acked_seq:
                     self._h264_acked_seq = acked
-                self._h264_ack_times.append(time.monotonic())
+                now_mono = time.monotonic()
+                self._h264_ack_times.append(now_mono)
+                # P0 监测：ACK RTT = 帧发出 → 观看端确认的往返耗时
+                send_ts = self._h264_send_times.pop(acked, None)
+                if send_ts is not None:
+                    rtt_ms = (now_mono - send_ts) * 1000.0
+                    prev = self._ack_rtt_ms_avg
+                    self._ack_rtt_ms_avg = round(prev * 0.8 + rtt_ms * 0.2, 1) if prev else round(rtt_ms, 1)
             elif msg_type == 'request_keyframe':
                 self.last_input_at = time.time()
                 self._h264_keyframe_requested = True
@@ -4065,6 +4171,11 @@ class RemoteDesktopSession:
                     # H.264：seq 发送时分配（被丢帧不占号），观看端 ack 回传同一 seq
                     self._h264_sent_seq = int(getattr(self, "_h264_sent_seq", 0)) + 1
                     frame_id = self._h264_sent_seq
+                    # P0 监测：记录发出时刻，frame_ack 回来时计算 ACK RTT
+                    self._h264_send_times[frame_id] = time.monotonic()
+                    if len(self._h264_send_times) > 256:
+                        for stale_seq in sorted(self._h264_send_times)[:128]:
+                            self._h264_send_times.pop(stale_seq, None)
                     keyframe_flag = 1 if frame_payload.get("keyframe") else 0
                     header = struct.pack(">BIIIIB", 0x03, frame_id, width, height, len(payload_bytes), keyframe_flag)
                 else:

@@ -2735,3 +2735,26 @@
 - 下一步候选（抓帧之外的远控优化）
   mss 抓帧 62ms@1080p 是当前地板；更高帧率需脏矩形/区域捕获（协议改造）
   或在物理机验证 wgc/dxgi 路径后按机器下发抓帧策略（策略引擎联动）。
+
+
+## [2026-09-14] 远控 P0 监测闭环：全链路 stats 埋点上线 + H264 分发结构缺陷修复（1.9.20）
+
+- Where things stand
+  P0 路线图的"Capture→Encode→Queue→Transport→Decode 全链路独立监测"达成 ✅：
+  agent-runtime.log 每 10s 一行 stats（FPS/tick_ms/frame_kb/net_kbps/inflight/
+  ack_rate/ack_rtt_ms/enc_ms/input_inj_ms/drops_bp）。闭环验证全绿：h264 全程
+  无回退、ack_rtt 0.2ms、inflight=1、drops_bp=0、input_inj 1.7ms、零 fatal。
+
+- 顺带修复两个真缺陷
+  ① capture_loop 里 h264_packets 分发分支被历史编辑错误嵌套进"12s 无 ack
+     回退"块内——健康会话（acked>0）时 h264 包落入 frame 路径 KeyError 'data'，
+     capture_loop 死亡。对比 8d0deea 确认原为循环级独立分支，1.9.20 移回。
+     **本地 h264 流在该结构缺陷下从未正常工作过**（此前基线"正常"是客户端
+     小端 ack 错值意外绕过背压/回退的幸运态）。
+  ② 测量客户端 ack seq 字节序错误（协议大端、客户端小端）已修正。
+  ③ capture_loop fatal 日志补 traceback（含出错行号），frame 路径加无数据防护。
+
+- 教训
+  ① 嵌套层级漂移是编辑事故高发区——分发/continue 类结构性代码改动后必须
+     对照原版缩进（git show <基线commit>）核验。
+  ② 埋点上线当轮就抓到一个存量结构缺陷——观测投入直接转化为缺陷发现。
