@@ -916,21 +916,28 @@ class DisabledRemoteFileTransferManager:
 class ScreenCapturer(DesktopFrameCapturer):
     """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
 
-    后端优先级：mss(GDI) 优先——2026-09-14 A/B 实测结论（docs/远控性能基线）：
-    本机（Broadcom 显示驱动）dxgi 路径虽"成功"但每帧代价极高（motion 场景
-    Agent CPU 10 核 vs mss 0.31 核，FPS 22 vs 30），mss 是该类机器的最优解。
-    dxgi 首选可通过 ZVIEW_RD_DXGI_FIRST=1 显式开启（供 dxcam 正常的
-    独显/物理机复测），配合 retry_after 冷却（连续失败指数递增）自动回退 mss。
+    后端优先级：mss 优先（2026-09-14 全量 A/B 结论，docs/远控性能基线 第五章）：
+    - 本 VM（VMware SVGA + Oray/Parsec/MS Remote 多虚拟显示适配器）上，合成器
+      读取路径（dxgi 与 wgc）在真实运动画面下每帧触发 GPU→CPU 软件拷贝，
+      CPU 飙到 ~10 核（wgc 静态屏基准 3.4ms 是假象——无新帧时瞬时返回缓存帧，
+      运动画面才暴露真实拷贝成本）；mss/GDI BitBlt 走 VMware 优化通道最便宜；
+    - 顺序：mss → wgc → dxgi → dwm → gdi（mss 失败时仍有合成器路径兜底）；
+    - ZVIEW_RD_WGC_FIRST=1 / ZVIEW_RD_DXGI_FIRST=1 可在 wgc/dxgi 正常的机器
+      （物理独显等）上显式切换优先级。
     """
 
     def __init__(self):
+        env_first = os.environ.get("ZVIEW_RD_WGC_FIRST", "").strip().lower() in ("1", "true", "yes")
         dxgi_first = os.environ.get("ZVIEW_RD_DXGI_FIRST", "").strip().lower() in ("1", "true", "yes")
         if dxgi_first:
             order = ("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui")
             note = "dxgi-first (ZVIEW_RD_DXGI_FIRST)"
+        elif env_first:
+            order = ("wgc", "dxgi", "dwm", "mss", "gdi", "imagegrab", "pyautogui")
+            note = "wgc-first (ZVIEW_RD_WGC_FIRST)"
         else:
-            order = ("mss", "gdi", "dxgi", "wgc", "dwm", "imagegrab", "pyautogui")
-            note = "headless-safe: mss first, fast-bitblt"
+            order = ("mss", "wgc", "dxgi", "dwm", "gdi", "imagegrab", "pyautogui")
+            note = "headless-safe: mss first (VM 合成器路径病态，A/B 见基线报告第五章)"
         super().__init__(backend_order=order)
         try:
             # CAPTUREBLT 标志为捕获分层窗口而设，BitBlt 慢 3-5 倍；

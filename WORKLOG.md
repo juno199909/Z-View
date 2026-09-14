@@ -2706,3 +2706,32 @@
      归零——性能优化必须带对照组。
   ② 跨会话对比测量必须核对分辨率（本次 1280x692→1920x1080 变化差点误判
      为性能回退）；像素吞吐（Mpix/s）是分辨率无关的归一指标。
+
+
+## [2026-09-14] 远控抓帧全量 A/B 收官：合成器路径在本 VM 不可用，mss 定为默认（1.9.17）
+
+- Where things stand
+  抓帧三路径全量实测收官：dxgi 10 核、wgc 10.3-10.6 核（真实运动画面下）、
+  mss 0.29-0.36 核。默认顺序定稿 mss → wgc → dxgi，新增
+  ZVIEW_RD_WGC_FIRST / ZVIEW_RD_DXGI_FIRST 环境开关。winrt 投影依赖
+  （dxcam[winrt] 10 个 wheel）已入冻结包，物理机上 WGC 能力随包可用。
+  双终端 1.9.17 自动升级 COMMITTED。
+
+- wgc 静态基准假象的教训
+  wgc 独立基准 3.4ms/grab（1080p）是假象：new_frame_only=False 时无新帧
+  瞬时返回缓存帧，静态屏测不出真实成本；运动画面每帧触发 GPU→CPU 软件拷贝
+  （VMware SVGA 无硬件 readback），CPU 飙到 10 核。与 dxgi 的 10 核如出一辙
+  ——合成器读取路径在这类 VM 上就是贵，GDI BitBlt 反而走 VMware 优化通道。
+  性能评估必须用与生产同负载的画面（运动发生器），静态基准会误导。
+
+- 本轮改动
+  ① ScreenCapturer 定稿：默认 mss → wgc → dxgi → dwm → gdi；
+     ZVIEW_RD_WGC_FIRST / ZVIEW_RD_DXGI_FIRST 开关（物理独显机器启用）。
+  ② winrt 依赖链补齐并随包：winrt-runtime/Foundation/Foundation.Collections/
+     Graphics/Graphics.Capture(+Interop)/DirectX/Direct3D11(+Interop) 共 10 wheel
+     （build env pip install "dxcam[winrt]"，spec 44-65 行本已备好收集配置）。
+  ③ 1.9.15→1.9.16→1.9.17 三轮升级均经管道自动 COMMITTED，零手工干预。
+
+- 下一步候选（抓帧之外的远控优化）
+  mss 抓帧 62ms@1080p 是当前地板；更高帧率需脏矩形/区域捕获（协议改造）
+  或在物理机验证 wgc/dxgi 路径后按机器下发抓帧策略（策略引擎联动）。
