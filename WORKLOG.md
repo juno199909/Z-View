@@ -3133,3 +3133,17 @@
      深水区暂不追；布局/白屏/滚轮三项确定性收益已落地）。
 - 验证：窗口构建 46 控件、480x694、渲染无异常；DPI 声明执行无副作用。
   双终端 1.9.29 发布，等待 COMMITTED。
+
+
+## [2026-09-15] 1.9.29 发布漏重启 assets_api 的复盘
+
+- 事故：发布 1.9.29（11:17:55 写入 manifest）后忘记重启 assets_api——升级
+  清单有内存缓存（进程启动时从盘加载），缓存仍是 1.9.28 → Agent 心跳
+  收到的 desired_version 与当前版本相同 → 不触发升级（用户报告"没有
+  更新到 1.9.29"）。
+- 恢复：重启 assets_api 后 1 分钟内双终端即 COMMITTED（11:24:53/57）。
+- 流程教训（第二次踩）：**manifest 直写盘必须重启 assets_api 才生效**——
+  1.9.20 轮已记录过此坑，本次又犯。固化检查单：agent-onedir.zip +
+  manifest.json 写入 agent_upgrade/<ver>/ 后，紧接 restart assets_api，
+  并以 agent_upgrade_history 出现新 to_version 的 COMMITTED 为发布完成
+  的判定标准（而不是 manifest 写入成功）。
