@@ -1156,7 +1156,7 @@ class InputDesktopController:
             target_desktop_name
             or self._get_desktop_name(target_desktop)
             or state.get("thread_desktop")
-            or input_desktop_name
+            or self._get_desktop_name(input_desktop)
             or "unknown"
         )
         target_desktop_kind = self._classify_desktop_name(target_desktop_name)

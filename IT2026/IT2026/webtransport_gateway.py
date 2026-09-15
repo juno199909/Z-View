@@ -308,6 +308,7 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
 
         # P2-04：记录 WT(QUIC/UDP) 通道到会话表（可观测性）
         try:
+            import mysql.connector
             from config_utils import get_db_config as _db_config
             conn = mysql.connector.connect(**_db_config(), connection_timeout=5)
             cur = conn.cursor()
