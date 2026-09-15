@@ -92,7 +92,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import request from '@/api/request'
 import { createAgentJob } from '@/api/jobs'
