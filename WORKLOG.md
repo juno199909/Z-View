@@ -3330,3 +3330,23 @@
      终端部署→Agent部署（AgentUpgrade 不变）。
 - 验证：前端构建通过；Layout 菜单收敛确认（无终端部署残留项）、
   AgentManage 路由与懒加载分块进 dist。
+
+
+## [2026-09-15] 全模块系统性测试：115 路由冒烟 + 前端占位扫描 + 写端点生命周期
+
+- 测试方法
+  ① 全量路由枚举（115 条）→ GET 只读端点进程内冒烟（57 条，inspect 自动
+     填参 + StubRequest 认证）；
+  ② 写端点生命周期测试（create→update→delete：资产/分组/任务通道）；
+  ③ 前端全量扫描（占位标记 0 + 31 路由组件存在且非空）。
+- 发现并修复 1 个真 bug
+  logs/export（操作日志导出 CSV）始终 500——zvplatform/routers/logs.py
+  用 import datetime（模块）调 datetime.now()，类被从 datetime import
+  datetime（23 行）覆盖后实际是模块 → 无 now 属性。改为 from datetime
+  import datetime。
+- 冒烟结果
+  GET 复测 48 OK / 5 FAIL（3 个 404 数据不存在=正确行为 + 2 个 stub 伪影
+  [netloc/method]——均非代码 bug）；写端点（资产更新/删除硬删/分组
+  生命周期/任务通道）全部通过。
+- 前端
+  占位/未实现标记：0；31 个路由组件全部存在且非空。

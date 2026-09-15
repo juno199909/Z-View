@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-import datetime
+from datetime import datetime
 import io
 from typing import Optional
 
