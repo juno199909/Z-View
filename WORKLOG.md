@@ -3197,3 +3197,25 @@
      局部变量会 NameError，已修正）。
 - 验证：py_compile OK、repr 核对中文无损、作用域核对（两处调用均可达）。
   双终端 1.9.32 COMMITTED。
+
+
+## [2026-09-15] 1.9.32 升级卡住排查与恢复：promote 残留目录锁
+
+- 现象：2241 的 1.9.32 升级 DISPATCHED（13:05:20）后 5 分钟无进展——
+  staging\1.9.32 已完整落盘（13:05:34）但 promote/swap 未发生，5 个进程
+  仍跑 1.9.31。
+- 根因（ZViewUpdater 重放捕获）
+  promote 阶段需先把残留的 versions\1.9.32 重命名为 .old-<ts> 清位——
+  **目录重命名 WinError 5 拒绝访问**（目录内文件/子目录逐个重命名均无锁，
+  仅目录本身被拒 = 某进程持有目录句柄/目录 CWD 占用）→ promote 失败 →
+  回滚 1.9.31。2213 无此环境干扰顺利 COMMIT。
+- 恢复
+  强制删除残留目录（shutil.rmtree + 只读属性清理，成功）→ 手动重放
+  updater（subprocess 捕获输出）→ 13 秒完成 promote → upgrade COMMIT:
+  1.9.31 -> 1.9.32 → 双终端 1.9.32 ✓（agent_upgrade_history 无 failed 行
+  ——updater 失败上报 agent_upgrade_history 缺 failed 行，见下）。
+- 暴露的可观测性缺陷（待改进）
+  ① ZViewUpdater 的 stdout/stderr 被 Agent Popen 丢弃（无重定向无日志）
+     ——promote 失败原因黑洞，本次靠手动重放捕获输出才定位；
+  ② 升级失败上报状态 REPORTED，但 agent_upgrade_history 未记 failed 行
+     （只有 DISPATCHED）——失败在升级历史里不可见。
