@@ -3147,3 +3147,20 @@
   manifest.json 写入 agent_upgrade/<ver>/ 后，紧接 restart assets_api，
   并以 agent_upgrade_history 出现新 to_version 的 COMMITTED 为发布完成
   的判定标准（而不是 manifest 写入成功）。
+
+
+## [2026-09-15] 黑屏根因确认与回退：DPI 感知声明与 Tk 8.6 不兼容（1.9.30）
+
+- 用户实测 1.9.29：双击托盘后**黑屏冻结**（此前白屏）。
+- 根因：1.9.29 新增的 Per-Monitor DPI 感知声明在 PyInstaller 打包的
+  Agent 进程内生效（无嵌入清单豁免；此前进程内测试用 python.exe 因清单
+  不同而测出 awareness=0，误判"未生效"）——**Tk 8.6 在 Per-Monitor DPI
+  感知进程中渲染会黑屏/冻结**（Tk 已知限制，tkinter 应用不可开 PMv2）。
+- 修复：回退 DPI 感知声明（DPI-unaware 位图拉伸的轻微软化可接受），
+  保留白屏/布局/滚轮三项修复（1.9.29 的 update_idletasks、pack 顺序、
+  top 级滚轮不受 DPI 影响，继续有效）。双终端 1.9.30 COMMITTED。
+- 教训
+  ① tkinter 应用（Tk 8.6）禁开进程级 Per-Monitor DPI 感知——黑屏是
+     已知限制；DPI-unaware 的位图拉伸模糊是可接受的代价。
+  ② "进程内测试未生效"与"打包后生效"可能是清单差异——PyInstaller
+     exe 与 python.exe 的 DPI 清单行为不同，判断必须以打包产物为准。

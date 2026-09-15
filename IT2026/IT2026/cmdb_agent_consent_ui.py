@@ -21,17 +21,9 @@ from multiprocessing.connection import Listener
 from pathlib import Path
 from types import SimpleNamespace
 
-# P1-UX：Per-Monitor DPI 感知——必须在任何窗口创建前声明。缺失时 Windows
-# 按位图拉伸渲染（模糊/白屏伪影），且鼠标坐标与窗口坐标缩放不一致导致
-# 拖动/滚轮卡顿错位（托盘"本机信息"窗口白屏卡顿的根因）。
-try:
-    import ctypes as _ctypes_dpi
-    try:
-        _ctypes_dpi.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
-    except Exception:
-        _ctypes_dpi.windll.user32.SetProcessDPIAware()
-except Exception:
-    pass
+# DPI 感知声明已回退（V1.9.30）：Tk 8.6 在 Per-Monitor DPI 感知进程中
+# 渲染会黑屏/冻结（Tk 已知限制，tkinter 应用不可开 PMv2）。DPI-unaware
+# 下窗口由系统位图拉伸（轻微软化可接受），1.9.29 黑屏即此声明所致。
 
 from agent_consent_ipc import (
     build_consent_authkey,
