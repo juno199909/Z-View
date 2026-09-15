@@ -3164,3 +3164,22 @@
      已知限制；DPI-unaware 的位图拉伸模糊是可接受的代价。
   ② "进程内测试未生效"与"打包后生效"可能是清单差异——PyInstaller
      exe 与 python.exe 的 DPI 清单行为不同，判断必须以打包产物为准。
+
+
+## [2026-09-15] 托盘"本机信息"黑屏根因修复：_pump 阻塞 mainloop（1.9.31）
+
+- 根因（步级日志实锤）
+  _ui_main 的 _pump 用 while True 死循环消费 job 队列且**永不返回**——它跑在
+  root.after(50, _pump) 的回调上下文里，第一个 job 执行完后 _pump 阻塞在
+  queue.get() → **Tk mainloop 被阻塞，事件循环死亡** → 非模态窗口（fn 立即
+  返回）映射后永远收不到绘制/交互事件 → 整窗变黑 + 点击无响应。
+  授权弹窗能用纯属侥幸——其 fn 内部用 top.wait_window 自转局部事件循环
+  （模态），掩盖了 _pump 的结构性缺陷。
+- 修复
+  ① _pump 改非阻塞泵：get_nowait 清空队列 + after(50, _pump) 自重排
+     （模态 fn 的 wait_window 兼容，fn 返回后泵恢复）；
+  ② 本机信息窗口 fn 改模态（wait_window 至关闭，与授权弹窗行为一致）；
+  ③ footer 加 UI 线程活性时钟（每秒走针）——若黑屏复现：时钟冻结=UI 线程
+     死亡（代码问题），走针但画面黑=渲染层问题（DWM/驱动）——决定性分叉。
+- 验证：py_compile OK；步级日志（repro3/4）实锤根因与修复路径。
+  双终端 1.9.31 COMMITTED，待用户托盘实测。

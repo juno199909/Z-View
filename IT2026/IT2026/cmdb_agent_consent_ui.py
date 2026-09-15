@@ -1000,14 +1000,22 @@ def _ensure_tk_ui_thread(self) -> bool:
         _append_consent_runtime_log("persistent consent ui thread ready")
 
         def _pump():
-            while True:
-                job = job_queue.get()
-                try:
-                    job["result"] = job["fn"]()
-                except BaseException as exc:
-                    job["error"] = exc
-                finally:
-                    job["done"].set()
+            # V1.9.30 修复：此前 while True 死循环消费队列且永不返回——
+            # mainloop 被 after 回调阻塞，非模态窗口（fn 立即返回）永远
+            # 收不到绘制/交互事件（黑屏+无响应）。改为非阻塞泵：清空队列
+            # 后自重排，fn 内部的 wait_window 模态循环亦兼容。
+            try:
+                while True:
+                    job = job_queue.get_nowait()
+                    try:
+                        job["result"] = job["fn"]()
+                    except BaseException as exc:
+                        job["error"] = exc
+                    finally:
+                        job["done"].set()
+            except queue.Empty:
+                pass
+            root.after(50, _pump)
 
         root.after(50, _pump)
         root.mainloop()
@@ -1672,6 +1680,22 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
     # ---- 底部：采集时间 + 关闭 ----
     tk.Label(footer, text=f"采集时间  {collected_at}", font=("Microsoft YaHei UI", 8),
              bg="white", fg=TEXT_SUB, anchor="w").place(x=PAD_X, y=S_px(18))
+    # V1.9.31 诊断：UI 线程活性时钟——黑屏复现时时钟冻结=UI 线程死亡（代码问题），
+    # 时钟走针但画面黑=渲染层问题（DWM/驱动/合成器）
+    ui_clock = {"label": None}
+    def _tick():
+        if state["closed"] or not top.winfo_exists():
+            return
+        try:
+            if ui_clock["label"] is None:
+                ui_clock["label"] = tk.Label(footer, text="", font=("Consolas", 8),
+                                             bg="white", fg=TEXT_SUB, anchor="e")
+                ui_clock["label"].place(x=S_px(150), y=S_px(18), width=S_px(90))
+            ui_clock["label"].configure(text=time.strftime("%H:%M:%S"))
+        except Exception:
+            return
+        top.after(1000, _tick)
+    _tick()
     close_btn = tk.Label(footer, text="关 闭", font=("Microsoft YaHei UI", 9, "bold"),
                          bg=GRAY_BTN, fg=TEXT_MAIN, cursor="hand2", width=10)
     close_btn.place(x=WIDTH - S_px(26) - S_px(88), y=(S_px(52) - S_px(30)) // 2, height=S_px(30))
@@ -1681,6 +1705,7 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
     top.geometry(f"{WIDTH}x{body_h + HEADER_H + S_px(52)}+{pos_x}+{pos_y}")
     top.update_idletasks()  # 先完成布局/控件实现，避免 deiconify 后白屏闪
     top.deiconify()
+    top.wait_window(top)  # V1.9.30：模态等待至关闭（fn 不立即返回，事件循环由 wait_window 驱动）
     try:
         top.lift()
         top.focus_force()
