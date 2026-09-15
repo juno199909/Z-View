@@ -197,8 +197,10 @@ def _verify_authenticode_signature(file_path: str) -> tuple[bool, str, str]:
         )
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + script],
             capture_output=True, text=True, timeout=90, creationflags=flags,
+            encoding="utf-8", errors="replace",
         )
         lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
         status = lines[0] if lines else "UnknownError"

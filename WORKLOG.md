@@ -3040,3 +3040,24 @@
   27 行定义），删除错误的 lazy import。
 - 验证
   assets-api 重启后进程内直调 get_batch_history：返回 12 条历史（此前 500）。
+
+
+## [2026-09-15] 补丁标题乱码修复（PowerShell 输出编码对齐）+ 2213 WU 策略问题定位
+
+- 乱码根因与修复（1.9.24，全仓 4 处调用点）
+  补丁采集 subprocess 强制 encoding="utf-8" 解码 PowerShell 输出，而中文
+  Windows 的 PowerShell 5.1 stdout 默认 GBK(代码页 936)——补丁中文标题
+  （WU COM Title）全部损坏，英文完好。修复：全部 PowerShell 子进程调用
+  （patches.py 采集/诊断/安装 3 处 + upgrade.py 签名校验 1 处）统一在脚本
+  前加 [Console]::OutputEncoding = UTF8，两端对齐。源码级验证：标题
+  "Microsoft Defender Antivirus 的安全智能更新..."完全正常。双终端
+  1.9.24 自动升级 COMMITTED，agent_patches 中文已正确入库。
+- 2213 采集失败定位（wu_diag）
+  HRESULT:0x80072EE6 = WinINET 无效 URL。诊断：wsus_wuserver=127.0.0.1、
+  wsus_usewuserver=1、do_not_connect_internet=1——该机 WU 策略指向本机
+  回环且禁用 Internet 更新（历史 WSUS 策略残留），COM 搜索必然失败。
+  属终端本地配置问题：清除 WSUS 策略或指向真实 WSUS 后恢复。
+- 编码修复的普适教训
+  Windows 上 Python subprocess 调 PowerShell 且 text=True 时，必须显式
+  双端对齐编码（PS 端 [Console]::OutputEncoding=UTF8 + Python 端
+  encoding="utf-8"），否则中文必乱码且被 errors="replace" 静默吞掉。

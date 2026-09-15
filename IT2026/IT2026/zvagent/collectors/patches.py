@@ -79,7 +79,8 @@ def collect_windows_update_status(force: bool = False) -> dict:
             return _LAST_RESULT
         try:
             completed = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_SCRIPT],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + _PS_SCRIPT],
                 capture_output=True, text=True, timeout=_PS_TIMEOUT_SECONDS,
                 encoding="utf-8", errors="replace",
             )
@@ -149,7 +150,8 @@ def wu_diagnose() -> dict:
     """WU 诊断：服务状态/策略配置/微软更新服务连通性/COM 搜索复现。"""
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _WU_DIAG_PS],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + _WU_DIAG_PS],
             capture_output=True, text=True, timeout=180,
             encoding="utf-8", errors="replace",
         )
@@ -225,7 +227,8 @@ $out | ConvertTo-Json -Depth 4
     script = script.replace("KB_FILTER", f"if ({kb_filter}) {{ [void]$coll.Add($u) }}")
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + script],
             capture_output=True, text=True, timeout=3600,
             encoding="utf-8", errors="replace",
         )
