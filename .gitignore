@@ -73,3 +73,6 @@ build_agent_work/
 build_updater_work/
 releases/
 agent_upgrade/
+
+# 服务管理器部署产物（不入库）
+ZViewServiceManager.exe
