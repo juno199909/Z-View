@@ -23,6 +23,8 @@ AGENT_POLICIES_DEFAULT = {
         "consent_timeout_seconds": 90,
         "allow_if_no_user": False,
         "disable_uac_secure_desktop": True,
+        "allow_shell": False,
+        "shell_timeout_seconds": 60,
     },
 }
 
@@ -146,7 +148,7 @@ def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
         if not isinstance(remote_in, dict):
             errors.append("remote_desktop must be an object")
         else:
-            for flag in ("require_consent", "allow_if_no_user", "disable_uac_secure_desktop"):
+            for flag in ("require_consent", "allow_if_no_user", "disable_uac_secure_desktop", "allow_shell"):
                 if flag not in remote_in or remote_in.get(flag) is None:
                     continue
                 value = remote_in.get(flag)
@@ -174,6 +176,23 @@ def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
                         else:
                             errors.append(
                                 "remote_desktop.consent_timeout_seconds must be between 5 and 3600 seconds"
+                            )
+
+            if "shell_timeout_seconds" in remote_in and remote_in.get("shell_timeout_seconds") is not None:
+                raw = remote_in.get("shell_timeout_seconds")
+                if isinstance(raw, bool):
+                    errors.append("remote_desktop.shell_timeout_seconds must be an integer")
+                else:
+                    try:
+                        value = int(raw)
+                    except (TypeError, ValueError):
+                        errors.append("remote_desktop.shell_timeout_seconds must be an integer")
+                    else:
+                        if 5 <= value <= 600:
+                            result["remote_desktop"]["shell_timeout_seconds"] = value
+                        else:
+                            errors.append(
+                                "remote_desktop.shell_timeout_seconds must be between 5 and 600 seconds"
                             )
 
     unknown_sections = set((payload or {}).keys()) - {"intervals", "remote_desktop"}

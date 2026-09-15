@@ -913,6 +913,38 @@ class DisabledRemoteFileTransferManager:
         return iter(())
 
 
+class RemoteShellSettings:
+    """远程 Shell 策略配置（平台策略下发 allow_shell 开启，默认关闭 fail-closed）。"""
+
+    def __init__(self):
+        self.allow_shell = False
+        self.timeout_seconds = 60
+        self.max_output_bytes = 1024 * 1024
+        self.max_command_chars = 8192
+
+    def configure(self, settings: dict | None = None) -> None:
+        if not isinstance(settings, dict):
+            return
+        if settings.get("allow_shell") is not None:
+            self.allow_shell = bool(settings.get("allow_shell"))
+        if settings.get("shell_timeout_seconds") is not None:
+            try:
+                self.timeout_seconds = max(5, min(600, int(settings.get("shell_timeout_seconds"))))
+            except (TypeError, ValueError):
+                pass
+
+    def snapshot(self) -> dict:
+        return {
+            "allow_shell": self.allow_shell,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
+REMOTE_SHELL_SETTINGS = RemoteShellSettings()
+
+_SHELL_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
 class ScreenCapturer(DesktopFrameCapturer):
     """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
 
@@ -1276,6 +1308,12 @@ class RemoteDesktopSession:
         )
         self._download_tasks: dict[str, asyncio.Task] = {}
         self._canceled_downloads: set[str] = set()
+
+        # 远程 Shell（策略 allow_shell 控制，默认关闭）：单命令串行执行 + 输出流式回传
+        self._shell_executor: ThreadPoolExecutor | None = None
+        self._shell_lock = threading.Lock()
+        self._shell_procs: dict[str, subprocess.Popen] = {}
+        self._shell_seq = 0
 
         # 统计
         self.frame_count = 0
@@ -1892,6 +1930,7 @@ class RemoteDesktopSession:
             await self.message_loop()
         finally:
             self.running = False
+            self._teardown_shell()
             if self.capture_task:
                 self.capture_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1961,6 +2000,8 @@ class RemoteDesktopSession:
             'file_transfer': file_transfer_enabled,
             'directory_upload': file_transfer_enabled,
             'cancel_transfer': file_transfer_enabled,
+            'shell': REMOTE_SHELL_SETTINGS.allow_shell,
+            'shell_timeout_seconds': REMOTE_SHELL_SETTINGS.timeout_seconds,
             'transfer_directory': transfer_directory,
             'max_file_size': int(getattr(self.file_transfer_manager, 'MAX_FILE_SIZE', 0) or 0),
             'chunk_size': int(getattr(self.file_transfer_manager, 'CHUNK_SIZE', 96 * 1024) or 96 * 1024),
@@ -3388,6 +3429,12 @@ class RemoteDesktopSession:
             elif msg_type == 'file_download_cancel':
                 self.last_input_at = time.time()
                 await self.handle_file_download_cancel(message)
+            elif msg_type == 'shell_exec':
+                self.last_input_at = time.time()
+                await self.handle_shell_exec(message)
+            elif msg_type == 'shell_stop':
+                self.last_input_at = time.time()
+                await self.handle_shell_stop(message)
             elif msg_type == 'ping':
                 await self._send_json({
                     'type': 'pong',
@@ -3470,6 +3517,217 @@ class RemoteDesktopSession:
                 'desktop_width': int(current_desktop.get('width', 0) or 0),
                 'desktop_height': int(current_desktop.get('height', 0) or 0),
             })
+
+    async def handle_shell_exec(self, message: dict):
+        """执行远程 Shell 命令（PowerShell，策略 allow_shell 开关控制，默认关闭）。
+
+        协议：{type:'shell_exec', id, command} → 流式 {type:'shell_output', id, stream, data}
+        + 终态 {type:'shell_exit', id, exit_code, duration_ms, timed_out, truncated}
+        / {type:'shell_error', id, code, message}。
+        """
+        if not REMOTE_SHELL_SETTINGS.allow_shell:
+            await self._send_json({
+                'type': 'shell_error',
+                'id': message.get('id'),
+                'code': 'shell_disabled',
+                'message': '被控端策略未启用远程 Shell',
+            })
+            return
+        command = str(message.get('command') or '').strip()
+        if not command:
+            await self._send_json({
+                'type': 'shell_error',
+                'id': message.get('id'),
+                'code': 'empty_command',
+                'message': '命令为空',
+            })
+            return
+        if len(command) > REMOTE_SHELL_SETTINGS.max_command_chars:
+            await self._send_json({
+                'type': 'shell_error',
+                'id': message.get('id'),
+                'code': 'command_too_long',
+                'message': f'命令长度超过 {REMOTE_SHELL_SETTINGS.max_command_chars} 字符上限',
+            })
+            return
+
+        with self._shell_lock:
+            if self._shell_procs:
+                busy = True
+            else:
+                busy = False
+                self._shell_seq += 1
+                shell_id = str(message.get('id') or self._shell_seq)
+        if busy:
+            await self._send_json({
+                'type': 'shell_error',
+                'id': message.get('id'),
+                'code': 'busy',
+                'message': '当前有命令正在执行，请等待完成或按 Ctrl+C 终止',
+            })
+            return
+
+        if self._shell_executor is None:
+            self._shell_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"rd-shell-{self.session_id}"
+            )
+        loop = asyncio.get_running_loop()
+        log_remote_desktop_flow(self.session_id, "shell_exec", f"id={shell_id} cmd={command[:300]}")
+        self._shell_executor.submit(self._shell_run_job, shell_id, command, loop)
+
+    def _shell_run_job(self, shell_id: str, command: str, loop) -> None:
+        """在工作线程中执行单条 PowerShell 命令并流式回传输出（UTF-8 解码）。"""
+        started_at = time.monotonic()
+        timed_out = False
+        truncated = False
+        exit_code: int | None = None
+
+        # chcp 65001 让 ipconfig 等原生命令输出 UTF-8；[Console]::OutputEncoding 让
+        # PowerShell 自身（cmdlet）按 UTF-8 输出——两者都需要（中文 Windows 默认 GBK/936）。
+        script = (
+            "$ErrorActionPreference = 'Continue'; "
+            "chcp 65001 > $null; "
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            + command
+        )
+        try:
+            proc = subprocess.Popen(
+                ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=os.path.expanduser('~'),
+                creationflags=_SHELL_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self._shell_emit(loop, {
+                'type': 'shell_error',
+                'id': shell_id,
+                'code': 'spawn_failed',
+                'message': f'命令启动失败: {exc}',
+            })
+            return
+
+        with self._shell_lock:
+            self._shell_procs[shell_id] = proc
+
+        # watchdog 通过标志位传递超时结果（线程内不能直接改闭包局部布尔）
+        state = {'timed_out': False}
+
+        def _watchdog_impl():
+            time.sleep(REMOTE_SHELL_SETTINGS.timeout_seconds)
+            if proc.poll() is None:
+                state['timed_out'] = True
+                self._shell_kill_tree(proc)
+
+        watchdog = threading.Thread(target=_watchdog_impl, daemon=True)
+        watchdog.start()
+
+        total_bytes = 0
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > REMOTE_SHELL_SETTINGS.max_output_bytes:
+                    truncated = True
+                    self._shell_emit(loop, {
+                        'type': 'shell_output',
+                        'id': shell_id,
+                        'stream': 'stdout',
+                        'data': '\r\n[输出超过 1MB 上限，已截断并终止命令]\r\n',
+                    })
+                    self._shell_kill_tree(proc)
+                    break
+                self._shell_emit(loop, {
+                    'type': 'shell_output',
+                    'id': shell_id,
+                    'stream': 'stdout',
+                    'data': chunk.decode('utf-8', errors='replace'),
+                })
+            exit_code = proc.wait()
+        except Exception as exc:
+            self._shell_emit(loop, {
+                'type': 'shell_error',
+                'id': shell_id,
+                'code': 'stream_failed',
+                'message': f'输出读取失败: {exc}',
+            })
+        finally:
+            if proc.poll() is None:
+                self._shell_kill_tree(proc)
+                exit_code = proc.wait()
+            timed_out = state['timed_out']
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            with self._shell_lock:
+                self._shell_procs.pop(shell_id, None)
+            self._shell_emit(loop, {
+                'type': 'shell_exit',
+                'id': shell_id,
+                'exit_code': int(exit_code) if exit_code is not None else -1,
+                'duration_ms': duration_ms,
+                'timed_out': timed_out,
+                'truncated': truncated,
+                'cwd': os.path.expanduser('~'),
+            })
+            log_remote_desktop_flow(
+                self.session_id,
+                "shell_exec_done",
+                f"id={shell_id} exit={exit_code} duration_ms={duration_ms} timed_out={timed_out} truncated={truncated}",
+            )
+
+    def _shell_emit(self, loop, payload: dict) -> None:
+        """从工作线程把 shell 消息投递回事件循环（会话已断开时静默丢弃）。"""
+        try:
+            asyncio.run_coroutine_threadsafe(self._send_json(payload), loop)
+        except RuntimeError:
+            pass
+
+    def _shell_kill_tree(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                capture_output=True,
+                timeout=10,
+                creationflags=_SHELL_CREATE_NO_WINDOW,
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+    async def handle_shell_stop(self, message: dict):
+        """终止正在执行的远程命令（Ctrl+C / 主动停止）。"""
+        shell_id = str(message.get('id') or '') or None
+        with self._shell_lock:
+            targets = [
+                (sid, proc) for sid, proc in self._shell_procs.items()
+                if shell_id is None or sid == shell_id
+            ]
+        for sid, proc in targets:
+            log_remote_desktop_flow(self.session_id, "shell_stop", f"id={sid}")
+            self._shell_kill_tree(proc)
+        if not targets:
+            await self._send_json({
+                'type': 'shell_error',
+                'id': shell_id,
+                'code': 'not_running',
+                'message': '当前没有正在执行的命令',
+            })
+
+    def _teardown_shell(self) -> None:
+        """会话结束：终止残余命令进程并释放执行器。"""
+        with self._shell_lock:
+            procs = list(self._shell_procs.values())
+            self._shell_procs.clear()
+        for proc in procs:
+            self._shell_kill_tree(proc)
+        if self._shell_executor is not None:
+            self._shell_executor.shutdown(wait=False, cancel_futures=True)
+            self._shell_executor = None
 
     async def handle_clipboard_get(self):
         success, text, message = await asyncio.to_thread(self.clipboard_manager.get_text)

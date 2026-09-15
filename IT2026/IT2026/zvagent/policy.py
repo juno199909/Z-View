@@ -125,12 +125,33 @@ def _handle_remote_desktop(policies: dict, applied: dict) -> None:
         current_remote["disable_uac_secure_desktop"] = value
         clean["disable_uac_secure_desktop"] = value
         _set_prompt_on_secure_desktop(value)
+    if "allow_shell" in remote_in and remote_in.get("allow_shell") is not None:
+        value = bool(remote_in.get("allow_shell"))
+        current_remote["allow_shell"] = value
+        clean["allow_shell"] = value
+    if (
+        "shell_timeout_seconds" in remote_in
+        and remote_in.get("shell_timeout_seconds") is not None
+    ):
+        try:
+            value = max(5, min(600, int(remote_in.get("shell_timeout_seconds"))))
+        except (TypeError, ValueError):
+            value = None
+        if value is not None:
+            current_remote["shell_timeout_seconds"] = value
+            clean["shell_timeout_seconds"] = value
     if clean:
         applied["remote_desktop"] = clean
         try:
             from remote_desktop_engine_v2 import CONSENT_MANAGER
 
             CONSENT_MANAGER.configure(current_remote)
+        except Exception:
+            pass
+        try:
+            from remote_desktop_engine_v2 import REMOTE_SHELL_SETTINGS
+
+            REMOTE_SHELL_SETTINGS.configure(current_remote)
         except Exception:
             pass
 

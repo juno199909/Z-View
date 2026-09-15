@@ -105,6 +105,23 @@
           </div>
           <el-switch v-model="form.disable_uac_secure_desktop" />
         </div>
+
+        <div class="zv-policy-toggle">
+          <div class="zv-toggle-info">
+            <div class="zv-toggle-label">允许远程 Shell</div>
+            <div class="zv-toggle-hint">开启后远程桌面会话内可打开命令终端执行 PowerShell 命令（默认关闭，所有命令将被审计记录）</div>
+          </div>
+          <el-switch v-model="form.allow_shell" />
+        </div>
+
+        <div v-if="form.allow_shell" class="zv-policy-item">
+          <div class="zv-policy-label">命令超时时间</div>
+          <div class="zv-policy-control">
+            <el-input-number v-model="form.shell_timeout_seconds" :min="5" :max="600" :step="5" controls-position="right" style="width: 180px" />
+            <span class="zv-unit">秒</span>
+          </div>
+          <div class="zv-policy-hint">单条命令最长执行时间（5 - 600 秒），超时自动终止进程</div>
+        </div>
       </div>
     </div>
   </div>
@@ -127,7 +144,9 @@ const DEFAULTS = {
   require_consent: true,
   consent_timeout_seconds: 90,
   allow_if_no_user: false,
-  disable_uac_secure_desktop: true
+  disable_uac_secure_desktop: true,
+  allow_shell: false,
+  shell_timeout_seconds: 60
 }
 
 const form = reactive({ ...DEFAULTS })
@@ -142,6 +161,8 @@ const applyPolicies = policies => {
   form.consent_timeout_seconds = Number(remote.consent_timeout_seconds ?? DEFAULTS.consent_timeout_seconds)
   form.allow_if_no_user = Boolean(remote.allow_if_no_user)
   form.disable_uac_secure_desktop = remote.disable_uac_secure_desktop !== false
+  form.allow_shell = Boolean(remote.allow_shell)
+  form.shell_timeout_seconds = Number(remote.shell_timeout_seconds ?? DEFAULTS.shell_timeout_seconds)
 }
 
 const loadPolicies = async () => {
@@ -166,7 +187,9 @@ const savePolicies = async () => {
         require_consent: form.require_consent,
         consent_timeout_seconds: form.consent_timeout_seconds,
         allow_if_no_user: form.allow_if_no_user,
-        disable_uac_secure_desktop: form.disable_uac_secure_desktop
+        disable_uac_secure_desktop: form.disable_uac_secure_desktop,
+        allow_shell: form.allow_shell,
+        shell_timeout_seconds: form.shell_timeout_seconds
       }
     })
     applyPolicies(data?.policies)

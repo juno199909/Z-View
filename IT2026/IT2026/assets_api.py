@@ -757,7 +757,87 @@ async def send_browser_session_error(
     await close_browser_websocket(websocket, code=code, reason=safe_message)
 
 
-async def relay_browser_to_agent(websocket: WebSocket, upstream_socket, *, asset_id: int) -> None:
+def _insert_remote_shell_audit(asset_id: int, action: str, message: str) -> None:
+    """远程 Shell 审计落库（best-effort：审计失败不阻断远控链路）。
+
+    system_activity_logs.event_time 为 NOT NULL 无默认值，必须显式 NOW()。
+    """
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO system_activity_logs (source_type, module, action, level, result, asset_id, message, event_time, created_at) "
+            "VALUES ('platform','remote-shell',%s,'info','success',%s,%s,NOW(),NOW())",
+            (action, asset_id, message[:900]),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def build_remote_shell_audit_hooks(
+    asset_id: int,
+    operator: str,
+    session_id: int | None = None,
+):
+    """生成中继双向审计钩子：浏览器→agent 记命令提交，agent→浏览器记执行结果。"""
+    prefix = f"Session {session_id}: " if session_id else ""
+
+    def audit_hook(action: str, **fields) -> None:
+        try:
+            if action == "shell_exec":
+                command = str(fields.get("command") or "").strip()
+                message = f"{prefix}{operator} 执行远程命令: {command}"
+            elif action == "shell_exit":
+                message = (
+                    f"{prefix}{operator} 远程命令[id={fields.get('id')}]执行完成: "
+                    f"exit_code={fields.get('exit_code')} duration_ms={fields.get('duration_ms')} "
+                    f"timed_out={fields.get('timed_out')} truncated={fields.get('truncated')}"
+                )
+            elif action == "shell_stop":
+                message = f"{prefix}{operator} 终止远程命令[id={fields.get('id')}]"
+            else:
+                return
+            asyncio.create_task(asyncio.to_thread(_insert_remote_shell_audit, asset_id, action, message))
+        except Exception:
+            pass
+
+    return audit_hook
+
+
+def _sniff_shell_message(text_data: str) -> Optional[Dict[str, Any]]:
+    """轻量嗅探 shell 控制消息（避免对普通 JSON 控制消息做完整解析）。"""
+    try:
+        if "shell_" not in text_data or '"type"' not in text_data:
+            return None
+        parsed = json.loads(text_data)
+    except Exception:
+        return None
+    if isinstance(parsed, dict) and str(parsed.get("type") or "").startswith("shell_"):
+        return parsed
+    return None
+
+
+async def relay_browser_to_agent(
+    websocket: WebSocket,
+    upstream_socket,
+    *,
+    asset_id: int,
+    shell_audit_hook=None,
+) -> None:
     should_close_upstream = False
     try:
         while True:
@@ -771,6 +851,14 @@ async def relay_browser_to_agent(websocket: WebSocket, upstream_socket, *, asset
 
             text_data = message.get("text")
             if text_data is not None:
+                if shell_audit_hook is not None:
+                    shell_msg = _sniff_shell_message(text_data)
+                    if shell_msg:
+                        shell_audit_hook(
+                            str(shell_msg.get("type")),
+                            command=shell_msg.get("command"),
+                            id=shell_msg.get("id"),
+                        )
                 await upstream_socket.send(text_data)
                 continue
 
@@ -797,7 +885,13 @@ async def relay_browser_to_agent(websocket: WebSocket, upstream_socket, *, asset
             )
 
 
-async def relay_agent_to_browser(websocket: WebSocket, upstream_socket, *, asset_id: int) -> None:
+async def relay_agent_to_browser(
+    websocket: WebSocket,
+    upstream_socket,
+    *,
+    asset_id: int,
+    shell_audit_hook=None,
+) -> None:
     close_code = 1000
     close_reason = ""
     outcome = "upstream_stream_ended"
@@ -806,6 +900,17 @@ async def relay_agent_to_browser(websocket: WebSocket, upstream_socket, *, asset
             if isinstance(payload, bytes):
                 await websocket.send_bytes(payload)
             else:
+                if shell_audit_hook is not None:
+                    shell_msg = _sniff_shell_message(payload)
+                    if shell_msg and shell_msg.get("type") in ("shell_exit", "shell_error"):
+                        shell_audit_hook(
+                            str(shell_msg.get("type")),
+                            id=shell_msg.get("id"),
+                            exit_code=shell_msg.get("exit_code"),
+                            duration_ms=shell_msg.get("duration_ms"),
+                            timed_out=shell_msg.get("timed_out"),
+                            truncated=shell_msg.get("truncated"),
+                        )
                 await websocket.send_text(payload)
         safe_console_print(f"[RemoteDesktopProxy] asset={asset_id} upstream stream ended")
     except ConnectionClosed as exc:
@@ -3369,11 +3474,15 @@ async def proxy_remote_desktop_websocket(asset_id: int, websocket: WebSocket):
             await websocket.accept()
             safe_console_print(f"[RemoteDesktopProxy] asset={asset_id} browser websocket accepted")
 
+            shell_audit_hook = build_remote_shell_audit_hooks(
+                asset_id,
+                requester,
+            )
             browser_to_agent_task = asyncio.create_task(
-                relay_browser_to_agent(websocket, upstream_socket, asset_id=asset_id)
+                relay_browser_to_agent(websocket, upstream_socket, asset_id=asset_id, shell_audit_hook=shell_audit_hook)
             )
             agent_to_browser_task = asyncio.create_task(
-                relay_agent_to_browser(websocket, upstream_socket, asset_id=asset_id)
+                relay_agent_to_browser(websocket, upstream_socket, asset_id=asset_id, shell_audit_hook=shell_audit_hook)
             )
 
             done, pending = await asyncio.wait(
@@ -3490,7 +3599,7 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
         import hashlib as _hashlib
         token_hash = _hashlib.sha256(token.encode("utf-8")).hexdigest()  # P0-4: hash 对比
         # P0-07: TTL 强制执行（created_at + max_duration_sec）
-        cursor.execute("SELECT asset_id, status, fps_limit, created_at, max_duration_sec FROM remote_sessions WHERE id=%s AND session_token=%s", (session_id, token_hash))
+        cursor.execute("SELECT asset_id, admin_user, status, fps_limit, created_at, max_duration_sec FROM remote_sessions WHERE id=%s AND session_token=%s", (session_id, token_hash))
         row = cursor.fetchone()
         if not row:
             await close_browser_websocket(websocket, code=4401, reason="Invalid session token")
@@ -3567,8 +3676,22 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
             finally:
                 c2.close(); conn.close()
 
-            browser_to_agent_task = asyncio.create_task(relay_browser_to_agent(websocket, upstream_socket, asset_id=asset_id))
-            agent_to_browser_task = asyncio.create_task(relay_agent_to_browser(websocket, upstream_socket, asset_id=asset_id))
+            browser_to_agent_task = asyncio.create_task(relay_browser_to_agent(
+                websocket, upstream_socket, asset_id=asset_id,
+                shell_audit_hook=build_remote_shell_audit_hooks(
+                    asset_id,
+                    str(row.get("admin_user") or "console"),
+                    session_id=session_id,
+                ),
+            ))
+            agent_to_browser_task = asyncio.create_task(relay_agent_to_browser(
+                websocket, upstream_socket, asset_id=asset_id,
+                shell_audit_hook=build_remote_shell_audit_hooks(
+                    asset_id,
+                    str(row.get("admin_user") or "console"),
+                    session_id=session_id,
+                ),
+            ))
             done, pending = await asyncio.wait({browser_to_agent_task, agent_to_browser_task}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()

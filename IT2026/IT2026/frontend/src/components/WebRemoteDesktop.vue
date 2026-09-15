@@ -35,6 +35,9 @@
               <el-button size="small" :icon="FolderOpened" @click="openFileTransferDialog">
                 文件传输
               </el-button>
+              <el-button size="small" :icon="Monitor" @click="openShellDrawer">
+                终端
+              </el-button>
               <el-button size="small" :icon="Setting" @click="showSettings">
                 设置
               </el-button>
@@ -161,6 +164,9 @@
               </el-button>
               <el-button size="small" text @click="openFileTransferDialog">
                 文件传输
+              </el-button>
+              <el-button size="small" text @click="openShellDrawer">
+                终端
               </el-button>
               <el-button size="small" text @click="hideFullscreenToolbar">
                 隐藏菜单
@@ -563,6 +569,24 @@
       </div>
     </el-dialog>
 
+    <!-- 远程终端抽屉（xterm.js，走同一远控会话 WebSocket） -->
+    <el-drawer
+      v-model="shellVisible"
+      title="远程终端"
+      size="60%"
+      append-to-body
+      :close-on-click-modal="false"
+      class="remote-shell-drawer"
+      @opened="handleShellDrawerOpened"
+    >
+      <RemoteShellTerminal
+        ref="shellTerminalRef"
+        :send="sendSocketMessage"
+        :connected="connectionStatus === 'connected'"
+        :timeout-seconds="shellTimeoutSeconds"
+      />
+    </el-drawer>
+
     <input
       ref="uploadInput"
       class="hidden-upload-input"
@@ -592,6 +616,8 @@ import { defaultSessionSettings } from '@/utils/remote/sessionSettings'
 import { formatResolutionText, parseDesktopResolutionValue, getDesktopResolutionValue } from '@/utils/remote/format'
 import { hexToBytes, concatU8, arrayBufferToBase64, base64ToUint8Array, createTransferId, normalizeTransferPath } from '@/utils/remote/bytes'
 import { useClipboard } from '@/composables/useClipboard'
+import { useRemoteShell } from '@/composables/useRemoteShell'
+import RemoteShellTerminal from '@/components/RemoteShellTerminal.vue'
 import { ElMessage } from 'element-plus'
 import {
   FullScreen, Refresh, Setting, Loading, CircleClose, Monitor,
@@ -1189,6 +1215,8 @@ const connect = async () => {
     fileTransfer: true,
     directoryUpload: false,
     cancelTransfer: false,
+    shell: false,
+    shellTimeoutSeconds: 60,
     transferDirectory: '',
     desktopResolutionControl: false,
     desktopResolutions: [],
@@ -1802,6 +1830,8 @@ const handleMessage = (data) => {
         fileTransfer: Boolean(message.file_transfer),
         directoryUpload: Boolean(message.directory_upload),
         cancelTransfer: Boolean(message.cancel_transfer),
+        shell: Boolean(message.shell),
+        shellTimeoutSeconds: normalizeNumber(message.shell_timeout_seconds, 60),
         transferDirectory: message.transfer_directory || '',
         desktopResolutionControl: Boolean(message.desktop_resolution_control),
         desktopResolutions: Array.isArray(message.desktop_resolutions) ? message.desktop_resolutions : [],
@@ -1894,6 +1924,9 @@ const handleMessage = (data) => {
       }
     } else if (message.type === 'session_warning') {
       showSessionWarning(message)
+    } else if (typeof message.type === 'string' && message.type.startsWith('shell_')) {
+      // Remote Shell 消息转发给终端组件（抽屉未打开时丢弃）
+      shellTerminalRef.value?.handleEngineMessage(message)
     } else if (message.type === 'pong') {
       const sentAt = typeof message.timestamp === 'number' ? message.timestamp : lastPingSentAt
       if (sentAt > 0) {
@@ -1935,6 +1968,24 @@ const {
   sendSocketMessage,
   onFullscreenActivity: handleFullscreenActivity
 })
+
+// P2 Remote Shell 域 composable（复用远控会话 socket；引擎侧受 allow_shell 策略门控）
+const {
+  shellVisible,
+  shellSupported,
+  shellTimeoutSeconds,
+  openShellDrawer
+} = useRemoteShell({
+  remoteCapabilities,
+  connectionStatus,
+  sendSocketMessage,
+  onFullscreenActivity: handleFullscreenActivity
+})
+const shellTerminalRef = ref(null)
+
+const handleShellDrawerOpened = () => {
+  shellTerminalRef.value?.focus()
+}
 
 const openFileTransferDialog = () => {
   if (!remoteCapabilities.value.fileTransfer) {
@@ -3832,6 +3883,7 @@ const performCloseCleanup = async () => {
   settingsVisible.value = false
   clipboardVisible.value = false
   fileTransferVisible.value = false
+  shellVisible.value = false
 
   try {
     await exitFullscreenIfNeeded()
