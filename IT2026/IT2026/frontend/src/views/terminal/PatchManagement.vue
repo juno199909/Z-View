@@ -3,7 +3,7 @@
     <div class="zv-page-header">
       <div>
         <h2 class="zv-page-title">补丁管理</h2>
-        <div class="zv-page-subtitle">基于 Windows Update 状态的补丁可视（Phase 1：状态采集与查看；安装下发经任务通道后续开放）</div>
+        <div class="zv-page-subtitle">基于 Windows Update 状态的补丁可视与安装下发（安装经任务通道执行，结果在任务中心可查）</div>
       </div>
       <div class="zv-page-actions">
         <el-button :icon="Refresh" @click="loadPatches" :loading="loading">刷新</el-button>
@@ -48,6 +48,16 @@
                     <span v-else>-</span>
                   </template>
                 </el-table-column>
+                <el-table-column label="操作" width="100" align="center">
+                  <template #default="{ row: p }">
+                    <el-button v-if="p.kb" size="small" type="primary" plain
+                      :loading="installingKey === `${row.asset_id}:${p.kb}`"
+                      @click="installPatch(row, p)">安装</el-button>
+                    <el-tooltip v-else content="该补丁无 KB 编号，请使用『全部安装』" placement="top">
+                      <span class="zv-patch-na">-</span>
+                    </el-tooltip>
+                  </template>
+                </el-table-column>
               </el-table>
             </div>
           </template>
@@ -68,6 +78,13 @@
         <el-table-column label="最近扫描" min-width="160">
           <template #default="{ row }">{{ formatTime(row.last_scan) }}</template>
         </el-table-column>
+        <el-table-column label="操作" width="110" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-button size="small" type="primary" plain :disabled="!row.pending_count"
+              :loading="installingKey === `all-${row.asset_id}`"
+              @click="installAll(row)">全部安装</el-button>
+          </template>
+        </el-table-column>
       </el-table>
     </div>
   </div>
@@ -75,12 +92,15 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import request from '@/api/request'
+import { createAgentJob } from '@/api/jobs'
 import dayjs from 'dayjs'
 
 const loading = ref(false)
 const terminals = ref([])
+const installingKey = ref('')
 
 const summary = computed(() => ({
   terminals: terminals.value.length,
@@ -103,6 +123,34 @@ const formatTime = (v) => {
   const d = dayjs(v)
   return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(v)
 }
+
+// 安装下发：经任务通道 wu_install（payload.kb 缺省 = 安装全部待安装补丁）
+const dispatchInstall = async (asset, payload, key, desc) => {
+  try {
+    await ElMessageBox.confirm(
+      `将在 ${asset.hostname} 上${desc}。安装经任务通道异步执行（大补丁可能需要较长时间），执行结果可在任务中心查看。`,
+      '下发安装任务',
+      { type: 'warning', confirmButtonText: '下发安装', cancelButtonText: '取消' }
+    )
+    installingKey.value = key
+    const res = await createAgentJob({
+      asset_id: asset.asset_id,
+      job_type: 'wu_install',
+      payload,
+    })
+    ElMessage.success(`安装任务已下发（${res.job_id}），可在任务中心跟踪进度`)
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') console.error('安装下发失败:', e)
+  } finally {
+    installingKey.value = ''
+  }
+}
+
+const installAll = (row) =>
+  dispatchInstall(row, {}, `all-${row.asset_id}`, '安装全部待安装补丁')
+
+const installPatch = (row, p) =>
+  dispatchInstall(row, { kb: p.kb }, `${row.asset_id}:${p.kb}`, `安装补丁 ${p.kb}（${p.title?.slice(0, 30) || ''}…）`)
 
 const loadPatches = async () => {
   loading.value = true
@@ -145,4 +193,5 @@ onMounted(loadPatches)
 .zv-stat-label { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 4px; }
 .zv-patch-detail { padding: 8px 16px; }
 .zv-patch-empty { color: var(--el-text-color-secondary); font-size: 13px; padding: 8px 0; }
+.zv-patch-na { color: var(--el-text-color-secondary); }
 </style>

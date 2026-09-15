@@ -3061,3 +3061,22 @@
   Windows 上 Python subprocess 调 PowerShell 且 text=True 时，必须显式
   双端对齐编码（PS 端 [Console]::OutputEncoding=UTF8 + Python 端
   encoding="utf-8"），否则中文必乱码且被 errors="replace" 静默吞掉。
+
+
+## [2026-09-15] 补丁管理补上安装下发入口（Phase 1 → Phase 2 收口）
+
+- 背景
+  wu_install 任务通道早已闭环（1.9.20 实测真实安装成功），但补丁管理页
+  仍是 Phase 1（仅状态查看），无安装入口——用户指出后补上。
+- 实现（PatchManagement.vue）
+  ① 主表新增"操作"列：**全部安装**（per-terminal，payload={} → Agent 端
+     kb=None 走安装全部待安装补丁），pending_count=0 时禁用；
+  ② 展开明细新增"操作"列：**单补丁安装**（payload={kb}），无 KB 编号的
+     补丁（如 Broadcom 驱动）禁用并提示用"全部安装"；
+  ③ 下发前 ElMessageBox.confirm 说明异步执行与任务中心查看路径；
+     installingKey 防重复点击；
+  ④ 副标题更新为"可视与安装下发"。
+- 说明
+  wu_install 经任务通道异步执行（handler 3600s 超时），安装结果随心跳
+  回传、任务中心可见。WU 被策略禁用的终端（2213）下发会失败并返回可读
+  错误（属终端本地配置）。
