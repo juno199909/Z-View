@@ -3239,3 +3239,21 @@
 - 行动
   用户重启 XXH-XXX（staged 驱动/补丁生效）后复验：托盘图标、双击窗口、
   授权弹窗。若重启后仍黑 → 回到代码侧（下一步：WGC 抓帧对照/换 WebView）。
+
+
+## [2026-09-15] 托盘缺失根因修复：版本显示补丁的作用域切断（1.9.33）
+
+- 根因（diff 实锤）
+  1.9.32 的版本显示补丁把 8 空格缩进的 _tray_agent_version_text 插在了
+  serve_forever 内 12 空格嵌套块的 apply_toggle 与 build_context_menu 之间
+  ——8 空格定义**结束了外层块的作用域**，build_context_menu/show_context_menu
+  及其后全部托盘代码被切进了 _tray_agent_version_text 的函数体 →
+  serve_forever 引用不到它们 → NameError → main 的 finally os._exit(0) →
+  consent-ui helper 静默消失（每轮 watchdog 重启都同样命运）→ 托盘缺失。
+  py_compile 通过（语法合法的嵌套 def）而运行时才炸——与 router 损坏同类。
+- 修复
+  错误位置删除 + 移到 serve_forever 体开头（与 session_id 同级，闭包可达）。
+  diff 复核干净。双终端 1.9.33 COMMITTED，consent-ui 进程恢复（pid=10040）。
+- 教训（第三次同类事故）
+  向既有嵌套结构插入代码时的缩进错误 = 作用域切断——插入后必须 diff 复核
+  结构（py_compile 抓不住），且绝不盲信编辑工具对含中文文件的写入完整性。
