@@ -3183,3 +3183,17 @@
      死亡（代码问题），走针但画面黑=渲染层问题（DWM/驱动）——决定性分叉。
 - 验证：py_compile OK；步级日志（repro3/4）实锤根因与修复路径。
   双终端 1.9.31 COMMITTED，待用户托盘实测。
+
+
+## [2026-09-15] 托盘右键菜单与"关于 Z-View"显示 Agent 版本（1.9.32）
+
+- 实现（cmdb_agent_consent_ui.py）
+  ① 右键菜单顶部新增灰显版本条目"Z-View Agent v1.9.32"
+     （MF_STRING | MF_GRAYED，不可点击，信息展示用；MF_GRAYED 常量补定义）；
+  ② "关于 Z-View…"弹窗首行加入版本号；
+  ③ 版本文本经 _tray_agent_version_text()（try-import zvagent.__version__，
+     失败回退 "v?"）——提取为嵌套函数供 build_context_menu 与
+     show_context_menu 两处作用域共用（初版直接引用 build_context_menu
+     局部变量会 NameError，已修正）。
+- 验证：py_compile OK、repr 核对中文无损、作用域核对（两处调用均可达）。
+  双终端 1.9.32 COMMITTED。

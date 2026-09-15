@@ -401,6 +401,7 @@ def _build_fallback_module():
             MF_STRING = 0x00000000
             MF_SEPARATOR = 0x00000800
             MF_CHECKED = 0x00000008
+            MF_GRAYED = 0x00000003  # 灰显不可点击（信息展示用）
             TPM_RIGHTBUTTON = 0x0002
             TPM_NONOTIFY = 0x0080
             TPM_RETURNCMD = 0x0100
@@ -502,6 +503,13 @@ def _build_fallback_module():
             def apply_toggle(menu_id):
                 return _tray_apply_toggle(self, menu_id)
 
+        def _tray_agent_version_text() -> str:
+            try:
+                from zvagent import __version__ as _v
+                return f"v{_v}"
+            except Exception:
+                return "v?"
+
             def build_context_menu(hwnd):
                 menu = user32.CreatePopupMenu()
                 if not menu:
@@ -511,6 +519,10 @@ def _build_fallback_module():
                 skip_checked = MF_CHECKED if settings.get("skip_consent_for_session") else MF_STRING
                 balloon_checked = MF_CHECKED if settings.get("show_balloon_notifications", True) else MF_STRING
                 uac_checked = MF_CHECKED if settings.get("allow_secure_desktop_input", True) else MF_STRING
+                version_text = _tray_agent_version_text()
+                user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                                   f"Z-View Agent {version_text}".rstrip())
+                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
                 user32.AppendMenuW(menu, MF_STRING, IDM_MACHINE_INFO, "查看本机信息(&I)")
                 user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
                 user32.AppendMenuW(menu, MF_STRING | allow_checked, IDM_TOGGLE_ALLOW_REQUESTS, "允许远程控制请求")
@@ -558,7 +570,7 @@ def _build_fallback_module():
                 elif chosen == IDM_ABOUT:
                     user32.MessageBoxW(
                         None,
-                        "Z-View 终端管理代理\n\n远程控制同意助手与托盘常驻程序。\n本图标提供远程控制开关与本机免确认设置。",
+                        f"Z-View 终端管理代理 {_tray_agent_version_text()}\n\n远程控制同意助手与托盘常驻程序。\n本图标提供远程控制开关与本机免确认设置。",
                         "关于 Z-View",
                         MB_TOPMOST | MB_SETFOREGROUND | 0x40,  # MB_ICONINFORMATION
                     )
