@@ -503,6 +503,13 @@ def _build_fallback_module():
             def apply_toggle(menu_id):
                 return _tray_apply_toggle(self, menu_id)
 
+            def _tray_agent_version_text() -> str:
+                try:
+                    from zvagent import __version__ as _v
+                    return f"v{_v}"
+                except Exception:
+                    return "v?"
+
             def build_context_menu(hwnd):
                 menu = user32.CreatePopupMenu()
                 if not menu:
@@ -645,12 +652,6 @@ def _build_fallback_module():
             return True
 
         def serve_forever(self):
-            def _tray_agent_version_text() -> str:
-                try:
-                    from zvagent import __version__ as _v
-                    return f"v{_v}"
-                except Exception:
-                    return "v?"
             session_id = get_current_process_session_id()
             if session_id is None:
                 _append_consent_runtime_log("fallback consent helper started without a session; waiting idle")

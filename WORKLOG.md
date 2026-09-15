@@ -3257,3 +3257,19 @@
 - 教训（第三次同类事故）
   向既有嵌套结构插入代码时的缩进错误 = 作用域切断——插入后必须 diff 复核
   结构（py_compile 抓不住），且绝不盲信编辑工具对含中文文件的写入完整性。
+
+
+## [2026-09-15] 右键无反应修复：版本函数的"位置/缩进"双变量终版（1.9.34）
+
+- 1.9.33 回归：作用域修复把 _tray_agent_version_text 移到了 serve_forever
+  体内——而 build_context_menu/show_context_menu 定义在 serve_forever
+  **之前**的外层嵌套函数内，闭包不含 serve_forever 的局部 → 右键菜单
+  构建调用 version_text 时 NameError → WndProc 吞掉 → 右键无反应
+  （托盘图标正常显示、helper 进程正常——仅菜单链路断）。
+- 终版修复：函数定义回到 _build_fallback_module 内、apply_toggle 之后、
+  build_context_menu 之前（1.9.32 的原始插入位置），缩进与同级函数一致
+  （16 空格）——"位置对、缩进错"（1.9.32）与"缩进对、位置错"（1.9.33）
+  两个单变量错误合并为正确终态。
+- 验证：diff 复核干净；双终端 1.9.34 COMMITTED；consent-ui 进程恢复
+  （pid=9824，1.9.34 路径）。待用户右键实测（版本条目 + About 版本行 +
+  菜单正常弹出）。
