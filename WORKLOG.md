@@ -3080,3 +3080,21 @@
   wu_install 经任务通道异步执行（handler 3600s 超时），安装结果随心跳
   回传、任务中心可见。WU 被策略禁用的终端（2213）下发会失败并返回可读
   错误（属终端本地配置）。
+
+
+## [2026-09-15] wu_install"全部安装"0x80240013 修复闭环（1.9.25→1.9.27 三轮迭代）
+
+- 用户操作"全部安装"失败：WU_E_DUPLICATE_ITEM (0x80240013，安装集合含重复项)
+- 修复（patches.py 安装脚本重写，三轮迭代）
+  ① 1.9.25：改逐更新安装（单元素集合结构性规避集合内重复）+ Identity 去重 +
+     bundle 子包不单独入选 —— 但引入新 bug：KB_FILTER 模板残留 $coll.Add
+     （$coll 在计划阶段不存在）→ "对 Null 值表达式调用方法"
+  ② 1.9.26：循环体全纳入 try + null 防护 —— 定位到 ① 的 coll-null
+  ③ 1.9.27：KB_FILTER 语义修正（过滤不入选 → continue），不再引用 coll
+- 闭环验证（1.9.27 实装，JOB-WUINST-2241-V3）
+  succeeded：KB2267602 Defender 定义 下载 rc=2 → 安装 rc=2/hresult=0，
+  per-update 结果粒度生效，中文标题正常，agent_patches reboot_required=1。
+- 教训
+  ① 模板字符串替换式改代码（KB_FILTER 占位符）在重构后语义漂移——占位符
+     依赖的上下文变量随重构移位，必须全链路核对
+  ② 任务通道失败详情可见化（error 透传）+ per-update 结果粒度 = 一轮定位

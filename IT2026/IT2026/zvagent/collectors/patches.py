@@ -177,54 +177,91 @@ try {
     $session = New-Object -ComObject Microsoft.Update.Session
     $searcher = $session.CreateUpdateSearcher()
     $result = $searcher.Search("IsInstalled=0 and IsHidden=0")
-    $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+
+    # V1.9.25：构建去重安装计划——同一 Identity 只入选一次；bundle 的子更新
+    # 不单独入选（随 bundle 一起安装），结构性规避 0x80240013
+    # (WU_E_DUPLICATE_ITEM：安装集合含重复项)。
+    $seenIds = @{}
+    $childIds = @{}
+    foreach ($u in $result.Updates) {
+        if ($u.BundledUpdates) {
+            for ($i = 0; $i -lt $u.BundledUpdates.Count; $i++) {
+                $childIds[[string]$u.BundledUpdates.Item($i).Identity.UpdateID] = $true
+            }
+        }
+    }
+    $plan = @()
     foreach ($u in $result.Updates) {
         if ($u.InstallationBehavior.CanRequestUserInput) { continue }
         KB_FILTER
+        $uid = [string]$u.Identity.UpdateID
+        if ($seenIds.ContainsKey($uid)) { continue }
+        if ($childIds.ContainsKey($uid)) { continue }
+        $seenIds[$uid] = $true
         if ($u.EulaAccepted -eq $false) { $u.AcceptEula() }
-        [void]$coll.Add($u)
+        $plan += $u
     }
-    $out.selected = @($coll).Count
-    if (@($coll).Count -eq 0) {
+    $out.selected = @($plan).Count
+    if (@($plan).Count -eq 0) {
         $out.note = "no installable updates matched"
     } else {
-        # V1.9.13 修复：先下载后安装。此前直接 Install()，WU 返回
-        # 0x80246007 (WU_E_DM_NOTDOWNLOADED) —— 更新未下载导致安装必败。
-        $downloader = $session.CreateUpdateDownloader()
-        $downloader.Updates = $coll
-        $dl = $downloader.Download()
-        $out.download_result = $dl.ResultCode
-        $out.download_hresult = $dl.HResult
-        if ($dl.ResultCode -notin @(2, 3)) {
-            $out.error = "download failed: result_code=$($dl.ResultCode) hresult=$($dl.HResult)"
-            $out | ConvertTo-Json -Depth 4
-            return
-        }
-        $installer = $session.CreateUpdateInstaller()
-        $installer.Updates = $coll
-        $res = $installer.Install()
-        $out.result_code = $res.ResultCode
-        $out.hresult = $res.HResult
+        # V1.9.13：先下载后安装（缺下载会 0x80246007）。
+        # V1.9.25：改为逐更新安装（单元素集合）——单更新失败不影响其余，
+        # 且每个更新独立下载/安装/结果，任务详情可读到 per-update 粒度。
+        # V1.9.26：循环体全部纳入 try + null 防护（Download/Install 在部分
+        # 场景返回 null，此前"对 Null 值表达式调用方法"无法定位阶段）。
         $results = @()
-        for ($i = 0; $i -lt $coll.Count; $i++) {
-            $ur = $res.GetUpdateResult($i)
-            $kb = $null
-            foreach ($id in $coll.Item($i).KBArticleIDs) { $kb = "KB$id"; break }
-            $results += [ordered]@{
-                title = $coll.Item($i).Title
-                kb = $kb
-                result_code = $ur.ResultCode
-                hresult = $ur.HResult
+        $any_ok = $false
+        foreach ($u in $plan) {
+            $item = [ordered]@{
+                title = $null
+                kb = $null
+                result_code = $null
+                hresult = $null
+                download_result = $null
+                error = $null
             }
+            try {
+                if ($null -eq $u) { throw "plan item is null" }
+                $item.title = $u.Title
+                foreach ($id in $u.KBArticleIDs) { $item.kb = "KB$id"; break }
+                $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+                [void]$coll.Add($u)
+                $downloader = $session.CreateUpdateDownloader()
+                $downloader.Updates = $coll
+                $dl = $downloader.Download()
+                if ($null -ne $dl) {
+                    $item.download_result = $dl.ResultCode
+                    $item.download_hresult = $dl.HResult
+                } else {
+                    $item.download_result = "null"
+                }
+                if ($dl -and $dl.ResultCode -in @(2, 3)) {
+                    $installer = $session.CreateUpdateInstaller()
+                    $installer.Updates = $coll
+                    $res = $installer.Install()
+                    if ($null -ne $res) {
+                        $item.result_code = $res.ResultCode
+                        $item.hresult = $res.HResult
+                        if ($res.ResultCode -in @(2, 3)) { $any_ok = $true }
+                    } else {
+                        $item.error = "Install() returned null"
+                    }
+                }
+            } catch {
+                $item.error = [string]$_.Exception.Message
+            }
+            $results += $item
         }
         $out.updates = $results
+        $out.result_code = if ($any_ok) { 2 } elseif ($results.Count -gt 0) { 4 } else { 2 }
     }
 } catch {
     $out.error = [string]$_.Exception.Message
 }
 $out | ConvertTo-Json -Depth 4
 """
-    script = script.replace("KB_FILTER", f"if ({kb_filter}) {{ [void]$coll.Add($u) }}")
+    script = script.replace("KB_FILTER", f"if (-not ({kb_filter})) {{ continue }}")
     try:
         completed = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
