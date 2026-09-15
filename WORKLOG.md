@@ -3350,3 +3350,23 @@
   生命周期/任务通道）全部通过。
 - 前端
   占位/未实现标记：0；31 个路由组件全部存在且非空。
+
+
+## [2026-09-15] P1+P2 功能开发计划（用户指令：先做P1和P2）
+
+- 批次 1（本session）：基础设施 + 快速收益
+  ① 资产 GPU/主板/BIOS 字段（DB + Agent 采集 + API）
+  ② 资产自定义字段（DB JSON 列 + API）
+  ③ 升级失败自动重试（upgrade.py）
+  ④ Agent Fleet 健康度评分（API + 前端）
+  ⑤ Remote Shell 基础版（任务通道 shell_exec + 前端终端）
+- 批次 2：架构级
+  ⑥ Policy Engine 统一模型
+  ⑦ Scoped RBAC
+  ⑧ 资产生命周期状态机
+- 批次 3（P2）：平台化
+  ⑨ Automation IF/THEN
+  ⑩ 安全基线
+  ⑪ 批量任务编排
+  ⑫ 软件仓库文件分发
+  ⑬ 软件安装/卸载 job 类型

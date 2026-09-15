@@ -486,6 +486,13 @@ def trigger_immediate_report(payload: dict | None = None) -> dict:
         "serial_number": hardware.get("serial_number") or "",
         "manufacturer": hardware.get("manufacturer") or "",
         "model": hardware.get("model") or "",
+        # V1.9.34：GPU / 主板 / BIOS（P1-①）
+        "gpu_name": hardware.get("gpu_name") or "",
+        "gpu_memory_mb": hardware.get("gpu_memory_mb") or 0,
+        "motherboard": hardware.get("motherboard") or "",
+        "bios_vendor": hardware.get("bios_vendor") or "",
+        "bios_version": hardware.get("bios_version") or "",
+        "bios_date": hardware.get("bios_date") or "",
     }
 
     try:

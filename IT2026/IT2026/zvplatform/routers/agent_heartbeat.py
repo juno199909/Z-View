@@ -420,6 +420,13 @@ def agent_heartbeat(data: dict, request: Request):
             "manufacturer": normalize_text(data.get("manufacturer")),
             "model": normalize_text(data.get("model")),
             "gateway": normalize_text(data.get("gateway")),
+            # V1.9.34 P1-①：GPU / 主板 / BIOS
+            "gpu_name": normalize_text(data.get("gpu_name")),
+            "gpu_memory_mb": normalize_positive_int(data.get("gpu_memory_mb")),
+            "motherboard": normalize_text(data.get("motherboard")),
+            "bios_vendor": normalize_text(data.get("bios_vendor")),
+            "bios_version": normalize_text(data.get("bios_version")),
+            "bios_date": normalize_text(data.get("bios_date")),
         }
 
         for field_name, field_value in normalized_report_values.items():
@@ -497,6 +504,12 @@ def agent_heartbeat(data: dict, request: Request):
                 "cpu_cores",
                 "memory_mb",
                 "disk_gb",
+                "gpu_name",
+                "gpu_memory_mb",
+                "motherboard",
+                "bios_vendor",
+                "bios_version",
+                "bios_date",
                 "status",
                 "agent_install_status",
                 "gateway",

@@ -190,6 +190,43 @@ def collect_hardware_info() -> dict:
         except Exception:
             pass
 
+    # V1.9.34：GPU / 主板 / BIOS 采集（P1-①）
+    info["gpu_name"] = ""
+    info["gpu_memory_mb"] = 0
+    info["motherboard"] = ""
+    info["bios_vendor"] = ""
+    info["bios_version"] = ""
+    info["bios_date"] = ""
+    if os.name == "nt":
+        try:
+            gpus = _wmi_query("SELECT Name, AdapterRAM FROM Win32_VideoController")
+            if gpus:
+                gpu_names = [str(g.get("Name") or "") for g in gpus if g.get("Name")]
+                info["gpu_name"] = " / ".join(gpu_names) if gpu_names else ""
+                max_mem = max((int(g.get("AdapterRAM") or 0) for g in gpus), default=0)
+                info["gpu_memory_mb"] = round(max_mem / (1024 * 1024), 0) if max_mem else 0
+        except Exception:
+            pass
+        try:
+            baseboard = _wmi_query("SELECT Manufacturer, Product FROM Win32_BaseBoard")
+            if baseboard:
+                mb_mfr = str(baseboard[0].get("Manufacturer") or "")
+                mb_prod = str(baseboard[0].get("Product") or "")
+                info["motherboard"] = f"{mb_mfr} {mb_prod}".strip()
+        except Exception:
+            pass
+        try:
+            bios_info = _wmi_query("SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS")
+            if bios_info:
+                b = bios_info[0]
+                info["bios_vendor"] = str(b.get("Manufacturer") or "")
+                info["bios_version"] = str(b.get("SMBIOSBIOSVersion") or "")
+                raw_date = str(b.get("ReleaseDate") or "")
+                if len(raw_date) >= 8:
+                    info["bios_date"] = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+        except Exception:
+            pass
+
     return info
 
 
