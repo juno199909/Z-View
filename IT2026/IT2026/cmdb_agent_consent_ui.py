@@ -21,6 +21,18 @@ from multiprocessing.connection import Listener
 from pathlib import Path
 from types import SimpleNamespace
 
+# P1-UX：Per-Monitor DPI 感知——必须在任何窗口创建前声明。缺失时 Windows
+# 按位图拉伸渲染（模糊/白屏伪影），且鼠标坐标与窗口坐标缩放不一致导致
+# 拖动/滚轮卡顿错位（托盘"本机信息"窗口白屏卡顿的根因）。
+try:
+    import ctypes as _ctypes_dpi
+    try:
+        _ctypes_dpi.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+    except Exception:
+        _ctypes_dpi.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 from agent_consent_ipc import (
     build_consent_authkey,
     build_consent_pipe_name,
@@ -1575,6 +1587,10 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
         widget.bind("<B1-Motion>", _drag_move)
 
     # ---- 主体（可滚动：适配器数量不定，超高时滚动） ----
+    # pack 顺序：footer 先占底部，body 再填充剩余（否则 body 先扩展挤掉 footer）
+    footer = tk.Frame(top, bg="white", height=S_px(52))
+    footer.pack(fill="x", side="bottom")
+    footer.pack_propagate(False)
     body = tk.Frame(top, bg="white")
     body.pack(fill="both", expand=True)
 
@@ -1595,8 +1611,7 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
     def _wheel(event):
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    canvas.bind("<MouseWheel>", _wheel)
-    inner.bind("<MouseWheel>", _wheel)
+    top.bind("<MouseWheel>", _wheel)  # top 级绑定：窗口任意位置滚轮均生效
     top.bind("<Escape>", _close)
 
     hero = tk.Frame(inner, bg="white")
@@ -1663,9 +1678,6 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
                  wraplength=WIDTH - PAD_X * 2).pack(fill="x", padx=PAD_X, pady=(S_px(8), 0))
 
     # ---- 底部：采集时间 + 关闭 ----
-    footer = tk.Frame(top, bg="white", height=S_px(52))
-    footer.pack(fill="x", side="bottom")
-    footer.pack_propagate(False)
     tk.Label(footer, text=f"采集时间  {collected_at}", font=("Microsoft YaHei UI", 8),
              bg="white", fg=TEXT_SUB, anchor="w").place(x=PAD_X, y=S_px(18))
     close_btn = tk.Label(footer, text="关 闭", font=("Microsoft YaHei UI", 9, "bold"),
@@ -1675,6 +1687,7 @@ def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
     _make_hover(close_btn, GRAY_BTN, GRAY_BTN_ACTIVE)
 
     top.geometry(f"{WIDTH}x{body_h + HEADER_H + S_px(52)}+{pos_x}+{pos_y}")
+    top.update_idletasks()  # 先完成布局/控件实现，避免 deiconify 后白屏闪
     top.deiconify()
     try:
         top.lift()

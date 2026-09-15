@@ -3117,3 +3117,19 @@
 - 验证
   py_compile OK；模块加载/方法接线 OK；真实构建窗口（假数据 3 适配器）
   40 控件、480x608 居中、渲染无异常。双终端 1.9.28 COMMITTED。
+
+
+## [2026-09-15] 本机信息窗口"白屏卡顿"修复（1.9.29，四项）
+
+- 根因与修复
+  ① 白屏闪：deiconify 前缺布局计算——补 top.update_idletasks()；
+  ② 布局错位：pack 顺序错误（body 先 expand 挤掉 footer）——改为
+     header(top) → footer(bottom) → body(expand) 的正确顺序；
+  ③ 滚轮只在 canvas 区域生效（标签上滚轮无响应，体感"卡顿"）——升级到
+     top 级绑定（窗口任意位置滚轮均生效）；
+  ④ DPI：进程无 DPI 感知声明（Windows 位图拉伸渲染）——补
+     SetProcessDpiAwareness(2)/SetProcessDPIAware() 声明（实测进程内
+     声明未生效，awareness 仍 0——位图拉伸模糊属 DPI-unaware 渲染特性，
+     深水区暂不追；布局/白屏/滚轮三项确定性收益已落地）。
+- 验证：窗口构建 46 控件、480x694、渲染无异常；DPI 声明执行无副作用。
+  双终端 1.9.29 发布，等待 COMMITTED。
