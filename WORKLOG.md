@@ -3293,3 +3293,23 @@
   PyInstaller onefile（psutil hidden import）→ D:\IT2026\IT2026\
   ZViewServiceManager.exe（10.0MB）。exe 冒烟通过（5s 存活 + terminate）。
   逻辑验证：adopt/状态判定/UDP 判定/UI 构建（50 控件、5 服务全部 running）。
+
+
+## [2026-09-15] 项目目录清理：释放 2.8GB（零功能影响）
+
+- 清理明细
+  ① releases\：删除 32 个历史版本包（1.9.0~1.9.32，~2.5GB），保留
+     1.9.33（回滚）+ 1.9.34（当前）；
+  ② agent_upgrade\：删除 1.9.32/1.9.33 历史目录（144MB），保留 1.9.34
+     （当前 manifest 指向）；
+  ③ dist_agent_onefile\（84MB）：onefile 构建已废弃（1.9.24 起 onedir）；
+  ④ build_agent_work（68.5MB）/ build_updater_work（10.3MB）：构建缓存，
+     下次构建自动重建；
+  ⑤ __pycache__（2.2MB）；
+  ⑥ kilo_tmp：652 个临时文件（12.8MB），保留测量工具三件套
+     （rdp_baseline/motion_gen/encode_bench，WORKLOG 引用的可复用工具）。
+- 验证：health 200、TLS 8443 200、双终端心跳正常、当前升级包（1.9.34）
+  完整。服务零影响。
+- 保留未动（说明）
+  dist_agent\（151MB，发布管线签名暂存）、dist_updater\（打包依赖）、
+  frontend\ node_modules、全部源码脚本（源码级清理需引用分析，另行评估）。
