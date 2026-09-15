@@ -3273,3 +3273,23 @@
 - 验证：diff 复核干净；双终端 1.9.34 COMMITTED；consent-ui 进程恢复
   （pid=9824，1.9.34 路径）。待用户右键实测（版本条目 + About 版本行 +
   菜单正常弹出）。
+
+
+## [2026-09-15] ZViewServiceManager：平台前后端服务管理器 exe（新功能）
+
+- 用户需求：把除 Agent 以外的所有前后端服务做成一个 exe，打开显示各服务
+  状态，可点击启动/重启/停止。
+- 实现（zview_service_manager.py，新组件）
+  ① 服务注册表 5 项：平台 API（8080/8443）、软件管理 API（8081）、
+     软件策略 API（8082）、WT 网关（4433 UDP）、控制台前端（5173 vite preview）；
+  ② 进程管理：Popen 启动（CREATE_NO_WINDOW，输出重定向 %TEMP%\ZView\logs）、
+     taskkill /T 杀树停止、psutil cmdline 收编遗留进程（管理器重启后 adopt）；
+  ③ 状态判定：进程存活 + TCP 端口探测（UDP 的 wt 网关 = 进程活即 running）；
+     每 2s after 轮询刷新状态徽标与按钮启用态；
+  ④ 品牌化 Tk 窗口（与 Agent 托盘同一视觉语言）：服务行（状态徽标/名称/
+     端口/启动·重启·停止按钮）+ 全部启动/停止 + 底部操作日志；
+  ⑤ 单实例 mutex；UI 全部主线程（after 轮询，无跨线程 Tk 调用）。
+- 打包部署
+  PyInstaller onefile（psutil hidden import）→ D:\IT2026\IT2026\
+  ZViewServiceManager.exe（10.0MB）。exe 冒烟通过（5s 存活 + terminate）。
+  逻辑验证：adopt/状态判定/UDP 判定/UI 构建（50 控件、5 服务全部 running）。
