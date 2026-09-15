@@ -11,4 +11,4 @@ policy（策略执行）、jobs（任务执行端）。单体文件保留为薄�
 """
 
 # Agent 版本号（与 cmdb_agent_core.AGENT_VERSION 同源，发布时 bump）
-__version__ = "1.9.27"
+__version__ = "1.9.28"

@@ -3098,3 +3098,22 @@
   ① 模板字符串替换式改代码（KB_FILTER 占位符）在重构后语义漂移——占位符
      依赖的上下文变量随重构移位，必须全链路核对
   ② 任务通道失败详情可见化（error 透传）+ per-update 结果粒度 = 一轮定位
+
+
+## [2026-09-15] Agent 托盘"本机信息"窗口品牌化重做（1.9.28）
+
+- 用户反馈：Agent 双击（托盘图标）弹出的本机信息是裸 Win32 MessageBoxW，
+  太丑。
+- 重做（cmdb_agent_consent_ui.py）
+  ① 新增 _show_tk_machine_info_toplevel：与远控授权弹窗同一视觉语言的
+     品牌化 Tk 窗口——自绘品牌头部（盾牌图标+标题+关闭，可拖动）、主机名
+     hero 区、基本信息卡片（用户/系统/架构）、网络适配器卡片（在线状态
+     绿标+速率+IPv4/IPv6/MAC 等宽字体）、底部采集时间+关闭按钮；
+  ② DPI 自适应缩放（复用授权弹窗的 S/S_px 模式）；适配器数量不定 →
+     内容区可滚动（Canvas+Scrollbar+滚轮）；
+  ③ _tray_show_machine_info 改为经常驻 Tk UI 线程分发（_tk_ui_queue
+     job 模式，与授权弹窗一致，非阻塞不等待），Tk 不可用时回退原生
+     MessageBox（保底可用）。
+- 验证
+  py_compile OK；模块加载/方法接线 OK；真实构建窗口（假数据 3 适配器）
+  40 控件、480x608 居中、渲染无异常。双终端 1.9.28 COMMITTED。

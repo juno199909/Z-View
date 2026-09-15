@@ -1473,14 +1473,241 @@ def _tray_render_machine_info(info: dict) -> str:
     return "\n".join(lines)
 
 
+def _show_tk_machine_info_toplevel(self, info: dict, collected_at: str) -> None:
+    """在常驻 Tk UI 线程上构建品牌化的本机信息窗口（与授权弹窗同一视觉语言）。"""
+    import tkinter as tk
+
+    root = getattr(self, "_tk_ui_root", None)
+    if root is None:
+        raise RuntimeError("persistent consent ui root unavailable")
+
+    try:
+        _dpi = float(root.winfo_fpixels("1i"))
+    except Exception:
+        _dpi = 96.0
+    S = max(1.0, min(2.0, _dpi / 96.0))
+
+    def S_px(value: int) -> int:
+        return max(1, int(round(value * S)))
+
+    WIDTH = S_px(480)
+    HEADER_H = S_px(54)
+    PAD_X = S_px(26)
+    BRAND_DARK = "#0E3358"
+    BRAND = "#16497E"
+    TEXT_MAIN = "#1F2733"
+    TEXT_SUB = "#64707F"
+    CARD_BG = "#F4F7FA"
+    CARD_BORDER = "#DCE4EC"
+    GREEN = "#1E8E4E"
+    GRAY_BTN = "#EDF1F6"
+    GRAY_BTN_ACTIVE = "#DFE6EE"
+
+    top = tk.Toplevel(root)
+    top.withdraw()
+    top.title("Z-View 终端信息")
+    top.resizable(False, False)
+    top.configure(bg="white")
+    try:
+        top.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        top.overrideredirect(True)
+    except Exception:
+        pass
+
+    screen_w = top.winfo_screenwidth()
+    screen_h = top.winfo_screenheight()
+    pos_x = max(0, (screen_w - WIDTH) // 2)
+    pos_y = max(0, (screen_h - S_px(560)) // 3)
+
+    state = {"closed": False}
+
+    def _close(_event=None):
+        if state["closed"]:
+            return
+        state["closed"] = True
+        try:
+            top.destroy()
+        except Exception:
+            pass
+
+    def _make_hover(widget, normal_bg, hover_bg):
+        widget.bind("<Enter>", lambda _e: widget.configure(bg=hover_bg))
+        widget.bind("<Leave>", lambda _e: widget.configure(bg=normal_bg))
+
+    # ---- 头部（品牌条：盾牌 + 标题 + 关闭；支持拖动） ----
+    header = tk.Frame(top, bg=BRAND, height=HEADER_H)
+    header.pack(fill="x", side="top")
+    header.pack_propagate(False)
+    shield = tk.Canvas(header, width=S_px(26), height=S_px(30), bg=BRAND, highlightthickness=0)
+    shield.create_polygon(13, 1, 24, 5, 24, 14, 24, 19, 13, 29, 2, 19, 2, 5,
+                          fill="", outline="white", width=2, joinstyle=tk.ROUND)
+    shield.create_line(13, 9, 13, 16, fill="white", width=2, capstyle=tk.ROUND)
+    shield.create_oval(12, 18, 14, 20, fill="white", outline="")
+    shield.place(x=S_px(20), y=max(0, (HEADER_H - S_px(30)) // 2))
+    tk.Label(header, text="Z-View 终端信息", font=("Microsoft YaHei UI", 11, "bold"),
+             bg=BRAND, fg="white").place(x=S_px(54), y=S_px(8))
+    tk.Label(header, text="本机概览", font=("Microsoft YaHei UI", 9),
+             bg=BRAND, fg="#B9CBE0").place(x=S_px(54), y=S_px(30))
+    close_label = tk.Label(header, text="✕", font=("Microsoft YaHei UI", 11),
+                           bg=BRAND, fg="#C7D6E8", cursor="hand2", width=3)
+    close_label.place(x=WIDTH - S_px(46), y=0, height=HEADER_H)
+    close_label.bind("<Button-1>", _close)
+    _make_hover(close_label, BRAND, "#C0392B")
+
+    drag_state = {"x": 0, "y": 0}
+
+    def _drag_start(event):
+        drag_state["x"] = event.x
+        drag_state["y"] = event.y
+
+    def _drag_move(event):
+        if state["closed"]:
+            return
+        new_x = top.winfo_x() + event.x - drag_state["x"]
+        new_y = top.winfo_y() + event.y - drag_state["y"]
+        top.geometry(f"+{max(0, new_x)}+{max(0, new_y)}")
+
+    for widget in (header, shield):
+        widget.bind("<ButtonPress-1>", _drag_start)
+        widget.bind("<B1-Motion>", _drag_move)
+
+    # ---- 主体（可滚动：适配器数量不定，超高时滚动） ----
+    body = tk.Frame(top, bg="white")
+    body.pack(fill="both", expand=True)
+
+    adapters = info.get("adapters") or []
+    content_h = S_px(150 + 24) + len(adapters) * S_px(86) + S_px(70)
+    max_h = max(S_px(320), screen_h - S_px(120))
+    body_h = min(content_h, max_h)
+
+    canvas = tk.Canvas(body, bg="white", highlightthickness=0)
+    vs = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vs.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    vs.pack(side="right", fill="y")
+    inner = tk.Frame(canvas, bg="white")
+    canvas.create_window((0, 0), window=inner, anchor="nw", width=WIDTH - S_px(14))
+    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+    def _wheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind("<MouseWheel>", _wheel)
+    inner.bind("<MouseWheel>", _wheel)
+    top.bind("<Escape>", _close)
+
+    hero = tk.Frame(inner, bg="white")
+    hero.pack(fill="x", padx=PAD_X, pady=(S_px(18), S_px(6)))
+    tk.Label(hero, text=info.get("hostname", "未知"), font=("Microsoft YaHei UI", 15, "bold"),
+             bg="white", fg=TEXT_MAIN, anchor="w").pack(fill="x")
+    tk.Label(hero, text=f"{info.get('system', '')} [{info.get('arch', '')}]".rstrip(),
+             font=("Microsoft YaHei UI", 9), bg="white", fg=TEXT_SUB, anchor="w").pack(fill="x")
+
+    def _card(title_text):
+        tk.Label(inner, text=title_text, font=("Microsoft YaHei UI", 9, "bold"),
+                 bg="white", fg=TEXT_SUB, anchor="w").pack(fill="x", padx=PAD_X, pady=(S_px(14), S_px(4)))
+        card = tk.Frame(inner, bg=CARD_BG, highlightbackground=CARD_BORDER, highlightthickness=1)
+        card.pack(fill="x", padx=PAD_X)
+        return card
+
+    basic = _card("基本信息")
+    details = (
+        ("当前用户", info.get("user", "未知")),
+        ("操作系统", info.get("system", "未知")),
+        ("系统架构", info.get("arch") or "未知"),
+    )
+    for i, (key, value) in enumerate(details):
+        tk.Label(basic, text=key, font=("Microsoft YaHei UI", 9), bg=CARD_BG,
+                 fg=TEXT_SUB, width=10, anchor="e").grid(row=i, column=0, sticky="w", padx=(14, 10), pady=(6 if i == 0 else 2, 2))
+        tk.Label(basic, text=str(value), font=("Microsoft YaHei UI", 9, "bold"), bg=CARD_BG,
+                 fg=TEXT_MAIN, anchor="w").grid(row=i, column=1, sticky="w", padx=(0, 14), pady=(6 if i == 0 else 2, 2))
+
+    if adapters:
+        net = _card("网络适配器")
+        row = 0
+        for adapter in adapters:
+            up = bool(adapter.get("up"))
+            state_text = "在线" if up else "离线"
+            speed = adapter.get("speed_mbps") or 0
+            speed_text = f"{speed}Mbps" if speed > 0 else "速率未知"
+            tk.Label(net, text=str(adapter.get("name", "未命名")), font=("Microsoft YaHei UI", 9, "bold"),
+                     bg=CARD_BG, fg=TEXT_MAIN, anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=(14, 10), pady=(10 if row else 8, 0))
+            tk.Label(net, text=state_text, font=("Microsoft YaHei UI", 8, "bold"), bg=CARD_BG,
+                     fg=GREEN if up else TEXT_SUB, anchor="e").grid(row=row, column=2, sticky="e", padx=(0, 14), pady=(10 if row else 8, 0))
+            row += 1
+            tk.Label(net, text=speed_text, font=("Microsoft YaHei UI", 8), bg=CARD_BG,
+                     fg=TEXT_SUB, anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=(22, 4))
+            row += 1
+            for ip in adapter.get("ipv4") or []:
+                tk.Label(net, text=f"IPv4  {ip}", font=("Consolas", 8), bg=CARD_BG,
+                         fg=TEXT_MAIN, anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=(22, 4))
+                row += 1
+            for ip in (adapter.get("ipv6") or [])[:2]:
+                tk.Label(net, text=f"IPv6  {ip}", font=("Consolas", 8), bg=CARD_BG,
+                         fg=TEXT_SUB, anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=(22, 4))
+                row += 1
+            if adapter.get("mac"):
+                tk.Label(net, text=f"MAC  {adapter['mac']}", font=("Consolas", 8), bg=CARD_BG,
+                         fg=TEXT_MAIN, anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", padx=(22, 4))
+                row += 1
+    else:
+        tk.Label(inner, text="网络适配器: 无可用数据", font=("Microsoft YaHei UI", 9),
+                 bg="white", fg=TEXT_SUB, anchor="w").pack(fill="x", padx=PAD_X, pady=(S_px(14), 0))
+
+    if info.get("collect_error"):
+        tk.Label(inner, text=str(info["collect_error"]), font=("Microsoft YaHei UI", 8),
+                 bg="white", fg="#C0392B", anchor="w",
+                 wraplength=WIDTH - PAD_X * 2).pack(fill="x", padx=PAD_X, pady=(S_px(8), 0))
+
+    # ---- 底部：采集时间 + 关闭 ----
+    footer = tk.Frame(top, bg="white", height=S_px(52))
+    footer.pack(fill="x", side="bottom")
+    footer.pack_propagate(False)
+    tk.Label(footer, text=f"采集时间  {collected_at}", font=("Microsoft YaHei UI", 8),
+             bg="white", fg=TEXT_SUB, anchor="w").place(x=PAD_X, y=S_px(18))
+    close_btn = tk.Label(footer, text="关 闭", font=("Microsoft YaHei UI", 9, "bold"),
+                         bg=GRAY_BTN, fg=TEXT_MAIN, cursor="hand2", width=10)
+    close_btn.place(x=WIDTH - S_px(26) - S_px(88), y=(S_px(52) - S_px(30)) // 2, height=S_px(30))
+    close_btn.bind("<Button-1>", _close)
+    _make_hover(close_btn, GRAY_BTN, GRAY_BTN_ACTIVE)
+
+    top.geometry(f"{WIDTH}x{body_h + HEADER_H + S_px(52)}+{pos_x}+{pos_y}")
+    top.deiconify()
+    try:
+        top.lift()
+        top.focus_force()
+    except Exception:
+        pass
+
+
 def _tray_show_machine_info(self) -> None:
-    """弹出「查看本机信息」对话框（IP/MAC 等）。"""
+    """弹出「查看本机信息」窗口（品牌化 Tk 窗口；Tk 不可用时回退原生 MessageBox）。"""
+    collected_at = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         info = _tray_collect_machine_info(self)
+    except Exception as exc:
+        info = {"hostname": "未知", "user": "未知", "system": "未知", "arch": "",
+                "adapters": [], "collect_error": f"{type(exc).__name__}: {exc}"}
+    _append_consent_runtime_log("tray action: view machine info")
+    try:
+        if _ensure_tk_ui_thread(self):
+            job = {
+                "fn": lambda: _show_tk_machine_info_toplevel(self, info, collected_at),
+                "done": threading.Event(),
+            }
+            self._tk_ui_queue.put(job)
+            # 非阻塞：信息窗无需等待结果，UI 线程自行完成
+            return
+    except Exception as exc:
+        _append_consent_runtime_log(f"tk machine info dispatch failed: {exc}")
+    # Tk 不可用 → 回退原生 MessageBox
+    try:
         text = _tray_render_machine_info(info)
     except Exception as exc:
         text = f"本机信息采集失败: {type(exc).__name__}: {exc}"
-    _append_consent_runtime_log("tray action: view machine info")
     ctypes.windll.user32.MessageBoxW(
         None,
         text,
