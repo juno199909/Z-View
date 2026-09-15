@@ -150,7 +150,7 @@ const routes = [
             path: 'agent-deploy',
             name: 'AgentDeploy',
             component: () => import('@/views/terminal/AgentDeploy.vue'),
-            meta: { title: '终端部署' }
+            meta: { title: 'Agent部署' }
           }
         ]
       },
@@ -202,6 +202,16 @@ const routes = [
         name: 'AgentPolicy',
         component: () => import('@/views/settings/AgentPolicy.vue'),
         meta: { title: '终端策略', icon: 'Setting' }
+      },
+      {
+        path: '/agent/manage',
+        component: () => import('@/views/agent/AgentManage.vue'),
+        children: [
+          { path: '', redirect: '/agent/manage/policy' },
+          { path: 'policy', name: 'AgentManagePolicy', component: () => import('@/views/settings/AgentPolicy.vue'), meta: { title: 'Agent策略' } },
+          { path: 'deploy', name: 'AgentManageDeploy', component: () => import('@/views/terminal/AgentDeploy.vue'), meta: { title: 'Agent部署' } },
+          { path: 'upgrade', name: 'AgentManageUpgrade', component: () => import('@/views/terminal/AgentUpgrade.vue'), meta: { title: 'Agent升级' } }
+        ]
       }
     ]
   },

@@ -2,7 +2,7 @@
   <div class="zv-page">
     <div class="zv-page-header">
       <div>
-        <h2 class="zv-page-title">终端策略</h2>
+        <h2 class="zv-page-title">Agent策略</h2>
         <div class="zv-page-subtitle">通过策略统一下发终端行为，最后更新 {{ updatedAt || '尚未更新' }}</div>
       </div>
       <div class="zv-page-actions">

@@ -3313,3 +3313,20 @@
 - 保留未动（说明）
   dist_agent\（151MB，发布管线签名暂存）、dist_updater\（打包依赖）、
   frontend\ node_modules、全部源码脚本（源码级清理需引用分析，另行评估）。
+
+
+## [2026-09-15] Agent管理统一页：Agent策略/部署/升级三合一（用户需求）
+
+- 需求
+  ① 终端策略 → 改名"Agent策略"；② 终端部署 → 改名"Agent部署"；
+  ③ 与 Agent升级 合并成统一入口"Agent管理"。
+- 实现（复用日志配置验证过的路由式页签模式）
+  ① 新增 /agent/manage 统一页（views/agent/AgentManage.vue：页签导航 +
+     router-view），三子路由 policy/deploy/upgrade 渲染原三个页面组件；
+  ② 菜单收敛：移除 Agent升级/终端部署/终端策略 三个独立菜单项，新增
+     "Agent管理"（软件管理之后）；原三路由（/terminal/agent-upgrade、
+     /terminal/agent-deploy、/settings/agent-policy）保留兼容直链；
+  ③ 页面标题改名：AgentPolicy 终端策略→Agent策略、AgentDeploy
+     终端部署→Agent部署（AgentUpgrade 不变）。
+- 验证：前端构建通过；Layout 菜单收敛确认（无终端部署残留项）、
+  AgentManage 路由与懒加载分块进 dist。

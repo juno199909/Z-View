@@ -2,7 +2,7 @@
   <div class="zv-page">
     <div class="zv-page-header">
       <div>
-        <h2 class="zv-page-title">终端部署</h2>
+        <h2 class="zv-page-title">Agent部署</h2>
         <div class="zv-page-subtitle">网页自助下载 · 静默安装 · 域批量部署 —— 新终端三步接入，无需手动拷贝</div>
       </div>
       <div class="zv-page-actions">
