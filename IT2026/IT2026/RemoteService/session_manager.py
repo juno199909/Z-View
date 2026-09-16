@@ -1042,8 +1042,26 @@ class SessionManager:
             )
         if normalized_action == "capture_frame":
             return self._invoke_capture_frame_action(normalized_action, action_payload)
+        if normalized_action == "send_sas":
+            return self._send_sas_action()
 
         raise ValueError(f"unsupported admin action: {normalized_action}")
+
+    def _send_sas_action(self) -> dict:
+        """以 SYSTEM 服务身份触发 SAS（Ctrl+Alt+Del），直达 winlogon。"""
+        try:
+            import ctypes
+
+            sas_dll = ctypes.WinDLL("sas.dll")
+            send_sas = sas_dll.SendSAS
+            send_sas.argtypes = [ctypes.c_bool, ctypes.c_bool]
+            send_sas.restype = None
+            send_sas(False, False)
+            self.bridge.log_runtime_event("ServiceRuntime", "SAS dispatched (Ctrl+Alt+Del)")
+            return {"ok": True, "message": "SAS dispatched"}
+        except Exception as exc:
+            self.bridge.log_runtime_event("ServiceRuntime", f"SAS dispatch failed: {exc}")
+            return {"ok": False, "message": str(exc)}
 
     def start_supervisor(self) -> None:
         if self._thread is not None and self._thread.is_alive():

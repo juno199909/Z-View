@@ -21,29 +21,51 @@
             </el-tag>
             <el-tag size="small" type="warning" effect="plain">{{ transportType === 'udp' ? 'UDP' : 'TCP' }}</el-tag>
             <el-tag v-if="h264Active" size="small" type="success" effect="plain">H.264 {{ fps }}FPS</el-tag>
+            <el-tag v-if="connectionStatus === 'connected'" size="small" effect="plain" :type="latency <= 80 ? 'success' : latency <= 200 ? 'warning' : 'danger'">
+              {{ latency }}ms · {{ fps }}FPS
+            </el-tag>
             <span class="info">{{ targetInfo }}</span>
             <el-button-group>
-              <el-button size="small" :icon="FullScreen" @click="toggleFullscreen">
-                全屏
-              </el-button>
-              <el-button size="small" :icon="Refresh" @click="reconnect">
-                重连
-              </el-button>
-              <el-button size="small" :icon="DocumentCopy" @click="openClipboardDialog">
-                剪贴板
-              </el-button>
-              <el-button size="small" :icon="FolderOpened" @click="openFileTransferDialog">
-                文件传输
-              </el-button>
-              <el-button size="small" :icon="Monitor" @click="openShellDrawer">
-                终端
-              </el-button>
-              <el-button size="small" :icon="Setting" @click="showSettings">
-                设置
-              </el-button>
-              <el-button size="small" type="danger" plain @click="handleClose">
-                关闭
-              </el-button>
+              <el-tooltip content="切换全屏模式" placement="bottom">
+                <el-button size="small" :icon="FullScreen" @click="toggleFullscreen">
+                  全屏
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="重新建立远控连接" placement="bottom">
+                <el-button size="small" :icon="Refresh" @click="reconnect">
+                  重连
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="打开剪贴板同步" placement="bottom">
+                <el-button size="small" :icon="DocumentCopy" @click="openClipboardDialog">
+                  剪贴板
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="双向传输文件" placement="bottom">
+                <el-button size="small" :icon="FolderOpened" @click="openFileTransferDialog">
+                  文件传输
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="打开远程命令终端（受策略门控）" placement="bottom">
+                <el-button size="small" :icon="Monitor" @click="openShellDrawer">
+                  终端
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="发送安全注意序列到远程终端（用于锁屏/切换用户/任务管理器）" placement="bottom">
+                <el-button size="small" :icon="Key" @click="sendCtrlAltDel">
+                  Ctrl+Alt+Del
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="画质与输入参数调优" placement="bottom">
+                <el-button size="small" :icon="Setting" @click="showSettings">
+                  设置
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="结束本次远程会话" placement="bottom">
+                <el-button size="small" type="danger" plain @click="handleClose">
+                  断开
+                </el-button>
+              </el-tooltip>
             </el-button-group>
           </el-space>
         </div>
@@ -74,6 +96,9 @@
               </el-tag>
               <el-tag size="small" type="warning" effect="plain">{{ transportType === 'udp' ? 'UDP' : 'TCP' }}</el-tag>
               <el-tag v-if="h264Active" size="small" type="success" effect="plain">H.264 {{ fps }}FPS</el-tag>
+              <el-tag v-if="connectionStatus === 'connected'" size="small" effect="plain" :type="latency <= 80 ? 'success' : latency <= 200 ? 'warning' : 'danger'">
+                {{ latency }}ms · {{ fps }}FPS
+              </el-tag>
               <span class="fullscreen-info">{{ targetInfo }}</span>
               <span class="fullscreen-field">桌面</span>
               <el-select
@@ -168,6 +193,12 @@
               <el-button size="small" text @click="openShellDrawer">
                 终端
               </el-button>
+              <el-button size="small" text @click="sendCtrlAltDel">
+                Ctrl+Alt+Del
+              </el-button>
+              <el-button size="small" text :icon="Refresh" @click="reconnect">
+                重连
+              </el-button>
               <el-button size="small" text @click="hideFullscreenToolbar">
                 隐藏菜单
               </el-button>
@@ -256,11 +287,13 @@
             @change="handlePresetChange"
           />
         </el-form-item>
-        <el-form-item label="压缩质量">
-          <el-slider v-model="settingsForm.quality" :min="35" :max="90" :step="5" show-input @change="markPresetCustom" />
-        </el-form-item>
-        <el-form-item label="帧率">
-          <el-slider v-model="settingsForm.fps" :min="4" :max="30" :step="1" show-input @change="markPresetCustom" />
+        <el-form-item label="传输模式">
+          <el-switch
+            v-model="settingsForm.adaptive"
+            inline-prompt
+            active-text="自适应"
+            inactive-text="手动"
+          />
         </el-form-item>
         <el-form-item label="桌面分辨率">
           <el-select
@@ -276,37 +309,6 @@
             />
           </el-select>
         </el-form-item>
-        <el-form-item label="推流分辨率">
-          <el-select
-            :model-value="settingsForm.scalePercent"
-            style="width: 100%"
-            @change="handleSettingsResolutionChange"
-          >
-            <el-option
-              v-for="option in getResolutionScaleOptions(settingsForm.scalePercent)"
-              :key="option"
-              :label="getResolutionOptionLabel(option)"
-              :value="option"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="输出缩放">
-          <el-slider v-model="settingsForm.scalePercent" :min="40" :max="100" :step="5" show-input @change="markPresetCustom" />
-        </el-form-item>
-        <el-form-item label="传输模式">
-          <el-switch
-            v-model="settingsForm.adaptive"
-            inline-prompt
-            active-text="自适应"
-            inactive-text="手动"
-          />
-        </el-form-item>
-        <el-form-item label="滚轮速度">
-          <el-slider v-model="settingsForm.wheelSpeed" :min="0.5" :max="3" :step="0.1" show-input @change="markPresetCustom" />
-        </el-form-item>
-        <el-form-item label="鼠标灵敏度">
-          <el-slider v-model="settingsForm.mouseSensitivity" :min="0.5" :max="2" :step="0.1" show-input @change="markPresetCustom" />
-        </el-form-item>
         <el-form-item label="自动重连">
           <el-switch
             v-model="settingsForm.autoReconnect"
@@ -315,8 +317,27 @@
             inactive-text="关"
           />
         </el-form-item>
+        <el-collapse class="zv-advanced-collapse">
+          <el-collapse-item title="高级参数" name="advanced">
+            <el-form-item label="压缩质量">
+              <el-slider v-model="settingsForm.quality" :min="35" :max="90" :step="5" show-input @change="markPresetCustom" />
+            </el-form-item>
+            <el-form-item label="帧率">
+              <el-slider v-model="settingsForm.fps" :min="4" :max="30" :step="1" show-input @change="markPresetCustom" />
+            </el-form-item>
+            <el-form-item label="输出缩放">
+              <el-slider v-model="settingsForm.scalePercent" :min="40" :max="100" :step="5" show-input @change="markPresetCustom" />
+            </el-form-item>
+            <el-form-item label="滚轮速度">
+              <el-slider v-model="settingsForm.wheelSpeed" :min="0.5" :max="3" :step="0.1" show-input @change="markPresetCustom" />
+            </el-form-item>
+            <el-form-item label="鼠标灵敏度">
+              <el-slider v-model="settingsForm.mouseSensitivity" :min="0.5" :max="2" :step="0.1" show-input @change="markPresetCustom" />
+            </el-form-item>
+          </el-collapse-item>
+        </el-collapse>
         <div class="settings-hint">
-          桌面分辨率会修改被控端真实 Windows 显示模式；推流分辨率只影响传输画面的输出尺寸；压缩质量只影响 JPEG 编码质量。自适应模式会在带宽或负载压力较高时自动降低帧率、压缩质量和推流分辨率。
+          桌面分辨率会修改被控端真实 Windows 显示模式；输出缩放只影响传输画面的输出尺寸；压缩质量只影响 JPEG 编码质量。自适应模式会在带宽或负载压力较高时自动降低帧率、压缩质量和推流分辨率。
         </div>
       </el-form>
 
@@ -618,9 +639,9 @@ import { hexToBytes, concatU8, arrayBufferToBase64, base64ToUint8Array, createTr
 import { useClipboard } from '@/composables/useClipboard'
 import { useRemoteShell } from '@/composables/useRemoteShell'
 import RemoteShellTerminal from '@/components/RemoteShellTerminal.vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  FullScreen, Refresh, Setting, Loading, CircleClose, Monitor,
+  FullScreen, Refresh, Setting, Loading, CircleClose, Monitor, Key,
   DocumentCopy, FolderOpened, UploadFilled, Download
 } from '@element-plus/icons-vue'
 import { getAuthToken } from '@/api/auth-session'
@@ -1927,6 +1948,12 @@ const handleMessage = (data) => {
     } else if (typeof message.type === 'string' && message.type.startsWith('shell_')) {
       // Remote Shell 消息转发给终端组件（抽屉未打开时丢弃）
       shellTerminalRef.value?.handleEngineMessage(message)
+    } else if (message.type === 'sas_result') {
+      if (message.ok) {
+        ElMessage.success(message.message || 'Ctrl+Alt+Del 已发送')
+      } else {
+        ElMessage.error(message.message || 'Ctrl+Alt+Del 发送失败')
+      }
     } else if (message.type === 'pong') {
       const sentAt = typeof message.timestamp === 'number' ? message.timestamp : lastPingSentAt
       if (sentAt > 0) {
@@ -3984,7 +4011,28 @@ const handleClose = () => {
     return
   }
 
+  // 断开是高风险操作：会话进行中需二次确认
+  if (connectionStatus.value === 'connected') {
+    ElMessageBox.confirm('确定断开当前远程桌面会话？', '断开确认', {
+      type: 'warning',
+      confirmButtonText: '断开',
+      cancelButtonText: '取消',
+    })
+      .then(() => void requestDialogClose())
+      .catch(() => {})
+    return
+  }
+
   void requestDialogClose()
+}
+
+const sendCtrlAltDel = () => {
+  handleFullscreenActivity()
+  if (connectionStatus.value !== 'connected') {
+    ElMessage.warning('远程桌面未连接')
+    return
+  }
+  sendSocketMessage({ type: 'send_sas' })
 }
 
 const normalizeNumber = (value, fallback) => {

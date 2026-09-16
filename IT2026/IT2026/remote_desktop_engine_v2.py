@@ -3480,6 +3480,9 @@ class RemoteDesktopSession:
             elif msg_type == 'shell_stop':
                 self.last_input_at = time.time()
                 await self.handle_shell_stop(message)
+            elif msg_type == 'send_sas':
+                self.last_input_at = time.time()
+                await self.handle_send_sas(message)
             elif msg_type == 'ping':
                 await self._send_json({
                     'type': 'pong',
@@ -3772,6 +3775,24 @@ class RemoteDesktopSession:
                 'id': shell_id,
                 'code': 'not_running',
                 'message': '当前没有正在执行的命令',
+            })
+
+    async def handle_send_sas(self, message: dict):
+        """发送 Ctrl+Alt+Del：委托高完整性服务（SYSTEM）调用 sas.dll SendSAS。"""
+        try:
+            result = self.input_injector.request_privileged_action("send_sas")
+            ok = bool(result.get("ok", False)) if isinstance(result, dict) else False
+            detail = str(result.get("message") or "") if isinstance(result, dict) else ""
+            await self._send_json({
+                "type": "sas_result",
+                "ok": ok,
+                "message": "Ctrl+Alt+Del 已发送" if ok else (detail or "发送失败"),
+            })
+        except Exception as exc:
+            await self._send_json({
+                "type": "sas_result",
+                "ok": False,
+                "message": f"发送失败: {exc}",
             })
 
     def _teardown_shell(self) -> None:
