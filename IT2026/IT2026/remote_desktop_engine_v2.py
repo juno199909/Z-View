@@ -3197,6 +3197,9 @@ class RemoteDesktopSession:
         不足时帧率本来就低，降画质只会更模糊且无法提升帧率。
         升档：积压消除且 ACK 速率 ≥ 实际发送帧率的八成（网络有余量）。
         """
+        # 「传输模式」开关：手动（adaptive=False）时固定参数，禁用 QoS 自动降档
+        if not self.adaptive_streaming:
+            return
         # 会话刚建立/帧数太少时不评估（避免统计噪声导致误降档）
         if self.h264_activated_at == 0 or time.time() - self.h264_activated_at < 3.0:
             return
