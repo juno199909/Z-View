@@ -1052,12 +1052,13 @@ class HighIntegritySessionHelperRuntime:
         return ""
 
     def _encode_h264_packets(self, screenshot, force_keyframe: bool) -> list[dict[str, Any]]:
-        """抓屏帧 → H.264 Annex-B 包（base64），持久编码器随分辨率重建。"""
+        """抓屏帧 → H.264 Annex-B 包（base64），持久编码器随分辨率/CRF 重建。"""
         import base64 as _base64
         from Codec.h264_encoder import H264StreamEncoder
 
         width = int(getattr(screenshot, "width", 0) or 0)
         height = int(getattr(screenshot, "height", 0) or 0)
+        crf = int(getattr(self, "_h264_crf", 21))
         enc = getattr(self, "_h264_encoder", None)
         if enc is None or enc.width != width or enc.height != height:
             try:
@@ -1065,9 +1066,15 @@ class HighIntegritySessionHelperRuntime:
                     enc.close()
             except Exception:
                 pass
-            enc = H264StreamEncoder(width, height, fps=30, crf=int(getattr(self, "_h264_crf", 21)))
+            enc = H264StreamEncoder(width, height, fps=30, crf=crf)
             self._h264_encoder = enc
             self._h264_fail_count = 0
+        elif getattr(enc, "crf", None) != crf:
+            # 预设切换（清晰度档位）通过 set_crf 热更新，下一帧自动为 IDR
+            try:
+                enc.set_crf(crf)
+            except Exception:
+                pass
         pkts = enc.encode(screenshot, keyframe=force_keyframe)
         return [
             {"data": _base64.b64encode(p["data"]).decode("ascii"), "keyframe": bool(p["keyframe"])}

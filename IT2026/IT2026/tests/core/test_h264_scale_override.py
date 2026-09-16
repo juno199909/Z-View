@@ -28,11 +28,11 @@ def test_override_smooth_caps_at_70():
     assert s._apply_h264_scale(img).size == (140, 70)
 
 
-def test_qos_can_still_drop_below_override():
-    """弱机压力下 QoS 降到 0.6，仍低于预设上限 0.7——继续生效。"""
+def test_override_is_authoritative_over_qos():
+    """预设档位直接决定缩放：QoS 弱机降采样不再穿透预设（高清=满分辨率语义）。"""
     s = make_session(0.6, 0.7)
     img = Image.new("RGB", (200, 100))
-    assert s._apply_h264_scale(img).size == (120, 60)
+    assert s._apply_h264_scale(img).size == (140, 70)
 
 
 def test_no_override_legacy_behavior():

@@ -120,8 +120,10 @@ class H264StreamEncoder:
         ctx.gop_size = max(2 * self.fps, 60)  # 约 2 秒一个 IDR
         ctx.max_b_frames = 0  # 低延迟：无 B 帧
         if codec_name == "libx264":
+            # 低 CRF（高清档）用 superfast 提升压缩效率/清晰度；高 CRF 保持 ultrafast 保帧率
+            x264_preset = "superfast" if self._crf <= 20 else "ultrafast"
             ctx.options = {
-                "preset": "ultrafast",
+                "preset": x264_preset,
                 "tune": "zerolatency",
                 "crf": str(self._crf),
                 "threads": "4",

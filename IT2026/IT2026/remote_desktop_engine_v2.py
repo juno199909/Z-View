@@ -1531,9 +1531,14 @@ class RemoteDesktopSession:
             # 深度诊断仅按需采集：每帧携带 desktop_state/backend_diagnostics 会让
             # 响应膨胀数十 KB，经两跳命名管道传输后把帧率拖到亚秒级。
             include_diagnostics = self.capture_empty_count >= 3
+            # 画质预设（高清/均衡/流畅）直接决定推流缩放与 CRF；custom 走 QoS 自适应
+            scale_override = getattr(self, "_h264_scale_override", None)
+            effective_scale = (
+                float(scale_override) if scale_override is not None else self._h264_scale
+            ) if self.h264_active else profile["scale"]
             service_payload = {
                 "quality": profile["quality"],
-                "scale": self._h264_scale if self.h264_active else profile["scale"],
+                "scale": effective_scale,
                 "previous_signature": self.last_frame_signature,
                 "include_desktop_state": include_diagnostics,
                 "include_backend_diagnostics": include_diagnostics,
@@ -1541,6 +1546,9 @@ class RemoteDesktopSession:
             if self.h264_active:
                 # 助手侧直接 H.264 编码（省 JPEG 往返）；观看端请求关键帧时透传
                 service_payload["codec"] = "h264"
+                crf_override = getattr(self, "_h264_crf_override", None)
+                if crf_override:
+                    service_payload["crf"] = int(crf_override)
                 if self._h264_keyframe_requested:
                     service_payload["force_keyframe"] = True
             call_started_at = time.perf_counter()
@@ -3106,9 +3114,11 @@ class RemoteDesktopSession:
         画质预设（handle_settings）设置缩放上限：QoS 只能在上限内继续降采样。
         """
         override = getattr(self, "_h264_scale_override", None)
-        scale = float(getattr(self, "_h264_scale", 1.0) or 1.0)
         if override is not None:
-            scale = min(scale, float(override))
+            # 预设直接决定缩放（高清=1.0 满分辨率），QoS 不再降采样
+            scale = float(override)
+        else:
+            scale = float(getattr(self, "_h264_scale", 1.0) or 1.0)
         if scale >= 0.99:
             return pil_image
         try:
