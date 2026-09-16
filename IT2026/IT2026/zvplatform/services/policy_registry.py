@@ -156,3 +156,113 @@ def build_effective_agent_policies(conn, asset_id: int) -> dict:
     base = load_agent_policies()
     override = resolve_agent_override(conn, asset_id)
     return merge_agent_policies(base, override)
+
+
+# ============ 软件策略并入（Phase 2：解析确定性收敛，存储/执行链路保留） ============
+#
+# 软件策略是多实例规则联合评估（blacklist/whitelist/force_install 同时生效），
+# 与"每类型单一生效策略"的引擎语义不同，因此不进 select_for_type；
+# 这里统一的是：排序确定性（policy_engine.sort_candidates，scope 权重参与
+# 平级 tiebreak）与"终端生效策略"统一视图。
+
+SOFTWARE_TARGET_SCOPE = {"all": "global", "group": "group", "asset": "asset"}
+
+
+def map_software_policy_to_unified(row: dict) -> dict:
+    """software_policies 行 → 统一策略 dict（纯函数，供排序与视图复用）。"""
+    target_type = str(row.get("target_type") or "all")
+    return {
+        "id": row.get("id"),
+        "policy_name": row.get("policy_name"),
+        "policy_type": "software",
+        "subtype": row.get("policy_type"),
+        "priority": int(row.get("priority") or 0),
+        "enabled": bool(row.get("enabled")),
+        "scope_type": SOFTWARE_TARGET_SCOPE.get(target_type, "global"),
+        "target_type": target_type,
+        "description": row.get("description"),
+    }
+
+
+def software_policy_applies(unified: dict, group_id: Optional[int], asset_id: int) -> bool:
+    """统一化后的软件策略是否作用于某终端（纯函数）。"""
+    scope = unified.get("scope_type")
+    if scope == "global":
+        return True
+    if scope == "group":
+        return group_id is not None and unified.get("target_id") == group_id
+    if scope == "asset":
+        return unified.get("target_id") == asset_id
+    return False
+
+
+def resolve_effective_software_policies(conn, asset_id: int) -> Dict[str, List[dict]]:
+    """按统一引擎排序返回该终端适用的软件策略（blacklist/whitelist/force_install 分组）。"""
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, policy_name, policy_type, description, enabled, priority, "
+            "target_type, target_ids FROM software_policies WHERE enabled = 1"
+        )
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT group_id FROM assets WHERE id=%s", (asset_id,))
+        row = cursor.fetchone()
+        group_id = (row or {}).get("group_id")
+    finally:
+        cursor.close()
+
+    from zvplatform.policy_engine import sort_candidates
+
+    grouped: Dict[str, List[dict]] = {"blacklist": [], "whitelist": [], "force_install": []}
+    for raw in rows:
+        try:
+            target_ids = json.loads(raw.get("target_ids") or "[]")
+        except (TypeError, ValueError):
+            target_ids = []
+        if not isinstance(target_ids, list):
+            target_ids = []
+        unified_base = map_software_policy_to_unified(raw)
+        # target 展开为候选（all=global 单候选；group/asset 按 id 列表展开）
+        candidates = []
+        if unified_base["scope_type"] == "global" or not target_ids:
+            candidates.append({**unified_base, "target_id": None})
+        else:
+            for tid in target_ids:
+                candidates.append({**unified_base, "target_id": int(tid) if isinstance(tid, (int, str)) and str(tid).isdigit() else tid})
+        for cand in candidates:
+            if not software_policy_applies(cand, group_id, asset_id):
+                continue
+            subtype = cand.get("subtype")
+            if subtype in grouped:
+                grouped[subtype].append(cand)
+    for subtype in grouped:
+        grouped[subtype] = sort_candidates(grouped[subtype])
+    return grouped
+
+
+def build_terminal_effective_policies(conn, asset_id: int) -> dict:
+    """策略中心统一视图：某终端四类策略的生效情况（一次查询）。
+
+    agent 字段返回 merged_config（全局兜底+覆盖合并后的最终心跳下发配置）
+    与 override（终端级覆盖策略原文，无则 None）。
+    """
+    unified = resolve_unified_policies(conn, asset_id)
+    result: Dict[str, Any] = {
+        "agent": {
+            "merged_config": build_effective_agent_policies(conn, asset_id),
+            "override": select_for_type(unified, "agent"),
+        }
+    }
+    for ptype in ("firewall", "usb"):
+        result[ptype] = select_for_type(unified, ptype)
+    try:
+        result["software"] = resolve_effective_software_policies(conn, asset_id)
+    except Exception as exc:
+        safe_console_print(f"[PolicyRegistry] resolve software policies failed: {exc}")
+        result["software"] = {"blacklist": [], "whitelist": [], "force_install": []}
+    return result

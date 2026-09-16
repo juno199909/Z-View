@@ -584,6 +584,26 @@ class SecurityPolicyRollback(BaseModel):
     version: int
 
 
+@router.get("/terminals/{asset_id}/effective-policies")
+def terminal_effective_policies(asset_id: int):
+    """统一策略引擎视图：某终端四类策略的生效情况（P1-05）。
+
+    firewall/usb/agent：统一引擎单一生效策略（含绑定来源）；software：多实例
+    规则联合评估模型，按 subtype 分组返回适用策略（统一排序）。
+    """
+    from zvplatform.services.policy_registry import build_terminal_effective_policies
+
+    conn = get_db()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        return {"asset_id": asset_id, "policies": build_terminal_effective_policies(conn, asset_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 @router.get("/policies")
 def list_security_policies(
     page: int = Query(1, ge=1),

@@ -5,7 +5,7 @@
       <el-button :icon="Refresh" plain @click="loadData">刷新</el-button>
     </div>
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
-      统一安全策略管理。在「防火墙 / USB管控」各模块页面通过结构化表单创建并下发策略；本页面用于管理已有策略：启用/禁用、绑定范围、版本回滚、查看执行结果、删除。
+      统一策略管理（P1-05）：防火墙 / USB管控 / 终端 Agent 策略在本页管理（启用/禁用、绑定范围、版本回滚、执行结果）；软件管控策略（黑名单/白名单/强制安装）为多实例规则模型，在「终端管理 → 策略管理」页维护，其排序确定性已收敛到统一策略引擎。
     </el-alert>
 
     <div class="zv-pol-filter">

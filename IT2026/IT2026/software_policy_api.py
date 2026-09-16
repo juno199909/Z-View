@@ -1363,10 +1363,16 @@ def check_policies(
             SELECT *
             FROM software_policies
             WHERE enabled = 1
-            ORDER BY priority DESC, id DESC
             """
         )
         policies = cursor.fetchall()
+        # P1-05：排序确定性收敛到统一策略引擎（priority DESC → scope asset>group>all → id DESC）
+        from zvplatform.policy_engine import sort_candidates
+        from zvplatform.services.policy_registry import map_software_policy_to_unified
+
+        policies = sort_candidates(
+            [{**p, "scope_type": map_software_policy_to_unified(p)["scope_type"]} for p in policies]
+        )
 
         software_context = build_software_match_context(
             software_name=software_name,
