@@ -197,6 +197,16 @@ def _heartbeat_loop():
                     body = None
                 if isinstance(body, dict):
                     applied = _apply_agent_policies(body.get("policies"))
+                    # P1-软件仓库自愈：平台在心跳响应中下发当前 Agent 令牌，
+                    # 配置漂移（安装时的旧 token vs 平台轮换后的新 token）时自动纠正，
+                    # 软件任务轮询/下载通道即时恢复，无需人工改配置或重装。
+                    try:
+                        platform_agent_token = str(body.get("agent_token") or "").strip()
+                        if platform_agent_token and platform_agent_token != SOFTWARE_CONFIG.get("token"):
+                            SOFTWARE_CONFIG["token"] = platform_agent_token
+                            safe_console_print("[Software] agent token refreshed from heartbeat")
+                    except Exception as exc:
+                        safe_console_print(f"[Software] token refresh failed: {exc}")
                     # V1.8.3 通用任务通道：执行心跳下发的任务，结果随下次心跳上报
                     try:
                         pending_jobs = body.get("jobs")

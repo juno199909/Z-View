@@ -144,6 +144,12 @@ def load_configs() -> tuple[dict, dict]:
     if "server_url" in user_config:
         software_config["server_url"] = user_config["server_url"].replace(":8080", ":8081")
 
+    # P1-软件仓库修复：软件通道令牌继承顶层 Agent 令牌（config.local.json 的 token）。
+    # 此前 SOFTWARE_CONFIG["token"] 仅来自 software 段/环境变量，默认为空，
+    # 导致 Agent 软件任务轮询的 Authorization 为空、8081 端点级校验 401 且静默失败。
+    if not software_config.get("token"):
+        software_config["token"] = config.get("token") or ""
+
     return _apply_env_overrides(config, software_config)
 
 

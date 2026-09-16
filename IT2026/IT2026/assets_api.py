@@ -25,7 +25,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 import websockets
-from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -106,6 +106,8 @@ AUTH_EXEMPTIONS = (
     {"path": "/api/v1/agent/security-policy-result", "methods": ["POST"]},
     {"path": "/api/v1/agent/upgrade/download", "methods": ["GET"]},
     {"path": "/api/v1/logs", "methods": ["POST"]},
+    # Agent 软件通道（反向代理到 8081；8081 侧同为 agent 专属豁免路径）
+    {"prefix": "/api/v1/software/agent/"},
 )
 
 # 数据库配置
@@ -4338,6 +4340,49 @@ app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
+
+
+# ============================================================
+# Agent 软件通道反向代理（P1-软件仓库）：Agent 统一指向平台 8443/8080，
+# 软件管理的 Agent 端点实现在 8081 软件服务，这里做透明转发。
+# 覆盖：tasks/poll、policies、packages/{id}/download、task-results/{id} 等。
+# ============================================================
+
+SOFTWARE_SERVICE_BASE = get_env("ZVIEW_SOFTWARE_SERVICE_URL", "http://127.0.0.1:8081")
+_agent_software_proxy_router = APIRouter(prefix="/api/v1/software/agent")
+
+
+@_agent_software_proxy_router.api_route("/{path:path}", methods=["GET", "POST", "PUT"])
+async def proxy_agent_software_endpoints(path: str, request: Request):
+    target_url = f"{SOFTWARE_SERVICE_BASE}/api/v1/software/agent/{path}"
+    try:
+        import httpx as _httpx
+
+        body = await request.body()
+        # 透传 Agent 鉴权头（8081 端点级 require_agent_request 依赖 Bearer 令牌）
+        forward_headers = {
+            "Content-Type": request.headers.get("content-type", "application/json"),
+            "Authorization": request.headers.get("authorization", ""),
+        }
+        async with _httpx.AsyncClient(timeout=60) as client:
+            resp = await client.request(
+                request.method,
+                target_url,
+                params=request.query_params,
+                content=body,
+                headers=forward_headers,
+            )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+    except Exception as proxy_exc:
+        safe_console_print(f"[AgentSoftwareProxy] forward failed: {proxy_exc}")
+        raise HTTPException(status_code=502, detail="软件服务不可达")
+
+
+app.include_router(_agent_software_proxy_router)
 
 # 网络监控路由（第一阶段：实时状态 + 历史趋势）
 from zvplatform.routers.network import router as network_router

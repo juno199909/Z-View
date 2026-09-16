@@ -765,11 +765,16 @@ def agent_heartbeat(data: dict, request: Request):
         except Exception as policies_exc:
             safe_console_print(f"[Heartbeat] unified policy resolve failed, fallback to global: {policies_exc}")
             effective_policies = load_agent_policies()
+        # P1-软件仓库自愈：下发当前 Agent 令牌，纠正终端侧配置漂移（软件通道 401 自愈）
+        from auth_utils import get_expected_agent_token
+
+        current_agent_token = get_expected_agent_token()
         heartbeat_response = {
             "status": "success",
             "asset_id": asset_id,
             "message": f"Heartbeat received: {report_type}",
             "policies": effective_policies,
+            "agent_token": current_agent_token,
         }
         if heartbeat_credential:
             heartbeat_response["agent_credential"] = heartbeat_credential

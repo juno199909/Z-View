@@ -1740,16 +1740,27 @@ def run_agent_service(
     print("[Software] Startup sequence begin")
     try:
         print("[Software] Step 1: Getting asset_id from server...")
-        asset_id = module.get_asset_id_from_server()
-        print(f"[Software] Step 2: Asset ID = {asset_id}")
+        # P1-软件仓库修复：启动期网络/服务未就绪会导致 asset_id 拉取瞬时失败，
+        # 此前直接禁用软件管理直到下次服务重启——改为有限重试窗口（约 2 分钟）。
+        asset_id = None
+        for _attempt in range(12):
+            try:
+                asset_id = module.get_asset_id_from_server()
+            except Exception as attempt_exc:
+                print(f"[Software] Step 1 attempt {_attempt + 1} failed: {attempt_exc}")
+            if asset_id:
+                break
+            print(f"[Software] Step 1 attempt {_attempt + 1}: asset_id 未获取，10s 后重试")
+            time.sleep(10)
 
         if asset_id:
+            print(f"[Software] Step 2: Asset ID = {asset_id}")
             print(f"[Software] Step 3: Starting software management with asset_id={asset_id}")
             module.start_software_management(asset_id)
             module.start_security_policy_sync(asset_id)
             print("[Software] Step 4: Software management + security policy sync started")
         else:
-            print("[Software] ERROR: Failed to get asset_id, software management disabled")
+            print("[Software] ERROR: Failed to get asset_id after retries, software management disabled")
     except Exception as exc:
         print(f"[Software] ERROR: Startup failed with exception: {exc}")
         import traceback

@@ -266,7 +266,7 @@ class SoftwareManager:
     def _sync_policies(self):
         url = urljoin(SOFTWARE_CONFIG["server_url"], "/api/v1/software/agent/policies")
         payload = {"asset_id": self.asset_id}
-        resp = requests.post(url, json=payload, headers=_software_headers(), timeout=30)
+        resp = requests.post(url, json=payload, headers=_software_headers(), timeout=30, verify=_agent_requests_verify())
         if resp.status_code == 200:
             print("[SoftwareManager] 策略同步成功")
         else:
@@ -275,7 +275,7 @@ class SoftwareManager:
     def _poll_and_execute_tasks(self):
         url = urljoin(SOFTWARE_CONFIG["server_url"], "/api/v1/software/agent/tasks/poll")
         payload = {"asset_id": self.asset_id}
-        resp = requests.post(url, json=payload, headers=_software_headers(), timeout=30)
+        resp = requests.post(url, json=payload, headers=_software_headers(), timeout=30, verify=_agent_requests_verify())
         if resp.status_code != 200:
             return
 
@@ -431,7 +431,7 @@ class SoftwareManager:
             headers["Range"] = f"bytes={resume_pos}-"
 
         mode = "ab" if resume_pos > 0 else "wb"
-        with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
+        with requests.get(url, headers=headers, stream=True, timeout=120, verify=_agent_requests_verify()) as resp:
             if resp.status_code == 416 and file_path.exists():
                 # 本地断点文件长度异常时删除后重新下载，避免无限 416。
                 file_path.unlink()
@@ -540,7 +540,7 @@ class SoftwareManager:
             if stderr_log is not None:
                 payload["stderr_log"] = self._truncate_log(stderr_log)
 
-            resp = requests.put(url, json=payload, headers=_software_headers(), timeout=30)
+            resp = requests.put(url, json=payload, headers=_software_headers(), timeout=30, verify=_agent_requests_verify())
             if resp.status_code >= 400:
                 print(f"[SoftwareManager] 结果上报 HTTP {resp.status_code}: {resp.text[:500]}")
         except Exception as exc:
