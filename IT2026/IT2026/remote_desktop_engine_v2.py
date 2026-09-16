@@ -3101,8 +3101,14 @@ class RemoteDesktopSession:
     )
 
     def _apply_h264_scale(self, pil_image):
-        """按动态分辨率缩放抓帧（弱机降采样保帧率，偶数尺寸适配 yuv420p）。"""
+        """按动态分辨率缩放抓帧（弱机降采样保帧率，偶数尺寸适配 yuv420p）。
+
+        画质预设（handle_settings）设置缩放上限：QoS 只能在上限内继续降采样。
+        """
+        override = getattr(self, "_h264_scale_override", None)
         scale = float(getattr(self, "_h264_scale", 1.0) or 1.0)
+        if override is not None:
+            scale = min(scale, float(override))
         if scale >= 0.99:
             return pil_image
         try:
@@ -3222,7 +3228,8 @@ class RemoteDesktopSession:
         self._h264_qos_level = level
         lvl = self.QOS_LEVELS[level]
         try:
-            if self.h264_encoder is not None:
+            if self.h264_encoder is not None and not getattr(self, "_h264_crf_override", None):
+                # 预设覆盖 CRF 时 QoS 不干预（避免与用户选择互相拉扯）
                 self.h264_encoder.set_crf(lvl["crf"])
             self._log_session_event(
                 "qos",
@@ -3534,8 +3541,15 @@ class RemoteDesktopSession:
         self.mouse_sensitivity = mouse_sensitivity
         self.color_preset = preset
         # P1-画质反馈修复：H264 管线此前完全忽略预设参数——
-        # 现将画质预设映射为 H.264 CRF 档位（custom 交还 QoS 自适应）
+        # 预设同时驱动 H.264 CRF 档位与推流缩放上限（custom 交还 QoS 自适应）
         self._h264_crf_override = {"high": 19, "balanced": 23, "smooth": 28}.get(preset)
+        self._h264_scale_override = {"high": 1.0, "balanced": 0.85, "smooth": 0.7}.get(preset)
+        self._log_session_event(
+            "settings",
+            f"applied preset={preset} quality={self.quality} fps={self.fps} "
+            f"scale={self.scale:.2f} crf_override={self._h264_crf_override} "
+            f"scale_override={self._h264_scale_override} h264_active={self.h264_active}",
+        )
         self.capture_pressure = 0.0
         self.last_frame_profile_key = None
         self.last_frame_signature = None
