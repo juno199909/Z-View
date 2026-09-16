@@ -351,6 +351,7 @@ const titleMap = {
   '/terminal/agent-upgrade': { title: 'Agent升级', icon: 'Goods' },
   '/discovery': { title: '终端发现', icon: 'Search' },
   '/settings/agent-policy': { title: '终端策略', icon: 'Setting' },
+  '/settings/users': { title: '用户与权限', icon: 'User' },
   '/security/overview': { title: '安全总览', icon: 'Lock' },
   '/security/terminals': { title: '终端安全', icon: 'Lock' },
   '/security/firewall': { title: '防火墙', icon: 'Lock' },

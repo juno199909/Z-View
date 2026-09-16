@@ -204,6 +204,12 @@ const routes = [
         meta: { title: '终端策略', icon: 'Setting' }
       },
       {
+        path: '/settings/users',
+        name: 'Users',
+        component: () => import('@/views/settings/Users.vue'),
+        meta: { title: '用户与权限', icon: 'User' }
+      },
+      {
         path: '/agent/manage',
         component: () => import('@/views/agent/AgentManage.vue'),
         children: [

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 import mysql.connector
 from mysql.connector import Error
 
-from auth_utils import get_request_username, user_has_permission
+from auth_utils import get_request_username, user_has_permission, get_user_scoped_group_ids
 from console_utils import safe_console_print
 from config_utils import get_db_config
 
@@ -88,7 +88,7 @@ def create_session(payload: CreateSessionRequest, request: Request):
     cur = conn.cursor(dictionary=True)
     try:
         ensure_remote_sessions_table(conn)
-        cur.execute("SELECT id, hostname, ip_address, agent_install_status FROM assets WHERE id=%s AND deleted_at IS NULL", (payload.asset_id,))
+        cur.execute("SELECT id, hostname, ip_address, agent_install_status, group_id FROM assets WHERE id=%s AND deleted_at IS NULL", (payload.asset_id,))
         asset = cur.fetchone()
         if not asset:
             raise HTTPException(status_code=404, detail="Asset not found")
@@ -96,6 +96,10 @@ def create_session(payload: CreateSessionRequest, request: Request):
             raise HTTPException(status_code=409, detail="Agent not installed on this asset")
         if not asset.get("ip_address"):
             raise HTTPException(status_code=400, detail="Asset has no IP address")
+        # Scoped RBAC：受限用户只能对自己分组范围内的终端发起远控
+        scoped_group_ids = get_user_scoped_group_ids(getattr(request.state, "auth_user", None))
+        if scoped_group_ids is not None and asset.get("group_id") not in scoped_group_ids:
+            raise HTTPException(status_code=403, detail="无权访问该终端（资产分组范围限制）")
 
         operator = get_request_username(request, fallback="console")
         token = secrets.token_urlsafe(32)

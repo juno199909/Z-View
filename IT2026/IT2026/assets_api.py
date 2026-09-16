@@ -10,6 +10,7 @@ import hmac
 import http.client
 import io
 import ipaddress
+import re
 import secrets
 import datetime
 import contextlib
@@ -39,6 +40,8 @@ from auth_utils import (
     extract_bearer_token,
     get_expected_agent_token,
     get_auth_profile,
+    get_user_scoped_group_ids,
+    set_user_scoped_groups,
     require_agent_request,
     get_request_username,
     is_exempt_path,
@@ -235,6 +238,35 @@ class AssetTriggerReportRequest(BaseModel):
     requester: Optional[str] = None
 
 
+ASSET_SCOPE_PATH_RE = re.compile(r"^/api/v1/assets/(\d+)(?:/|$)")
+
+
+def _asset_in_user_scope(auth_user: Optional[Dict[str, Any]], asset_id: int) -> bool:
+    """Scoped RBAC：校验资产是否在用户可见分组范围内（admin/未配置范围不限制）。"""
+    from auth_utils import get_user_scoped_group_ids
+
+    scoped = get_user_scoped_group_ids(auth_user)
+    if scoped is None:
+        return True
+    conn = get_db_connection()
+    if not conn:
+        # 数据库不可用时按无权限处理，避免范围校验被绕过
+        return False
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT group_id FROM assets WHERE id=%s AND deleted_at IS NULL", (asset_id,))
+        row = cursor.fetchone()
+        group_id = row[0] if row else None
+        return group_id is not None and group_id in scoped
+    except Exception:
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if is_exempt_path(request.url.path, request.method, AUTH_EXEMPTIONS):
@@ -254,6 +286,14 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
+        )
+
+    # Scoped RBAC（P1）：路径携带资产 id 的请求统一做分组范围校验
+    scope_match = ASSET_SCOPE_PATH_RE.match(request.url.path)
+    if scope_match and not _asset_in_user_scope(auth_user, int(scope_match.group(1))):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "无权访问该终端（资产分组范围限制）"},
         )
 
     request.state.auth_user = auth_user
@@ -2111,11 +2151,13 @@ class CreateUserRequest(BaseModel):
     username: str
     password: str
     role: str = "viewer"
+    scoped_group_ids: Optional[List[int]] = None
 
 
 class UpdateUserRequest(BaseModel):
     role: Optional[str] = None
     enabled: Optional[bool] = None
+    scoped_group_ids: Optional[List[int]] = None
 
 
 class ResetUserPasswordRequest(BaseModel):
@@ -2155,14 +2197,16 @@ def create_platform_user(payload: CreateUserRequest, request: Request):
     operator = get_request_username(request)
 
     try:
-        profile = create_user(payload.username, payload.password, payload.role, operator)
+        profile = create_user(payload.username, payload.password, payload.role, operator,
+                              scoped_group_ids=payload.scoped_group_ids)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     _log_user_management(
         "create_user", "success", "info",
         f"管理员 {operator} 创建用户 {profile['username']}（角色 {profile['role']}）",
-        profile["username"], operator, request, {"role": profile["role"]},
+        profile["username"], operator, request,
+        {"role": profile["role"], "scoped_group_ids": profile.get("scoped_group_ids") or []},
     )
     return {"message": "用户创建成功", "user": profile}
 
@@ -2175,6 +2219,15 @@ def update_platform_user(username: str, payload: UpdateUserRequest, request: Req
     operator = get_request_username(request)
 
     try:
+        if payload.scoped_group_ids is not None:
+            profile = set_user_scoped_groups(username, payload.scoped_group_ids, operator)
+            _log_user_management(
+                "update_scope", "success", "info",
+                f"管理员 {operator} 更新用户 {username} 的资产分组范围 "
+                f"（{len(payload.scoped_group_ids)} 个分组，空=不限制）",
+                username, operator, request,
+                {"scoped_group_ids": payload.scoped_group_ids},
+            )
         if payload.role is not None:
             profile = update_user_role(username, payload.role, operator)
             _log_user_management(
@@ -2415,6 +2468,7 @@ def get_assets_stats(
 
 @app.get("/api/v1/assets")
 def get_assets(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     asset_type: Optional[str] = Query(None),
@@ -2431,6 +2485,12 @@ def get_assets(
         cursor = conn.cursor(dictionary=True)
 
         where_clauses, params = build_asset_filters(asset_type, status, group_id, keyword)
+        # Scoped RBAC：限定用户可见分组（未分组资产对受限用户不可见）
+        scoped_group_ids = get_user_scoped_group_ids(getattr(request.state, "auth_user", None))
+        if scoped_group_ids is not None:
+            placeholders = ",".join(["%s"] * len(scoped_group_ids))
+            where_clauses.append(f"a.group_id IN ({placeholders})")
+            params.extend(scoped_group_ids)
         where_sql = " AND ".join(where_clauses)
 
         # 查询总数

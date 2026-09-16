@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from fnmatch import fnmatch
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import HTTPException, Request
 
@@ -268,6 +268,15 @@ def _bootstrap_auth_state() -> Dict[str, Any]:
 
 def _normalize_user_entry(raw: Any, fallback_username: str, fallback_role: str) -> Dict[str, Any]:
     raw = raw or {}
+    raw_groups = raw.get("scoped_group_ids")
+    if not isinstance(raw_groups, list):
+        raw_groups = []
+    scoped_group_ids = []
+    for gid in raw_groups:
+        try:
+            scoped_group_ids.append(int(gid))
+        except (TypeError, ValueError):
+            continue
     return {
         "username": str(raw.get("username") or fallback_username).strip() or fallback_username,
         "role": normalize_role(raw.get("role") or fallback_role),
@@ -277,7 +286,26 @@ def _normalize_user_entry(raw: Any, fallback_username: str, fallback_role: str) 
         "credential_source": str(raw.get("credential_source") or "file"),
         "enabled": bool(raw.get("enabled", True)),
         "created_at": raw.get("created_at"),
+        "scoped_group_ids": scoped_group_ids,
     }
+
+
+def get_user_scoped_group_ids(user: Optional[Dict[str, Any]]) -> Optional[List[int]]:
+    """返回用户的资产组可见范围：None = 不限制（admin 或未分配范围）；列表 = 仅可见这些分组。
+
+    兼容性约定：存量账号未配置范围时行为不变（不限制），显式分配分组后才生效。
+    """
+    if not user:
+        return None
+    if normalize_role(user.get("role")) == "admin":
+        return None
+    groups = user.get("scoped_group_ids")
+    if not isinstance(groups, list) or not groups:
+        return None
+    try:
+        return [int(g) for g in groups]
+    except (TypeError, ValueError):
+        return None
 
 
 def _legacy_state_to_users(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,6 +387,7 @@ def _user_profile(user: Dict[str, Any]) -> Dict[str, Any]:
         "credential_source": user.get("credential_source") or "file",
         "enabled": bool(user.get("enabled", True)),
         "created_at": user.get("created_at"),
+        "scoped_group_ids": get_user_scoped_group_ids(user) or [],
     }
     profile["permissions"] = get_role_permissions(profile["role"])
     profile["must_change_password"] = compute_must_change_password(profile)
@@ -408,12 +437,14 @@ def list_users() -> Dict[str, Any]:
     return {"users": users, "total": len(users)}
 
 
-def create_user(username: str, password: str, role: str, operator: str = "system") -> Dict[str, Any]:
+def create_user(username: str, password: str, role: str, operator: str = "system",
+                scoped_group_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     normalized_username = str(username or "").strip()
     normalized_role = normalize_role(role)
     if not USERNAME_PATTERN.match(normalized_username):
         raise ValueError("用户名只能包含字母、数字、点、下划线、连字符，长度 2-32 位")
     validate_password_strength(normalized_username, str(password or ""))
+    normalized_scoped = _normalize_scoped_group_ids(normalized_role, scoped_group_ids)
 
     with AUTH_STATE_LOCK:
         state = _load_auth_state()
@@ -428,6 +459,7 @@ def create_user(username: str, password: str, role: str, operator: str = "system
             "credential_source": "admin_created",
             "enabled": True,
             "created_at": int(time.time()),
+            "scoped_group_ids": normalized_scoped,
         })
         saved_state = _save_auth_state(state)
 
@@ -476,6 +508,43 @@ def set_user_enabled(username: str, enabled: bool, operator: str = "system") -> 
             raise ValueError("不能停用最后一个可用的管理员账号")
         user["enabled"] = bool(enabled)
         # 停用即吊销已发令牌
+        user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
+        saved_state = _save_auth_state(state)
+
+    saved_user = _find_user(saved_state, normalized_username) or {}
+    return _user_profile(saved_user)
+
+
+def _normalize_scoped_group_ids(role: str, scoped_group_ids: Optional[List[int]]) -> List[int]:
+    """规范化分组范围：admin 恒为空（不限制）；非 admin 保留合法 int 列表。"""
+    if normalize_role(role) == "admin":
+        return []
+    normalized: List[int] = []
+    for gid in scoped_group_ids or []:
+        try:
+            value = int(gid)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def set_user_scoped_groups(username: str, scoped_group_ids: Optional[List[int]],
+                           operator: str = "system") -> Dict[str, Any]:
+    """设置用户可见资产分组范围（Scoped RBAC）。空列表 = 不限制。"""
+    normalized_username = str(username or "").strip()
+
+    with AUTH_STATE_LOCK:
+        state = _load_auth_state()
+        user = _find_user(state, normalized_username)
+        if not user:
+            raise ValueError("用户不存在")
+        normalized_role = normalize_role(user.get("role"))
+        if normalized_role == "admin":
+            raise ValueError("管理员账号不做范围限制")
+        user["scoped_group_ids"] = _normalize_scoped_group_ids(normalized_role, scoped_group_ids)
+        # 立即生效：吊销旧令牌（verify 每请求重读 profile，其实时生效，这里双保险）
         user["token_version"] = max(1, int(user.get("token_version") or 1)) + 1
         saved_state = _save_auth_state(state)
 
@@ -604,6 +673,7 @@ def issue_access_token(username: str, expires_in_seconds: Optional[int] = None) 
     payload = {
         "username": str(profile.get("username") or username),
         "role": normalize_role(profile.get("role")),
+        "scoped_group_ids": get_user_scoped_group_ids(profile) or [],
         "issued_at": issued_at,
         "expires_at": expires_at,
         "token_version": int(profile.get("token_version") or 1),
@@ -669,6 +739,7 @@ def verify_access_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
         "password_updated_at": profile.get("password_updated_at"),
         "credential_source": profile.get("credential_source") or "file",
         "must_change_password": compute_must_change_password(profile),
+        "scoped_group_ids": get_user_scoped_group_ids(profile),
     }
 
 
