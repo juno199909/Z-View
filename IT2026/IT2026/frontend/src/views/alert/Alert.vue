@@ -2,8 +2,8 @@
   <div class="zv-page">
     <div class="zv-page-header">
       <div>
-        <h2 class="zv-page-title">终端日志</h2>
-        <div class="zv-page-subtitle">共 {{ pagination.total }} 条告警 · 待处理 {{ stats.unresolved || 0 }} 条</div>
+        <h2 class="zv-page-title">告警中心</h2>
+        <div class="zv-page-subtitle">近 7 天 {{ stats.total_7days || 0 }} 条 · 待处理 {{ stats.active || 0 }} 条 · 点击「解决」标记处理完成</div>
       </div>
       <div class="zv-page-actions">
         <el-button :icon="Refresh" @click="loadData">刷新</el-button>
@@ -15,19 +15,19 @@
     <div class="zv-alert-stats">
       <div class="zv-stat-mini zv-stat-danger">
         <div class="zv-stat-num">{{ stats.by_severity?.critical || 0 }}</div>
-        <div class="zv-stat-lbl">严重</div>
+        <div class="zv-stat-lbl">严重告警（待处理）</div>
       </div>
       <div class="zv-stat-mini zv-stat-warning">
-        <div class="zv-stat-num">{{ (stats.by_severity?.high || 0) + (stats.by_severity?.medium || 0) }}</div>
-        <div class="zv-stat-lbl">高危/中等</div>
+        <div class="zv-stat-num">{{ stats.by_severity?.warning || 0 }}</div>
+        <div class="zv-stat-lbl">警告告警（待处理）</div>
       </div>
       <div class="zv-stat-mini zv-stat-info">
         <div class="zv-stat-num">{{ stats.active || 0 }}</div>
-        <div class="zv-stat-lbl">未解决</div>
+        <div class="zv-stat-lbl">待处理合计</div>
       </div>
       <div class="zv-stat-mini zv-stat-success">
         <div class="zv-stat-num">{{ stats.resolved || 0 }}</div>
-        <div class="zv-stat-lbl">已解决</div>
+        <div class="zv-stat-lbl">已解决（累计）</div>
       </div>
     </div>
 
@@ -37,25 +37,18 @@
           <el-form-item label="级别">
             <el-select v-model="searchForm.severity" placeholder="全部" clearable style="width: 110px">
               <el-option label="严重" value="critical" />
-              <el-option label="高危" value="high" />
-              <el-option label="中等" value="medium" />
-              <el-option label="低危" value="low" />
-              <el-option label="提示" value="info" />
+              <el-option label="警告" value="warning" />
             </el-select>
           </el-form-item>
           <el-form-item label="状态">
             <el-select v-model="searchForm.status" placeholder="全部" clearable style="width: 110px">
-              <el-option label="未解决" value="active" />
+              <el-option label="待处理" value="active" />
               <el-option label="已解决" value="resolved" />
             </el-select>
           </el-form-item>
           <el-form-item label="类型">
-            <el-select v-model="searchForm.alert_type" placeholder="全部" clearable style="width: 110px">
-              <el-option label="离线" value="offline" />
-              <el-option label="CPU" value="cpu" />
-              <el-option label="内存" value="memory" />
-              <el-option label="磁盘" value="disk" />
-              <el-option label="进程" value="process" />
+            <el-select v-model="searchForm.alert_type" placeholder="全部" clearable style="width: 130px">
+              <el-option v-for="t in typeOptions" :key="t.value" :label="t.label" :value="t.value" />
             </el-select>
           </el-form-item>
           <el-form-item label="来源主机">
@@ -83,27 +76,44 @@
         </el-form>
       </div>
 
-      <el-table v-loading="loading" :data="tableData" @selection-change="handleSelectionChange">
+      <el-table v-loading="loading" :data="tableData" :row-class-name="rowClassName" @selection-change="handleSelectionChange">
         <el-table-column type="selection" width="48" />
-        <el-table-column label="级别" width="80">
+        <el-table-column label="级别" width="82">
           <template #default="{ row }">
             <el-tag size="small" :type="getLevelType(row.severity)" effect="dark">{{ getLevelText(row.severity) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="message" label="告警内容" min-width="260" show-overflow-tooltip />
-        <el-table-column label="来源" width="160">
+        <el-table-column label="类型" width="96">
           <template #default="{ row }">
-            <span class="zv-source">{{ row.hostname || row.source || '-' }}</span>
+            <span class="zv-alert-type">{{ getTypeText(row.alert_type) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="100">
+        <el-table-column label="告警内容" min-width="300">
+          <template #default="{ row }">
+            <div class="zv-msg">{{ row.message }}</div>
+            <div v-if="hasThreshold(row)" class="zv-msg-sub">
+              当前 {{ fmtVal(row.current_value) }} · 阈值 {{ fmtVal(row.threshold_value) }}
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="来源" width="150">
+          <template #default="{ row }">
+            <div class="zv-msg">{{ row.hostname || row.source || '-' }}</div>
+            <div v-if="row.ip_address && row.ip_address !== '-'" class="zv-msg-sub">{{ row.ip_address }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="96">
           <template #default="{ row }">
             <span v-if="row.status === 'resolved'" class="zv-alert-resolved">已解决</span>
-            <span v-else class="zv-alert-unresolved">未解决</span>
+            <span v-else class="zv-alert-unresolved">待处理</span>
           </template>
         </el-table-column>
-        <el-table-column label="触发时间" width="170">
-          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        <el-table-column label="时间" width="180">
+          <template #default="{ row }">
+            <div class="zv-msg">{{ formatTime(row.created_at) }}</div>
+            <div v-if="row.status !== 'resolved'" class="zv-msg-sub">已持续 {{ formatDuration(row.first_triggered_at || row.created_at) }}</div>
+            <div v-else-if="row.resolved_at" class="zv-msg-sub">解决于 {{ formatTime(row.resolved_at) }}</div>
+          </template>
         </el-table-column>
         <el-table-column label="操作" width="140" fixed="right" align="right">
           <template #default="{ row }">
@@ -112,7 +122,12 @@
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无告警数据" :image-size="80" />
+          <el-empty
+            :description="searchForm.severity || searchForm.status || searchForm.alert_type || searchForm.hostname || searchForm.keyword || timeRange?.length
+              ? '没有符合筛选条件的告警'
+              : '当前没有任何告警，各终端运行正常'"
+            :image-size="80"
+          />
         </template>
       </el-table>
 
@@ -209,9 +224,39 @@ const handleBatchResolve = async () => {
   }
 }
 
-const getLevelType = (l) => ({ critical: 'danger', high: 'danger', medium: 'warning', low: 'info', info: 'info' }[l] || 'info')
-const getLevelText = (l) => ({ critical: '严重', high: '高危', medium: '中等', low: '低危', info: '提示' }[l] || (l || '-'))
+const getLevelType = (l) => ({ critical: 'danger', warning: 'warning' }[l] || 'info')
+const getLevelText = (l) => ({ critical: '严重', warning: '警告' }[l] || (l || '-'))
+const typeTextMap = {
+  offline: '离线', cpu: 'CPU', memory: '内存', disk: '磁盘', process: '进程',
+  network_quality: '网络质量', security: '安全', software: '软件', patch: '补丁',
+}
+const typeOptions = [
+  { label: '离线', value: 'offline' },
+  { label: 'CPU', value: 'cpu' },
+  { label: '内存', value: 'memory' },
+  { label: '磁盘', value: 'disk' },
+  { label: '进程', value: 'process' },
+  { label: '网络质量', value: 'network_quality' },
+  { label: '安全', value: 'security' },
+]
+const getTypeText = (t) => typeTextMap[t] || (t || '-')
+const fmtVal = (v) => (v === null || v === undefined || v === '' ? '-' : Number(v))
+const hasThreshold = (row) => row.current_value !== null && row.current_value !== undefined
+  && row.threshold_value !== null && row.threshold_value !== undefined
 const formatTime = (v) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '-'
+const formatDuration = (v) => {
+  if (!v) return '-'
+  const minutes = dayjs().diff(dayjs(v), 'minute')
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时 ${minutes % 60} 分`
+  return `${Math.floor(hours / 24)} 天 ${hours % 24} 小时`
+}
+const rowClassName = ({ row }) => {
+  if (row.status === 'resolved') return 'zv-row-resolved'
+  return `zv-row-sev-${row.severity === 'critical' ? 'critical' : 'warning'}`
+}
 
 onMounted(() => { loadStats(); loadData() })
 </script>
@@ -282,6 +327,32 @@ onMounted(() => { loadStats(); loadData() })
   font-family: $font-mono;
   font-size: 12px;
   color: $text-secondary;
+}
+
+.zv-alert-type {
+  font-size: 12px;
+  color: $text-secondary;
+}
+
+.zv-msg {
+  font-size: 13px;
+  color: $text-primary;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.zv-msg-sub {
+  font-size: 12px;
+  color: $text-tertiary;
+  margin-top: 2px;
+  font-family: $font-mono;
+}
+
+:deep(.el-table) {
+  .zv-row-sev-critical td.el-table__cell:first-child { box-shadow: inset 3px 0 0 $danger-color; }
+  .zv-row-sev-warning td.el-table__cell:first-child { box-shadow: inset 3px 0 0 $warning-color; }
+  .zv-row-resolved td.el-table__cell { opacity: 0.62; }
 }
 
 .zv-alert-resolved {
