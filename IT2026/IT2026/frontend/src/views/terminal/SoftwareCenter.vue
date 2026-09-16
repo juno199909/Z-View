@@ -144,10 +144,7 @@
           </div>
         </div>
       </el-tab-pane>
-      <!-- 软件策略（8082 完整策略 CRUD：黑名单/白名单/强制安装） -->
-      <el-tab-pane label="软件策略" name="policy-mgmt" lazy>
-        <PolicyManagement />
-      </el-tab-pane>
+      <!-- 软件策略管理已迁入 策略中心（P1-05 统一策略管理） -->
 
       <!-- 合规检查 -->
       <el-tab-pane label="合规检查" name="compliance" lazy>
@@ -254,7 +251,6 @@ import {
 } from '@/api/software'
 import { getGroups } from '@/api/group'
 import { getPolicies, createPolicy, updatePolicy, deletePolicy } from '@/api/policy'
-import PolicyManagement from '@/views/terminal/components/PolicyManagement.vue'
 import ComplianceManagement from '@/views/terminal/components/ComplianceManagement.vue'
 import InstalledSoftware from '@/views/terminal/components/InstalledSoftware.vue'
 

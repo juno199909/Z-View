@@ -5,9 +5,11 @@
       <el-button :icon="Refresh" plain @click="loadData">刷新</el-button>
     </div>
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
-      统一策略管理（P1-05）：防火墙 / USB管控 / 终端 Agent 策略在本页管理（启用/禁用、绑定范围、版本回滚、执行结果）；软件管控策略（黑名单/白名单/强制安装）为多实例规则模型，在「终端管理 → 策略管理」页维护，其排序确定性已收敛到统一策略引擎。
+      统一策略管理（P1-05）：防火墙 / USB管控 / 终端 Agent 策略在「统一策略」页签管理（启用/禁用、绑定范围、版本回滚、执行结果）；软件管控策略（黑名单/白名单/强制安装）在「软件管控」页签维护，其解析排序已收敛到统一策略引擎。
     </el-alert>
 
+    <el-tabs v-model="activeTab">
+      <el-tab-pane label="统一策略" name="unified">
     <div class="zv-pol-filter">
       <el-select v-model="filters.policy_type" placeholder="策略类型" clearable style="width:140px" @change="loadData">
         <el-option v-for="t in types" :key="t.v" :label="t.l" :value="t.v" />
@@ -41,6 +43,12 @@
         </template>
       </el-table-column>
     </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="软件管控" name="software" lazy>
+        <PolicyManagement />
+      </el-tab-pane>
+    </el-tabs>
 
     <el-dialog v-model="bindVisible" title="策略绑定" width="480px">
       <p>策略: {{ bindTarget?.policy_name }}（{{ typeLabel(bindTarget?.policy_type) }}）</p>
@@ -98,6 +106,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { getSecurityPolicies, updateSecurityPolicy, bindSecurityPolicy, deleteSecurityPolicy, getSecurityPolicyVersions, getSecurityPolicyExecResults, rollbackSecurityPolicy } from '@/api/security'
 import { useAssetGroupOptions } from '@/composables/useAssetGroupOptions'
+import PolicyManagement from '@/views/terminal/components/PolicyManagement.vue'
+
+const activeTab = ref('unified')
 const types = [{v:'firewall',l:'防火墙'},{v:'usb',l:'USB管控'},{v:'agent',l:'终端Agent'}]
 const typeLabel = (v)=>({firewall:'防火墙',usb:'USB管控',agent:'终端Agent'})[v]||v
 const statusLabel = (v)=>({success:'成功',failed:'失败',partial:'部分成功',pending:'待执行'})[v]||v
