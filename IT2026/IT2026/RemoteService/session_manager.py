@@ -1048,9 +1048,21 @@ class SessionManager:
         raise ValueError(f"unsupported admin action: {normalized_action}")
 
     def _send_sas_action(self) -> dict:
-        """以 SYSTEM 服务身份触发 SAS（Ctrl+Alt+Del），直达 winlogon。"""
+        """以 SYSTEM 服务身份触发 SAS（Ctrl+Alt+Del），直达 winlogon。
+
+        Windows 默认策略禁止服务生成软件 SAS，需 SoftwareSASGeneration≥1；
+        服务以 SYSTEM 运行可自行写入该策略（幂等）。
+        """
         try:
             import ctypes
+            import winreg
+
+            policy_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, policy_path, 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, "SoftwareSASGeneration", 0, winreg.REG_DWORD, 1)
+            except OSError as reg_exc:
+                self.bridge.log_runtime_event("ServiceRuntime", f"SAS policy write failed: {reg_exc}")
 
             sas_dll = ctypes.WinDLL("sas.dll")
             send_sas = sas_dll.SendSAS

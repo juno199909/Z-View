@@ -3040,17 +3040,26 @@ class RemoteDesktopSession:
                 pass
 
     def _h264_encode_pil(self, pil_image, keyframe: bool) -> list[dict[str, Any]]:
-        """把 PIL RGB 帧送入 H.264 编码器（自动处理分辨率变化）。"""
+        """把 PIL RGB 帧送入 H.264 编码器（自动处理分辨率/画质档位变化）。"""
         width = int(pil_image.width)
         height = int(pil_image.height)
+        # 预设画质档位（handle_settings 设置）：high→crf19 / balanced→23 / smooth→28，
+        # custom=None 时交由 QoS 背压自适应选档
+        crf_override = getattr(self, "_h264_crf_override", None)
+        effective_crf = int(crf_override) if crf_override else self.QOS_LEVELS[int(self._h264_qos_level)]["crf"]
+        effective_fps = max(self.fps, 15)
         if (
             self.h264_encoder is None
             or self.h264_encoder.width != width
             or self.h264_encoder.height != height
+            or getattr(self, "_h264_encoder_crf", None) != effective_crf
+            or getattr(self, "_h264_encoder_fps", None) != effective_fps
         ):
             self._close_h264_encoder()
             from Codec.h264_encoder import H264StreamEncoder
-            self.h264_encoder = H264StreamEncoder(width, height, fps=max(self.fps, 15), crf=self.QOS_LEVELS[int(self._h264_qos_level)]["crf"])
+            self.h264_encoder = H264StreamEncoder(width, height, fps=effective_fps, crf=effective_crf)
+            self._h264_encoder_crf = effective_crf
+            self._h264_encoder_fps = effective_fps
         return self.h264_encoder.encode(pil_image, keyframe=keyframe)
 
     def _h264_results_from(self, packets, width: int, height: int) -> list[dict[str, Any]]:
@@ -3524,6 +3533,9 @@ class RemoteDesktopSession:
         self.wheel_speed = wheel_speed
         self.mouse_sensitivity = mouse_sensitivity
         self.color_preset = preset
+        # P1-画质反馈修复：H264 管线此前完全忽略预设参数——
+        # 现将画质预设映射为 H.264 CRF 档位（custom 交还 QoS 自适应）
+        self._h264_crf_override = {"high": 19, "balanced": 23, "smooth": 28}.get(preset)
         self.capture_pressure = 0.0
         self.last_frame_profile_key = None
         self.last_frame_signature = None
