@@ -216,7 +216,8 @@ const routes = [
           { path: '', redirect: '/agent/manage/policy' },
           { path: 'policy', name: 'AgentManagePolicy', component: () => import('@/views/settings/AgentPolicy.vue'), meta: { title: 'Agent策略' } },
           { path: 'deploy', name: 'AgentManageDeploy', component: () => import('@/views/terminal/AgentDeploy.vue'), meta: { title: 'Agent部署' } },
-          { path: 'upgrade', name: 'AgentManageUpgrade', component: () => import('@/views/terminal/AgentUpgrade.vue'), meta: { title: 'Agent升级' } }
+          { path: 'upgrade', name: 'AgentManageUpgrade', component: () => import('@/views/terminal/AgentUpgrade.vue'), meta: { title: 'Agent升级' } },
+          { path: 'health', name: 'AgentManageHealth', component: () => import('@/views/agent/AgentFleetHealth.vue'), meta: { title: 'Agent健康度' } }
         ]
       }
     ]

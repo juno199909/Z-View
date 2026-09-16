@@ -6,6 +6,7 @@
         <el-tab-pane label="Agent策略" name="/agent/manage/policy" />
         <el-tab-pane label="Agent部署" name="/agent/manage/deploy" />
         <el-tab-pane label="Agent升级" name="/agent/manage/upgrade" />
+        <el-tab-pane label="健康度" name="/agent/manage/health" />
       </el-tabs>
     </div>
     <router-view />

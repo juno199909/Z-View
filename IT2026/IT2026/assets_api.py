@@ -2982,6 +2982,214 @@ def update_asset(asset_id: int, data: dict, request: Request):
         conn.close()
 
 
+# ============================================================
+# 资产生命周期状态机（P1）：in_stock 入库 → deployed 在用 ⇄ repairing 维修 → retired 退役（终态）
+# ============================================================
+
+ASSET_LIFECYCLE_TRANSITIONS = {
+    "in_stock": ("deployed", "retired"),
+    "deployed": ("repairing", "in_stock", "retired"),
+    "repairing": ("deployed", "retired"),
+    "retired": (),
+}
+
+ASSET_LIFECYCLE_LABELS = {
+    "in_stock": "入库",
+    "deployed": "在用",
+    "repairing": "维修",
+    "retired": "退役",
+}
+
+
+class AssetLifecycleRequest(BaseModel):
+    status: str
+    note: Optional[str] = None
+
+
+@app.get("/api/v1/assets/{asset_id}/lifecycle")
+def get_asset_lifecycle(asset_id: int, request: Request):
+    """当前生命周期状态与允许的下一状态列表。"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT asset_status FROM assets WHERE id=%s AND deleted_at IS NULL", (asset_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        current = str(row.get("asset_status") or "in_stock")
+        return {
+            "asset_id": asset_id,
+            "current": current,
+            "label": ASSET_LIFECYCLE_LABELS.get(current, current),
+            "allowed_next": list(ASSET_LIFECYCLE_TRANSITIONS.get(current, ())),
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.put("/api/v1/assets/{asset_id}/lifecycle")
+def change_asset_lifecycle(asset_id: int, payload: AssetLifecycleRequest, request: Request):
+    """生命周期流转：校验状态机迁移、落库、写资产变更与审计日志。"""
+    target = str(payload.status or "").strip()
+    if target not in ASSET_LIFECYCLE_LABELS:
+        raise HTTPException(status_code=422, detail="无效的生命周期状态")
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, hostname, asset_status, deployment_date FROM assets WHERE id=%s AND deleted_at IS NULL",
+            (asset_id,),
+        )
+        asset = cursor.fetchone()
+        if not asset:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        current = str(asset.get("asset_status") or "in_stock")
+        allowed = ASSET_LIFECYCLE_TRANSITIONS.get(current, ())
+        if target not in allowed:
+            raise HTTPException(
+                status_code=422,
+                detail=f"不允许从 {ASSET_LIFECYCLE_LABELS.get(current, current)} 流转到 "
+                       f"{ASSET_LIFECYCLE_LABELS.get(target, target)}",
+            )
+
+        update_fields = ["asset_status=%s"]
+        values: list = [target]
+        if target == "retired":
+            update_fields.append("retire_date=CURDATE()")
+            update_fields.append("retire_reason=%s")
+            values.append(str(payload.note or "").strip() or "生命周期退役")
+        if target == "deployed" and not asset.get("deployment_date"):
+            update_fields.append("deployment_date=CURDATE()")
+        values.append(asset_id)
+        cursor.execute(f"UPDATE assets SET {', '.join(update_fields)} WHERE id=%s", tuple(values))
+
+        after_asset = fetch_asset_row(cursor, asset_id, include_deleted=False)
+        record_asset_changes(
+            cursor,
+            asset_id,
+            asset,
+            after_asset,
+            field_names=("asset_status", "retire_date", "retire_reason", "deployment_date"),
+            change_type="lifecycle",
+            source_type="manual",
+            operator_name=get_request_username(request),
+        )
+        conn.commit()
+
+        operator = get_request_username(request)
+        transition_note = str(payload.note or "").strip()
+        record_system_activity_log(SystemActivityLogCreate(
+            source_type="platform",
+            module="asset",
+            category="lifecycle",
+            action="lifecycle_change",
+            level="info" if target != "retired" else "warning",
+            result="success",
+            asset_id=asset_id,
+            hostname=asset.get("hostname"),
+            operator_name=operator,
+            title=f"资产生命周期流转: {ASSET_LIFECYCLE_LABELS.get(current, current)} → {ASSET_LIFECYCLE_LABELS.get(target)}",
+            message=(f"{ASSET_LIFECYCLE_LABELS.get(current, current)} → "
+                     f"{ASSET_LIFECYCLE_LABELS.get(target, target)}") + (f"，备注: {transition_note}" if transition_note else ""),
+        ))
+        return {
+            "message": "生命周期已更新",
+            "asset_id": asset_id,
+            "current": target,
+            "label": ASSET_LIFECYCLE_LABELS.get(target),
+            "allowed_next": list(ASSET_LIFECYCLE_TRANSITIONS.get(target, ())),
+        }
+    except HTTPException:
+        raise
+    except Error as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============================================================
+# Agent Fleet 健康度（P1）：Agent 安装/在线/版本分布/异常聚合
+# ============================================================
+
+@app.get("/api/v1/agent-fleet/health")
+def agent_fleet_health(request: Request):
+    """Agent 队列健康度：安装与在线概况、版本分布、落后与心跳异常清单。"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT id, hostname, ip_address, agent_install_status, agent_version,
+                   TIMESTAMPDIFF(SECOND, last_seen, NOW()) AS seconds_since_seen
+            FROM assets WHERE deleted_at IS NULL
+        """)
+        rows = cursor.fetchall()
+
+        total = len(rows)
+        installed = [r for r in rows if r.get("agent_install_status") == "installed"]
+        online = [r for r in rows if r.get("seconds_since_seen") is not None
+                  and r["seconds_since_seen"] <= ALERT_ONLINE_SECONDS]
+        not_installed = [r for r in rows if r.get("agent_install_status") != "installed"]
+
+        version_counts: Dict[str, int] = {}
+        for r in installed:
+            version = str(r.get("agent_version") or "unknown")
+            version_counts[version] = version_counts.get(version, 0) + 1
+        latest_version = max(version_counts, key=lambda v: tuple(int(x) for x in re.findall(r"\d+", v)) if re.findall(r"\d+", v) else (0,)) \
+            if version_counts else None
+
+        anomalies = []
+        for r in installed:
+            seen = r.get("seconds_since_seen")
+            version = str(r.get("agent_version") or "unknown")
+            if seen is None:
+                anomalies.append({
+                    "asset_id": r["id"], "hostname": r.get("hostname"),
+                    "ip_address": r.get("ip_address"),
+                    "type": "never_seen",
+                    "detail": "Agent 已安装但从未上报心跳",
+                })
+            elif seen > max(ALERT_ONLINE_SECONDS * 3, 300):
+                anomalies.append({
+                    "asset_id": r["id"], "hostname": r.get("hostname"),
+                    "ip_address": r.get("ip_address"),
+                    "type": "stale_heartbeat",
+                    "detail": f"心跳中断 {seen // 60} 分钟",
+                })
+            if latest_version and version != latest_version and version != "unknown":
+                anomalies.append({
+                    "asset_id": r["id"], "hostname": r.get("hostname"),
+                    "ip_address": r.get("ip_address"),
+                    "type": "version_lag",
+                    "detail": f"Agent {version} 落后于最新 {latest_version}",
+                })
+
+        return {
+            "summary": {
+                "total": total,
+                "online": len(online),
+                "offline": total - len(online),
+                "installed": len(installed),
+                "not_installed": len(not_installed),
+                "anomaly_count": len(anomalies),
+            },
+            "versions": version_counts,
+            "latest_version": latest_version,
+            "anomalies": anomalies,
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+
 # 硬删除时随资产一并清除的关联数据表（V1.9.23 用户决策：手动删除 = 彻底删除）。
 # system_activity_logs 为全局审计，不在清除范围内；删除动作本身写入该表。
 ASSET_HARD_DELETE_TABLES = (

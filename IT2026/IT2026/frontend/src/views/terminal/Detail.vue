@@ -23,6 +23,19 @@
             <span class="zv-status-dot" :class="`is-${detail.asset.status}`" />
             {{ getStatusText(detail.asset.status) }}
           </span>
+          <el-tag size="small" :type="lifecycleTag" style="margin-left: 6px" effect="plain">{{ lifecycleLabel }}</el-tag>
+          <el-dropdown v-if="lifecycleNext.length" trigger="click" @command="changeLifecycle" style="margin-left: 6px">
+            <el-button size="small" text type="primary" :loading="lifecycleLoading">
+              流转 <el-icon><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item v-for="next in lifecycleNext" :key="next.status" :command="next.status">
+                  {{ next.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
         <div class="zv-overview-meta">
           <span class="zv-mono">{{ detail.asset?.ip_address || '-' }}</span>
@@ -236,10 +249,11 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  ArrowLeft, VideoPlay, RefreshRight, SwitchButton, Monitor, Goods,
+  ArrowLeft, ArrowDown, VideoPlay, RefreshRight, SwitchButton, Monitor, Goods,
   Box, Cpu, Share, Connection, Search, Key, List, Link,
   CircleCheckFilled, WarningFilled
 } from '@element-plus/icons-vue'
+import request from '@/api/request'
 import { getAssetDetail } from '@/api/asset'
 import { getInstalledSoftware } from '@/api/software'
 import { rebootTerminal, shutdownTerminal as shutdownCmd } from '@/api/terminal'
@@ -269,6 +283,57 @@ const showRemoteDesktop = ref(false)
 const scanLoading = ref(false)
 const scanVisible = ref(false)
 const scanResult = ref(null)
+
+// ===== 资产生命周期状态机（P1） =====
+const LIFECYCLE_LABELS = { in_stock: '入库', deployed: '在用', repairing: '维修', retired: '退役' }
+const lifecycle = ref({ current: 'in_stock', allowed_next: [] })
+const lifecycleLoading = ref(false)
+const lifecycleLabel = computed(() => LIFECYCLE_LABELS[lifecycle.value.current] || lifecycle.value.current)
+const lifecycleTag = computed(() => ({
+  in_stock: 'info', deployed: 'success', repairing: 'warning', retired: 'danger'
+}[lifecycle.value.current] || 'info'))
+const lifecycleNext = computed(() => (lifecycle.value.allowed_next || []).map(s => ({ status: s, label: LIFECYCLE_LABELS[s] || s })))
+
+const loadLifecycle = async () => {
+  try {
+    const res = await request({ url: `/api/v1/assets/${route.params.id}/lifecycle`, method: 'get' })
+    lifecycle.value = res?.data || res
+  } catch (e) {
+    // 非关键数据，加载失败静默
+  }
+}
+
+const changeLifecycle = async (status) => {
+  const label = LIFECYCLE_LABELS[status]
+  let note = ''
+  if (status === 'retired') {
+    try {
+      const res = await ElMessageBox.prompt(`确认将终端退役？退役后不可恢复。`, '退役确认', {
+        inputPlaceholder: '退役原因（可选）',
+        confirmButtonText: '确认退役',
+        type: 'warning',
+      })
+      note = res.value || ''
+    } catch (e) {
+      return
+    }
+  }
+  lifecycleLoading.value = true
+  try {
+    await request({
+      url: `/api/v1/assets/${route.params.id}/lifecycle`,
+      method: 'put',
+      data: { status, note },
+    })
+    lifecycle.value = { current: status, allowed_next: [] }
+    ElMessage.success(`生命周期已流转为「${label}」`)
+    loadLifecycle()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '流转失败')
+  } finally {
+    lifecycleLoading.value = false
+  }
+}
 
 const TYPE_META = {
   server: { icon: Cpu,        gradient: 'linear-gradient(135deg, #3b82f6, #2563eb)' },
@@ -492,7 +557,7 @@ const shutdownTerminal = async () => {
   } catch (e) { if (e !== 'cancel') ElMessage.error('下发失败') }
 }
 
-onMounted(() => { loadDetail(); loadSoftware() })
+onMounted(() => { loadDetail(); loadSoftware(); loadLifecycle() })
 </script>
 
 <style lang="scss" scoped>
