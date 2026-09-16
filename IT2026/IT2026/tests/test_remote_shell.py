@@ -24,6 +24,7 @@ from remote_desktop_engine_v2 import (  # noqa: E402
     REMOTE_SHELL_SETTINGS,
     RemoteDesktopSession,
     RemoteShellSettings,
+    _ShellOutputDecoder,
 )
 
 
@@ -162,6 +163,39 @@ def test_platform_policy_validation_accepts_shell_fields():
 pytestmark_integration = pytest.mark.skipif(
     __import__("os").name != "nt", reason="Windows PowerShell 集成冒烟"
 )
+
+
+def test_decoder_utf8_multibyte_split_across_chunks():
+    """4096B 分块边界切开 UTF-8 中文时不得产生 U+FFFD（乱码根因回归）。"""
+    line = "中文输出测试：以太网适配器 本地链接* 1 行内容填充。\n"
+    # 构造 >2 行、使块边界必然落在多字节字符中间
+    data = (line * 300).encode("utf-8")
+    decoder = _ShellOutputDecoder()
+    parts = []
+    for i in range(0, len(data), 4096):
+        parts.append(decoder.feed(data[i:i + 4096]))
+    parts.append(decoder.flush())
+    text = "".join(parts)
+    assert "\ufffd" not in text
+    assert text.count("以太网适配器") == 300
+    assert text.endswith(line)
+
+
+def test_decoder_gbk_fallback():
+    """无视 chcp 的 GBK 输出（type GBK 文件等）按行回退 gbk 解码。"""
+    gbk_line = "卷的序列号 是 B6F1-5044\n".encode("gbk")
+    decoder = _ShellOutputDecoder()
+    text = decoder.feed(gbk_line) + decoder.flush()
+    assert "卷的序列号" in text
+    assert "\ufffd" not in text
+
+
+def test_decoder_buffer_and_flush():
+    """无换行尾包在 flush 时输出；跨 feed 的不完整行不提前解码。"""
+    decoder = _ShellOutputDecoder()
+    assert decoder.feed("中文abc".encode("utf-8")[:5]) == ""  # 切在"中"字节中间
+    text = decoder.feed("中文abc".encode("utf-8")[5:]) + decoder.flush()
+    assert text == "中文abc"
 
 
 async def _wait_for_type(session, msg_type, timeout_s):

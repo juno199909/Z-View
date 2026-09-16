@@ -945,6 +945,51 @@ REMOTE_SHELL_SETTINGS = RemoteShellSettings()
 _SHELL_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
+class _ShellOutputDecoder:
+    """Shell 输出解码器（行缓冲 + 编码回退），修两类中文乱码：
+
+    1) 读取按 4096B 分块，UTF-8 中文（3B/字）会在块边界被切成两半——
+       逐块 decode(errors='replace') 会产生 U+FFFD（�）；行缓冲可完整解码。
+    2) 个别程序（type GBK 文件、python 脚本默认输出等）无视 chcp 65001 仍输出
+       GBK——按行 utf-8 失败后回退 gbk 解码。
+    """
+
+    def __init__(self):
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> str:
+        self._buffer += data
+        if len(self._buffer) > 65536:
+            # 无换行的超长输出（进度条/二进制噪声）：强制按当前缓冲解码，防积压
+            text = self._decode(self._buffer)
+            self._buffer.clear()
+            return text
+        cut = self._buffer.rfind(b"\n")
+        if cut < 0:
+            return ""
+        complete = bytes(self._buffer[: cut + 1])
+        del self._buffer[: cut + 1]
+        return self._decode(complete)
+
+    def flush(self) -> str:
+        if not self._buffer:
+            return ""
+        text = self._decode(self._buffer)
+        self._buffer.clear()
+        return text
+
+    @staticmethod
+    def _decode(data: bytes) -> str:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        try:
+            return data.decode("gbk")
+        except UnicodeDecodeError:
+            return data.decode("utf-8", errors="replace")
+
+
 class ScreenCapturer(DesktopFrameCapturer):
     """远程桌面本地兜底抓屏器，统一复用共享抓屏后端。
 
@@ -3582,12 +3627,12 @@ class RemoteDesktopSession:
         truncated = False
         exit_code: int | None = None
 
-        # chcp 65001 让 ipconfig 等原生命令输出 UTF-8；[Console]::OutputEncoding 让
-        # PowerShell 自身（cmdlet）按 UTF-8 输出——两者都需要（中文 Windows 默认 GBK/936）。
+        # 多行包装：编码设置与用户命令分行，PowerShell 错误记录的位置信息才会
+        # 指向用户命令本身，而不是把包装脚本整行回显出来。
         script = (
-            "$ErrorActionPreference = 'Continue'; "
-            "chcp 65001 > $null; "
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$ErrorActionPreference = 'Continue'\n"
+            "chcp 65001 > $null\n"
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
             + command
         )
         try:
@@ -3624,6 +3669,7 @@ class RemoteDesktopSession:
         watchdog.start()
 
         total_bytes = 0
+        decoder = _ShellOutputDecoder()
         try:
             assert proc.stdout is not None
             while True:
@@ -3641,11 +3687,21 @@ class RemoteDesktopSession:
                     })
                     self._shell_kill_tree(proc)
                     break
+                text = decoder.feed(chunk)
+                if text:
+                    self._shell_emit(loop, {
+                        'type': 'shell_output',
+                        'id': shell_id,
+                        'stream': 'stdout',
+                        'data': text,
+                    })
+            tail = decoder.flush()
+            if tail:
                 self._shell_emit(loop, {
                     'type': 'shell_output',
                     'id': shell_id,
                     'stream': 'stdout',
-                    'data': chunk.decode('utf-8', errors='replace'),
+                    'data': tail,
                 })
             exit_code = proc.wait()
         except Exception as exc:
