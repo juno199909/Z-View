@@ -36,9 +36,9 @@ SERVICES = [
     {"key": "wt_gateway", "label": "WT 网关", "ports": (4433,), "proto": "udp",
      "cmd": [PY_EXE, "webtransport_gateway.py", "--port", "4433"], "cwd": APP_DIR,
      "match": "webtransport_gateway.py", "log": "wt-gateway.out.log"},
-    {"key": "frontend", "label": "控制台前端", "ports": (5173,),
-     "cmd": [NODE_EXE, VITE_JS, "preview", "--host", "0.0.0.0"],
-     "cwd": FRONTEND_DIR, "match": "vite", "log": "frontend.out.log"},
+{"key": "frontend", "label": "控制台前端（生产）", "ports": (4173,),
+"cmd": [NODE_EXE, VITE_JS, "preview", "--host", "0.0.0.0", "--port", "4173"],
+"cwd": FRONTEND_DIR, "match": "vite", "log": "frontend.out.log"},
 ]
 
 MUTEX_NAME = "ZViewServiceManager-SingleInstance"
@@ -254,30 +254,85 @@ class App:
             self.rows[svc["key"]]["buttons"] = btns
 
     def on_action(self, svc: dict, action: str) -> None:
-        if action == "启动":
-            self.mgr.start(svc)
-            self.log(f"{svc['label']} 启动指令已发出")
-        elif action == "停止":
-            self.mgr.stop(svc)
-            self.log(f"{svc['label']} 已停止")
-        elif action == "重启":
-            self.mgr.stop(svc)
-            time.sleep(0.5)
-            self.mgr.start(svc)
-            self.log(f"{svc['label']} 重启指令已发出")
+        label = svc["label"]
+        try:
+            if action == "启动":
+                self.mgr.start(svc)
+                self.log(f"{label} 启动指令已发出，等待端口就绪…")
+                self._verify_async(svc, expect_running=True, action_label="启动")
+            elif action == "停止":
+                self.mgr.stop(svc)
+                self.log(f"{label} 停止指令已发出，等待端口释放…")
+                self._verify_async(svc, expect_running=False, action_label="停止")
+            elif action == "重启":
+                self.log(f"{label} 重启中…")
+
+                def _restart():
+                    try:
+                        self.mgr.stop(svc)
+                        time.sleep(1.0)
+                        self.mgr.start(svc)
+                        self._verify_async(svc, expect_running=True, action_label="重启")
+                    except Exception as exc:
+                        self.root.after(0, lambda: self.log(f"{label} 重启失败: {exc}"))
+
+                threading.Thread(target=_restart, daemon=True).start()
+            else:
+                return
+        except Exception as exc:
+            # 兜底：此前回调抛异常会被 tkinter 静默吞掉，导致小窗口毫无反馈
+            self.log(f"{label} {action}操作出错: {exc}")
         self.refresh_once()
+
+    def _svc_alive(self, svc: dict) -> bool:
+        """运行判定：TCP 服务看端口监听，UDP 服务看进程存在。"""
+        if svc.get("proto") == "udp":
+            return bool(find_pids(svc["match"]))
+        return all(port_open(p) for p in svc["ports"])
+
+    def _verify_async(self, svc: dict, expect_running: bool, action_label: str) -> None:
+        """后台轮询真实端口/进程状态（最长 15s），把成功/失败结果回填日志窗口。"""
+        label = svc["label"]
+        ports_text = "/".join(str(p) for p in svc["ports"])
+
+        def _worker():
+            deadline = time.time() + 15
+            ok = False
+            while time.time() < deadline:
+                alive = self._svc_alive(svc)
+                if alive == expect_running:
+                    ok = True
+                    break
+                time.sleep(0.8)
+            if expect_running:
+                msg = f"{label} {action_label}成功（端口 {ports_text} 已监听）" if ok else \
+                      f"{label} {action_label}失败（端口 {ports_text} 未监听，请查看日志 {svc['log']}）"
+            else:
+                msg = f"{label} {action_label}成功（端口 {ports_text} 已释放）" if ok else \
+                      f"{label} {action_label}失败（进程仍在运行）"
+            self.root.after(0, lambda: self.log(msg))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def start_all(self) -> None:
         for svc in SERVICES:
-            if self.mgr.state(svc) == "stopped":
-                self.mgr.start(svc)
-                self.log(f"{svc['label']} 启动指令已发出")
+            try:
+                if self.mgr.state(svc) == "stopped":
+                    self.mgr.start(svc)
+                    self.log(f"{svc['label']} 启动指令已发出，等待端口就绪…")
+                    self._verify_async(svc, expect_running=True, action_label="启动")
+            except Exception as exc:
+                self.log(f"{svc['label']} 启动出错: {exc}")
         self.refresh_once()
 
     def stop_all(self) -> None:
         for svc in SERVICES:
-            self.mgr.stop(svc)
-            self.log(f"{svc['label']} 已停止")
+            try:
+                self.mgr.stop(svc)
+                self.log(f"{svc['label']} 停止指令已发出，等待端口释放…")
+                self._verify_async(svc, expect_running=False, action_label="停止")
+            except Exception as exc:
+                self.log(f"{svc['label']} 停止出错: {exc}")
         self.refresh_once()
 
 

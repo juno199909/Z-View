@@ -51,11 +51,6 @@
                   终端
                 </el-button>
               </el-tooltip>
-              <el-tooltip content="发送安全注意序列到远程终端（用于锁屏/切换用户/任务管理器）" placement="bottom">
-                <el-button size="small" :icon="Key" @click="sendCtrlAltDel">
-                  Ctrl+Alt+Del
-                </el-button>
-              </el-tooltip>
               <el-tooltip content="画质与输入参数调优" placement="bottom">
                 <el-button size="small" :icon="Setting" @click="showSettings">
                   设置
@@ -192,9 +187,6 @@
               </el-button>
               <el-button size="small" text @click="openShellDrawer">
                 终端
-              </el-button>
-              <el-button size="small" text @click="sendCtrlAltDel">
-                Ctrl+Alt+Del
               </el-button>
               <el-button size="small" text :icon="Refresh" @click="reconnect">
                 重连
@@ -4027,12 +4019,8 @@ const handleClose = () => {
 }
 
 const sendCtrlAltDel = () => {
-  handleFullscreenActivity()
-  if (connectionStatus.value !== 'connected') {
-    ElMessage.warning('远程桌面未连接')
-    return
-  }
-  sendSocketMessage({ type: 'send_sas' })
+  // 已下线：SAS 触发后进入安全桌面，当前采集/注入架构无法在安全桌面工作，
+  // 会导致画面冻结与鼠标失联。待控制台融合方案后再启用（引擎 send_sas 链路保留）。
 }
 
 const normalizeNumber = (value, fallback) => {

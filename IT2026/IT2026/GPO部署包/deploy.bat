@@ -130,6 +130,9 @@ if errorlevel 1 goto :deploy_failed
 set "CURRENT_STAGE=firewall"
 call :configure_firewall
 
+set "CURRENT_STAGE=webtransport_trust"
+call :import_wt_root_cert
+
 set "CURRENT_STAGE=start"
 call :start_service_and_verify
 if errorlevel 1 goto :deploy_failed
@@ -390,7 +393,24 @@ if errorlevel 1 (
     call :log_warn "firewall rule creation failed"
     exit /b 0
 )
-call :log_info "firewall rule configured"
+rem P1-UDP 远程桌面：WebTransport 网关入站端口（QUIC/UDP）
+netsh advfirewall firewall delete rule name="Z-View WebTransport" >nul 2>&1
+netsh advfirewall firewall add rule name="Z-View WebTransport" dir=in action=allow protocol=UDP localport=4433 enable=yes profile=any >nul 2>&1
+call :log_info "firewall rules configured (agent program + webtransport udp/4433)"
+exit /b 0
+
+:import_wt_root_cert
+rem P1-UDP 远程桌面：导入 WebTransport 根 CA（浏览器 QUIC 证书链信任，一次即可）
+if not exist "%~dp0zview-root.cer" (
+    call :log_warn "zview-root.cer not found in package, webtransport trust import skipped"
+    exit /b 0
+)
+certutil -addstore -f Root "%~dp0zview-root.cer" >nul 2>&1
+if errorlevel 1 (
+    call :log_warn "webtransport root certificate import failed"
+    exit /b 0
+)
+call :log_info "webtransport root certificate imported to trusted root store"
 exit /b 0
 
 :start_service_and_verify

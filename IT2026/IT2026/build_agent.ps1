@@ -138,6 +138,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $ReleasePackageDir "updater
 Copy-Item -LiteralPath $UpdaterSource -Destination (Join-Path $ReleasePackageDir "updater\ZViewUpdater.exe") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $DistDir "config.json") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $ReleasePackageDir "config.json") -Force
+# P1-UDP 远程桌面：WebTransport 根 CA 随包分发（deploy.bat 导入受信任根存储）
+$WtRootCertSource = Join-Path $ProjectRoot "wt_certs\zview-root.cer"
+if (Test-Path $WtRootCertSource) {
+    Copy-Item -LiteralPath $WtRootCertSource -Destination (Join-Path $ReleasePackageDir "zview-root.cer") -Force
+}
 
 # 中文注释：如果项目内存在虚拟显示驱动载荷，则在构建阶段同步到 dist 和部署包目录。
 if (Test-Path $DriverSourceDir) {
