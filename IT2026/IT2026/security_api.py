@@ -627,12 +627,20 @@ def list_security_policies(
 
 @router.post("/policies")
 def create_security_policy(payload: SecurityPolicyCreate, request: Request):
-    if payload.policy_type not in ("firewall", "usb"):
+    # P1-05：统一策略引擎可写类型（agent 策略并入；software Phase 2）
+    if payload.policy_type not in ("firewall", "usb", "agent"):
         raise HTTPException(status_code=422, detail="Invalid policy_type")
     try:
-        json.loads(payload.config_json)
+        config = json.loads(payload.config_json)
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid config_json")
+    if payload.policy_type == "agent":
+        from zvplatform.services.policy_registry import validate_policy_config
+
+        clean, errors = validate_policy_config("agent", config if isinstance(config, dict) else {})
+        if errors:
+            raise HTTPException(status_code=422, detail="; ".join(errors[:5]))
+        payload.config_json = json.dumps(clean, ensure_ascii=False)
     conn = get_db()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -721,9 +729,22 @@ def update_security_policy(policy_id: int, payload: SecurityPolicyUpdate, reques
         new_config = old_config
         if payload.config_json is not None:
             try:
-                json.loads(payload.config_json)
+                new_config_parsed = json.loads(payload.config_json)
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid config_json")
+            # P1-05：agent 类型统一策略走注册表校验
+            cur.execute("SELECT policy_type FROM security_policies WHERE id=%s", (policy_id,))
+            policy_type_row = cur.fetchone()
+            if policy_type_row and policy_type_row[0] == "agent":
+                from zvplatform.services.policy_registry import validate_policy_config
+
+                clean, errors = validate_policy_config(
+                    "agent", new_config_parsed if isinstance(new_config_parsed, dict) else {}
+                )
+                if errors:
+                    raise HTTPException(status_code=422, detail="; ".join(errors[:5]))
+                payload.config_json = json.dumps(clean, ensure_ascii=False)
+                new_config = payload.config_json
             updates.append("config_json=%s"); values.append(payload.config_json)
             new_config = payload.config_json
             # config 变更则版本+1

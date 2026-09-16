@@ -113,17 +113,21 @@ def load_agent_policies_with_meta() -> dict:
                 pass
     return {"policies": policies, "updated_at": updated_at}
 
+def normalize_agent_policy_config(payload: dict) -> tuple[dict, list]:
+    """校验 agent 配置片段（intervals/remote_desktop），返回 (clean, errors)。
 
-def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
-    """在当前策略基础上合并校验合法字段，返回 (新策略, 错误列表)。"""
+    clean 只含合法字段（分节），供统一策略引擎与控制台更新共用，
+    保证两种来源的 agent 策略格式与校验完全一致。
+    """
     errors = []
-    result = load_agent_policies()
+    clean: dict = {}
 
     intervals_in = (payload or {}).get("intervals")
     if intervals_in is not None:
         if not isinstance(intervals_in, dict):
             errors.append("intervals must be an object")
         else:
+            clean_intervals: dict = {}
             for key, (low, high) in AGENT_POLICY_INTERVAL_BOUNDS.items():
                 if key not in intervals_in or intervals_in.get(key) is None:
                     continue
@@ -141,23 +145,26 @@ def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
                         f"intervals.{key} must be between {low} and {high} seconds"
                     )
                     continue
-                result["intervals"][key] = value
+                clean_intervals[key] = value
+            if clean_intervals:
+                clean["intervals"] = clean_intervals
 
     remote_in = (payload or {}).get("remote_desktop")
     if remote_in is not None:
         if not isinstance(remote_in, dict):
             errors.append("remote_desktop must be an object")
         else:
+            remote_clean: dict = {}
             for flag in ("require_consent", "allow_if_no_user", "disable_uac_secure_desktop", "allow_shell"):
                 if flag not in remote_in or remote_in.get(flag) is None:
                     continue
                 value = remote_in.get(flag)
                 if isinstance(value, bool):
-                    result["remote_desktop"][flag] = value
+                    remote_clean[flag] = value
                 elif str(value).strip().lower() in ("true", "1", "yes"):
-                    result["remote_desktop"][flag] = True
+                    remote_clean[flag] = True
                 elif str(value).strip().lower() in ("false", "0", "no"):
-                    result["remote_desktop"][flag] = False
+                    remote_clean[flag] = False
                 else:
                     errors.append(f"remote_desktop.{flag} must be a boolean")
 
@@ -172,7 +179,7 @@ def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
                         errors.append("remote_desktop.consent_timeout_seconds must be an integer")
                     else:
                         if 5 <= value <= 3600:
-                            result["remote_desktop"]["consent_timeout_seconds"] = value
+                            remote_clean["consent_timeout_seconds"] = value
                         else:
                             errors.append(
                                 "remote_desktop.consent_timeout_seconds must be between 5 and 3600 seconds"
@@ -189,13 +196,27 @@ def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
                         errors.append("remote_desktop.shell_timeout_seconds must be an integer")
                     else:
                         if 5 <= value <= 600:
-                            result["remote_desktop"]["shell_timeout_seconds"] = value
+                            remote_clean["shell_timeout_seconds"] = value
                         else:
                             errors.append(
                                 "remote_desktop.shell_timeout_seconds must be between 5 and 600 seconds"
                             )
+            if remote_clean:
+                clean["remote_desktop"] = remote_clean
 
     unknown_sections = set((payload or {}).keys()) - {"intervals", "remote_desktop"}
     if unknown_sections:
         errors.append(f"unknown policy sections: {', '.join(sorted(unknown_sections))}")
+    return clean, errors
+
+
+def normalize_agent_policies(payload: dict) -> tuple[dict, list]:
+    """在当前策略基础上合并校验合法字段，返回 (新策略, 错误列表)。"""
+    result = load_agent_policies()
+    clean, errors = normalize_agent_policy_config(payload)
+    for section, values in clean.items():
+        if isinstance(values, dict) and isinstance(result.get(section), dict):
+            result[section] = {**result[section], **values}
+        else:
+            result[section] = values
     return result, errors

@@ -123,15 +123,136 @@
           <div class="zv-policy-hint">单条命令最长执行时间（5 - 600 秒），超时自动终止进程</div>
         </div>
       </div>
+
+      <!-- 分组/终端覆盖策略（统一策略引擎 P1-05） -->
+      <div class="zv-card zv-card-pad zv-override-card">
+        <div class="zv-policy-head">
+          <div class="zv-policy-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">
+            <el-icon :size="20"><Operation /></el-icon>
+          </div>
+          <div style="flex: 1;">
+            <div class="zv-policy-title">分组 / 终端覆盖策略</div>
+            <div class="zv-policy-subtitle">按分组或单终端覆盖上方全局默认值（优先级：终端 &gt; 分组 &gt; 全局），终端心跳时自动生效</div>
+          </div>
+          <el-button size="small" type="primary" plain :icon="Plus" @click="openOverrideDialog">新建覆盖策略</el-button>
+        </div>
+
+        <el-table :data="overridePolicies" size="small" stripe>
+          <el-table-column prop="id" label="ID" width="60" />
+          <el-table-column prop="policy_name" label="策略名" min-width="140" show-overflow-tooltip />
+          <el-table-column prop="priority" label="优先级" width="70" />
+          <el-table-column prop="enabled" label="状态" width="80">
+            <template #default="{row}">
+              <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="binding_count" label="绑定数" width="70" />
+          <el-table-column label="操作" width="200" fixed="right">
+            <template #default="{row}">
+              <el-button link type="primary" size="small" @click="toggleOverride(row)">{{ row.enabled ? '停用' : '启用' }}</el-button>
+              <el-button link type="primary" size="small" @click="openBindDialog(row)">绑定</el-button>
+              <el-button link type="danger" size="small" @click="removeOverride(row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
     </div>
+
+    <!-- 新建覆盖策略 -->
+    <el-dialog v-model="overrideDialogVisible" title="新建分组/终端覆盖策略" width="520px" append-to-body>
+      <el-form label-width="110px">
+        <el-form-item label="策略名" required>
+          <el-input v-model="overrideForm.policy_name" placeholder="如：机房 A 高频心跳" maxlength="100" />
+        </el-form-item>
+        <el-form-item label="生效范围" required>
+          <el-radio-group v-model="overrideForm.scope_type">
+            <el-radio-button value="group">按分组</el-radio-button>
+            <el-radio-button value="asset">按终端</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="目标" required>
+          <el-select v-if="overrideForm.scope_type === 'group'" v-model="overrideForm.scope_id" placeholder="选择分组" style="width: 100%">
+            <el-option v-for="g in groups" :key="g.id" :label="g.name || g.group_name" :value="g.id" />
+          </el-select>
+          <el-select v-else v-model="overrideForm.scope_id" filterable placeholder="选择终端" style="width: 100%">
+            <el-option v-for="a in assets" :key="a.id" :label="`${a.hostname}（${a.ip_address || a.id}）`" :value="a.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="优先级">
+          <el-input-number v-model="overrideForm.priority" :min="0" :max="100" controls-position="right" />
+          <span class="zv-unit">同范围多条策略时数值大者生效</span>
+        </el-form-item>
+        <el-divider content-position="left">覆盖配置（仅勾选/填写项会覆盖全局值）</el-divider>
+        <el-form-item label="心跳间隔">
+          <el-input-number v-model="overrideForm.heartbeat" :min="5" :max="3600" :step="5" controls-position="right" style="width: 160px" />
+          <span class="zv-unit">秒</span>
+        </el-form-item>
+        <el-form-item label="远控需用户确认">
+          <el-switch v-model="overrideForm.require_consent" />
+        </el-form-item>
+        <el-form-item label="允许远程 Shell">
+          <el-switch v-model="overrideForm.allow_shell" />
+        </el-form-item>
+        <el-form-item v-if="overrideForm.allow_shell" label="Shell 超时">
+          <el-input-number v-model="overrideForm.shell_timeout_seconds" :min="5" :max="600" :step="5" controls-position="right" style="width: 160px" />
+          <span class="zv-unit">秒</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="overrideDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="overrideSaving" @click="submitOverride">创建并绑定</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 绑定管理 -->
+    <el-dialog v-model="bindDialogVisible" title="管理绑定范围" width="560px" append-to-body>
+      <div v-if="bindTarget">
+        <p style="margin: 0 0 10px; font-size: 13px;">
+          策略：<b>{{ bindTarget.policy_name }}</b>（优先级 {{ bindTarget.priority }}）
+        </p>
+        <el-table :data="bindRows" size="small" stripe v-loading="bindLoading">
+          <el-table-column label="范围" width="90">
+            <template #default="{row}">{{ scopeLabel(row.scope_type) }}</template>
+          </el-table-column>
+          <el-table-column label="目标" min-width="160">
+            <template #default="{row}">{{ scopeTargetLabel(row) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="80">
+            <template #default="{row}">
+              <el-button link type="danger" size="small" @click="removeBinding(row)">解绑</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-divider style="margin: 14px 0 10px;" />
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <el-radio-group v-model="bindForm.scope_type" size="small">
+            <el-radio-button value="group">分组</el-radio-button>
+            <el-radio-button value="asset">终端</el-radio-button>
+          </el-radio-group>
+          <el-select v-if="bindForm.scope_type === 'group'" v-model="bindForm.scope_id" placeholder="选择分组" size="small" style="width: 220px">
+            <el-option v-for="g in groups" :key="g.id" :label="g.name || g.group_name" :value="g.id" />
+          </el-select>
+          <el-select v-else v-model="bindForm.scope_id" filterable placeholder="选择终端" size="small" style="width: 220px">
+            <el-option v-for="a in assets" :key="a.id" :label="`${a.hostname}（${a.ip_address || a.id}）`" :value="a.id" />
+          </el-select>
+          <el-button type="primary" size="small" :loading="bindSaving" @click="addBinding">添加绑定</el-button>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Check, Refresh, RefreshLeft, Clock, Monitor } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Check, Refresh, RefreshLeft, Clock, Monitor, Plus, Operation } from '@element-plus/icons-vue'
 import { getAgentPolicies, updateAgentPolicies } from '@/api/agentPolicy'
+import {
+  getSecurityPolicies, createSecurityPolicy, updateSecurityPolicy, deleteSecurityPolicy,
+  getSecurityPolicyDetail, bindSecurityPolicy, unbindSecurityPolicy
+} from '@/api/security'
+import { getGroups } from '@/api/group'
+import { getAssetList } from '@/api/asset'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -207,7 +328,190 @@ const resetToDefaults = () => {
   ElMessage.info('已恢复推荐值，点击"保存并下发"后生效')
 }
 
-onMounted(loadPolicies)
+// ============ 分组/终端覆盖策略（统一策略引擎 P1-05） ============
+const overridePolicies = ref([])
+const overrideDialogVisible = ref(false)
+const overrideSaving = ref(false)
+const overrideForm = reactive({
+  policy_name: '', scope_type: 'group', scope_id: null, priority: 10,
+  heartbeat: 30, require_consent: true, allow_shell: false, shell_timeout_seconds: 60
+})
+const groups = ref([])
+const assets = ref([])
+const bindDialogVisible = ref(false)
+const bindTarget = ref(null)
+const bindRows = ref([])
+const bindLoading = ref(false)
+const bindSaving = ref(false)
+const bindForm = reactive({ scope_type: 'group', scope_id: null })
+const groupNameMap = ref({})
+const assetNameMap = ref({})
+
+const scopeLabel = v => ({ global: '全局', group: '分组', asset: '终端' }[v] || v)
+
+const scopeTargetLabel = row => {
+  if (row.scope_type === 'global') return '全部终端'
+  if (row.scope_type === 'group') return groupNameMap.value[row.scope_id] || `分组 #${row.scope_id}`
+  return assetNameMap.value[row.scope_id] || `终端 #${row.scope_id}`
+}
+
+const loadScopeOptions = async () => {
+  try {
+    const [g, a] = await Promise.all([getGroups(), getAssetList({ page: 1, page_size: 500 })])
+    groups.value = Array.isArray(g?.data) ? g.data : (Array.isArray(g) ? g : [])
+    groupNameMap.value = Object.fromEntries(groups.value.map(x => [x.id, x.name || x.group_name]))
+    assets.value = Array.isArray(a?.data) ? a.data : []
+    assetNameMap.value = Object.fromEntries(assets.value.map(x => [x.id, x.hostname]))
+  } catch (e) {
+    console.error('加载分组/终端失败:', e)
+  }
+}
+
+const loadOverridePolicies = async () => {
+  try {
+    const r = await getSecurityPolicies({ page: 1, page_size: 200, policy_type: 'agent' })
+    overridePolicies.value = (r.data || []).map(p => ({ ...p, _toggling: false }))
+  } catch (e) {
+    console.error('加载覆盖策略失败:', e)
+  }
+}
+
+const openOverrideDialog = async () => {
+  Object.assign(overrideForm, {
+    policy_name: '', scope_type: 'group', scope_id: null, priority: 10,
+    heartbeat: form.heartbeat, require_consent: form.require_consent,
+    allow_shell: form.allow_shell, shell_timeout_seconds: form.shell_timeout_seconds
+  })
+  await loadScopeOptions()
+  overrideDialogVisible.value = true
+}
+
+const submitOverride = async () => {
+  if (!overrideForm.policy_name.trim()) {
+    ElMessage.warning('请填写策略名')
+    return
+  }
+  if (overrideForm.scope_type === 'group' && !overrideForm.scope_id) {
+    ElMessage.warning('请选择分组')
+    return
+  }
+  if (overrideForm.scope_type === 'asset' && !overrideForm.scope_id) {
+    ElMessage.warning('请选择终端')
+    return
+  }
+  overrideSaving.value = true
+  try {
+    const config = {
+      intervals: { heartbeat: overrideForm.heartbeat },
+      remote_desktop: {
+        require_consent: overrideForm.require_consent,
+        allow_shell: overrideForm.allow_shell,
+        shell_timeout_seconds: overrideForm.shell_timeout_seconds
+      }
+    }
+    const created = await createSecurityPolicy({
+      policy_name: overrideForm.policy_name.trim(),
+      policy_type: 'agent',
+      description: '分组/终端覆盖策略（终端 Agent）',
+      priority: overrideForm.priority,
+      config_json: JSON.stringify(config)
+    })
+    await bindSecurityPolicy(created.id, {
+      scope_type: overrideForm.scope_type,
+      scope_id: overrideForm.scope_type === 'group' ? overrideForm.scope_id : overrideForm.scope_id
+    })
+    ElMessage.success('覆盖策略已创建并绑定，目标终端将在下一个心跳周期生效')
+    overrideDialogVisible.value = false
+    loadOverridePolicies()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '创建失败')
+  } finally {
+    overrideSaving.value = false
+  }
+}
+
+const toggleOverride = async row => {
+  row._toggling = true
+  try {
+    await updateSecurityPolicy(row.id, { enabled: !row.enabled })
+    ElMessage.success(row.enabled ? '已停用' : '已启用')
+    loadOverridePolicies()
+  } catch (e) {
+    ElMessage.error('操作失败')
+  } finally {
+    row._toggling = false
+  }
+}
+
+const removeOverride = async row => {
+  try {
+    await ElMessageBox.confirm(`确定删除覆盖策略"${row.policy_name}"？`, '删除', { type: 'warning' })
+  } catch (e) {
+    return
+  }
+  try {
+    await deleteSecurityPolicy(row.id)
+    ElMessage.success('已删除')
+    loadOverridePolicies()
+  } catch (e) {
+    ElMessage.error('删除失败')
+  }
+}
+
+const openBindDialog = async row => {
+  bindTarget.value = row
+  bindDialogVisible.value = true
+  bindLoading.value = true
+  await Promise.all([loadScopeOptions(), loadBindRows()])
+  bindLoading.value = false
+}
+
+const loadBindRows = async () => {
+  try {
+    const detail = await getSecurityPolicyDetail(bindTarget.value.id)
+    bindRows.value = detail?.bindings || []
+  } catch (e) {
+    bindRows.value = []
+  }
+}
+
+const addBinding = async () => {
+  if (!bindForm.scope_id) {
+    ElMessage.warning('请选择绑定目标')
+    return
+  }
+  bindSaving.value = true
+  try {
+    await bindSecurityPolicy(bindTarget.value.id, {
+      scope_type: bindForm.scope_type,
+      scope_id: bindForm.scope_type === 'group' ? bindForm.scope_id : bindForm.scope_id
+    })
+    ElMessage.success('绑定成功')
+    bindForm.scope_id = null
+    await loadBindRows()
+    loadOverridePolicies()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '绑定失败')
+  } finally {
+    bindSaving.value = false
+  }
+}
+
+const removeBinding = async row => {
+  try {
+    await unbindSecurityPolicy(bindTarget.value.id, row.id)
+    ElMessage.success('已解绑')
+    await loadBindRows()
+    loadOverridePolicies()
+  } catch (e) {
+    ElMessage.error('解绑失败')
+  }
+}
+
+onMounted(() => {
+  loadPolicies()
+  loadOverridePolicies()
+})
 </script>
 
 <style lang="scss" scoped>
@@ -229,6 +533,8 @@ onMounted(loadPolicies)
 }
 
 .zv-card-pad { padding: 24px 26px; }
+
+.zv-override-card { grid-column: 1 / -1; }
 
 .zv-policy-head {
   display: flex;

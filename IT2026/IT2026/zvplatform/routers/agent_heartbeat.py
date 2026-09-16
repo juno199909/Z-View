@@ -756,11 +756,20 @@ def agent_heartbeat(data: dict, request: Request):
 
         # 自动升级（R13）：记录资产版本，版本落后于平台最新版时在响应中携带升级指令
         record_agent_version(asset_id, data.get("agent_version"))
+        # P1-05：统一策略引擎——agent_policies 全局兜底 + agent 类型统一策略
+        # （global/group/asset 绑定，asset > group > global）分节覆盖合并
+        try:
+            from zvplatform.services.policy_registry import build_effective_agent_policies
+
+            effective_policies = build_effective_agent_policies(conn, asset_id)
+        except Exception as policies_exc:
+            safe_console_print(f"[Heartbeat] unified policy resolve failed, fallback to global: {policies_exc}")
+            effective_policies = load_agent_policies()
         heartbeat_response = {
             "status": "success",
             "asset_id": asset_id,
             "message": f"Heartbeat received: {report_type}",
-            "policies": load_agent_policies(),
+            "policies": effective_policies,
         }
         if heartbeat_credential:
             heartbeat_response["agent_credential"] = heartbeat_credential

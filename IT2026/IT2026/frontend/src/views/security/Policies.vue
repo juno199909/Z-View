@@ -98,8 +98,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { getSecurityPolicies, updateSecurityPolicy, bindSecurityPolicy, deleteSecurityPolicy, getSecurityPolicyVersions, getSecurityPolicyExecResults, rollbackSecurityPolicy } from '@/api/security'
 import { useAssetGroupOptions } from '@/composables/useAssetGroupOptions'
-const types = [{v:'firewall',l:'防火墙'},{v:'usb',l:'USB管控'}]
-const typeLabel = (v)=>({firewall:'防火墙',usb:'USB管控'})[v]||v
+const types = [{v:'firewall',l:'防火墙'},{v:'usb',l:'USB管控'},{v:'agent',l:'终端Agent'}]
+const typeLabel = (v)=>({firewall:'防火墙',usb:'USB管控',agent:'终端Agent'})[v]||v
 const statusLabel = (v)=>({success:'成功',failed:'失败',partial:'部分成功',pending:'待执行'})[v]||v
 const loading = ref(false); const policies = ref([])
 const filters = reactive({policy_type:'',enabled:''})
