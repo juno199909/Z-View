@@ -72,7 +72,7 @@ const health = ref(null)
 const load = async () => {
   loading.value = true
   try {
-    const res = await request({ url: '/api/v1/agent-fleet/health', method: 'get' })
+    const res = await request({ url: '/agent-fleet/health', method: 'get' })
     health.value = res?.data || res
   } catch (e) {
     ElMessage.error('加载健康度失败')

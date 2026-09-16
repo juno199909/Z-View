@@ -296,7 +296,7 @@ const lifecycleNext = computed(() => (lifecycle.value.allowed_next || []).map(s 
 
 const loadLifecycle = async () => {
   try {
-    const res = await request({ url: `/api/v1/assets/${route.params.id}/lifecycle`, method: 'get' })
+    const res = await request({ url: `/assets/${route.params.id}/lifecycle`, method: 'get' })
     lifecycle.value = res?.data || res
   } catch (e) {
     // 非关键数据，加载失败静默
@@ -321,7 +321,7 @@ const changeLifecycle = async (status) => {
   lifecycleLoading.value = true
   try {
     await request({
-      url: `/api/v1/assets/${route.params.id}/lifecycle`,
+      url: `/assets/${route.params.id}/lifecycle`,
       method: 'put',
       data: { status, note },
     })
