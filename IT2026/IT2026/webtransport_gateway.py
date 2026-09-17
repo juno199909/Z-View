@@ -361,19 +361,13 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
                     f"({info['hostname']}) session={session_id}")
 
     def send_wt_data(self, stream_id: int, payload: bytes):
-        """Agent → 观看端：在观看端发起的 WT 双向流上续写 WEBTRANSPORT_STREAM 数据。
+        """Agent → 观看端：在观看端发起的 WT 双向流上续写应用数据。
 
-        流建立后服务端首帧前需带 [0x41 WEBTRANSPORT_STREAM 帧类型][session_id]
-        变int头（与观看端建流方向对称），后续帧为纯应用数据。
+        注意：WT 流的会话头由建流方（浏览器）发送，服务端回写为裸应用帧
+        （[4B len][1B type][payload]，与观看端适配器的解析一致）；
+        注入 [0x41][session_id] 头会破坏观看端的帧解析导致 0 FPS。
         """
         try:
-            if not getattr(self, "_wt_stream_header_sent", False):
-                self._quic.send_stream_data(
-                    stream_id=stream_id,
-                    data=encode_uint_var(0x41)  # FrameType.WEBTRANSPORT_STREAM
-                    + encode_uint_var(self._bridge.connect_stream_id),
-                )
-                self._wt_stream_header_sent = True
             self._quic.send_stream_data(stream_id=stream_id, data=payload)
             self.transmit()
         except Exception as exc:
