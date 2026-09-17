@@ -57,14 +57,31 @@ class AgentBridge:
         self.data_stream_id: int | None = None  # 观看端发起的 WT 数据流（回写用）
         self.asset_ip = asset_ip
         self.upstream_ws = None
+        self._pre_stream_frames: list[tuple[int, bytes]] = []  # 数据流打开前缓冲的 Agent 帧（控制帧全留/视频帧留最近2帧）
         self._pending_frames: list[tuple[int, bytes]] = []  # 上游未就绪时缓存早期消息
         self._upstream_task: asyncio.Task | None = None
         self._closed = False
+
+    def _buffer_agent_frame(self, frame_type: int, payload: bytes) -> None:
+        """数据流未打开时缓冲 Agent 帧；防膨胀：视频帧只保留最近 2 帧。"""
+        self._pre_stream_frames.append((frame_type, payload))
+        if frame_type == 1:
+            bin_positions = [i for i, (t, _) in enumerate(self._pre_stream_frames) if t == 1]
+            while len(bin_positions) > 2:
+                del self._pre_stream_frames[bin_positions[0]]
+                bin_positions = bin_positions[1:]
 
     def set_data_stream(self, stream_id: int) -> None:
         if self.data_stream_id is None:
             self.data_stream_id = stream_id
             self._wt_stream_header_sent = False
+            # 冲刷数据流打开前缓冲的 Agent 帧（capabilities/最近视频帧）
+            try:
+                for ftype, payload in self._pre_stream_frames:
+                    self.send_wt_data(stream_id, payload)
+            except Exception as exc:
+                logger.warning(f"pre-stream frame flush failed: {exc}")
+            self._pre_stream_frames.clear()
 
     # ---- WT → Agent ----
 
@@ -114,9 +131,8 @@ class AgentBridge:
                     payload, _ftype = _encode_frame(message)
                     stream_id = self.data_stream_id
                     if stream_id is None:
-                        if forwarded == 0:
-                            logger.warning(f"[{self.asset_ip}] agent frame dropped: data_stream_id not set yet "
-                                           f"(len={len(payload)} type={_ftype})")
+                        # 数据流未打开：缓冲（控制帧全留，视频帧留最近2帧），打开时按序冲刷
+                        self._bridge._buffer_agent_frame(_ftype, payload)
                         continue
                     forwarded += 1
                     if forwarded <= 5:
