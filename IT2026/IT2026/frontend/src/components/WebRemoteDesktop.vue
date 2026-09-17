@@ -218,11 +218,17 @@
             @keyup="handleKeyUp"
           ></canvas>
 
-          <!-- 连接中遮罩 -->
-          <div v-if="connectionStatus === 'connecting'" class="connecting-mask">
-            <el-icon class="is-loading" :size="50"><Loading /></el-icon>
-            <p>正在连接到远程桌面...</p>
-          </div>
+<!-- 连接中遮罩 -->
+<div v-if="connectionStatus === 'connecting'" class="connecting-mask">
+<el-icon class="is-loading" :size="50"><Loading /></el-icon>
+<p>正在连接到远程桌面...</p>
+</div>
+
+<!-- P1-1.4 媒体面等待提示（控制面已连接但视频流未就绪） -->
+<div v-if="connectionStatus === 'connected' && mediaState !== 'playing'" class="media-waiting-mask">
+<el-icon class="is-loading" :size="36"><Loading /></el-icon>
+<p>正在解码视频流...</p>
+</div>
 
           <!-- 错误提示 -->
           <div v-if="connectionStatus === 'error'" class="error-mask">
@@ -247,6 +253,27 @@
             <span>帧率: {{ fps }} FPS</span>
             <span>延迟: {{ latency }}ms</span>
             <span>流量: {{ bandwidth }}</span>
+            <span>媒体面: {{ mediaState === 'playing' ? '播放中' : '等待视频流' }}</span>
+            <el-popover trigger="hover" width="300" placement="top">
+              <template #reference>
+                <span class="pipeline-link">链路指标 ▾</span>
+              </template>
+              <div class="zv-pipeline-metrics">
+                <div class="zv-pm-title">引擎侧</div>
+                <div>Capture: {{ engineStats?.capture_ms ?? '-' }} ms</div>
+                <div>Encode: {{ engineStats?.encode_ms ?? '-' }} ms</div>
+                <div>Queue: {{ engineStats?.queue_depth ?? '-' }}</div>
+                <div>Send FPS: {{ engineStats?.sent_fps ?? '-' }} (req {{ engineStats?.fps_req ?? '-' }})</div>
+                <div>Inflight: {{ engineStats?.inflight ?? '-' }}</div>
+                <div>丢帧(背压): {{ engineStats?.drops_bp ?? 0 }}</div>
+                <div class="zv-pm-title">网络</div>
+                <div>ACK rate: {{ engineStats?.ack_rate ?? '-' }}/s</div>
+                <div class="zv-pm-title">观看端</div>
+                <div>Decode FPS: {{ decodeFps || '-' }}</div>
+                <div>Render FPS: {{ renderFps || '-' }}</div>
+                <div>媒体面: {{ mediaState === 'playing' ? '播放中' : '等待视频流' }}</div>
+              </div>
+            </el-popover>
             <span>传输预设: {{ getPresetLabel(sessionSettings.preset) }}</span>
             <span>压缩质量: {{ sessionSettings.quality }}</span>
             <span>输出缩放: {{ sessionSettings.scalePercent }}%</span>
@@ -875,6 +902,9 @@ const clearCapabilitiesRetry = () => {
   }
 }
 
+// P1-1.1：引擎分段指标（pipeline_stats 消息）
+const engineStats = ref(null)
+
 const announceCapabilities = (force = false) => {
   if (capabilitiesSent && !force) {
     return
@@ -1347,6 +1377,9 @@ const openWebTransportAdapter = async (sessionInfo) => {
     connectionStatus.value = 'connecting'
     awaitingConsent.value = true
     reconnectAttempts = 0
+    // P1-1.4：媒体面状态复位（新连接从 waiting 开始）
+    mediaState.value = 'waiting'
+    lastDecodedFrameId.value = 0
   }
 
   const adapter = {
@@ -1660,41 +1693,46 @@ const handleBinaryFrame = async (arrayBuffer) => {
       const payloadLen = view.getUint32(offset + 13)
       if (arrayBuffer.byteLength < offset + 17 + payloadLen) break
 
-      if (frameType === 0x03) {
-        // H.264：Annex-B 裸流，解码后渲染并回 ACK（背压依据）
-        const keyframe = view.getUint8(offset + 17) === 1
-        const payload = new Uint8Array(arrayBuffer, offset + 18, payloadLen)
-        markRemoteSessionInitialized()
-        markSessionConnected()
-        h264Mode = true
-        clearCapabilitiesRetry()
-        const decoder = ensureH264Decoder()
-        if (!decoder || decoder.state !== 'configured') {
-          // 解码器不可用：丢弃并要求关键帧/回退
-          sendFrameAck(frameId)
-          offset += 17 + payloadLen
-          continue
-        }
-        const now = Date.now()
-        if (lastFrameTime > 0) {
-          fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
-        }
-        lastFrameTime = now
-        frameCounter++
-        streamResolution.value = formatResolutionText(width, height, streamResolution.value)
-        if (frameCounter % 10 === 0) {
-          bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
-        }
-        const chunk = new EncodedVideoChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp: frameId * 1000,
-          data: payload
-        })
-        decoder.decode(chunk)
+    if (frameType === 0x03) {
+      // H.264：Annex-B 裸流，解码后渲染并回 ACK（P1-1.2：ACK 移至渲染后）
+      const keyframe = view.getUint8(offset + 17) === 1
+      const payload = new Uint8Array(arrayBuffer, offset + 18, payloadLen)
+      markRemoteSessionInitialized()
+      markSessionConnected()
+      h264Mode = true
+      clearCapabilitiesRetry()
+      const decoder = ensureH264Decoder()
+      if (!decoder || decoder.state !== 'configured') {
+        // 解码器不可用：丢弃并要求关键帧/回退
         sendFrameAck(frameId)
         offset += 17 + payloadLen
         continue
       }
+      const now = Date.now()
+      if (lastFrameTime > 0) {
+        fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+      }
+      lastFrameTime = now
+      frameCounter++
+      // 解码 FPS
+      if (lastDecodeTick > 0) {
+        decodeFps.value = Math.round(1000 / Math.max(1, now - lastDecodeTick))
+      }
+      lastDecodeTick = now
+      streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+      if (frameCounter % 10 === 0) {
+        bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
+      }
+      const chunk = new EncodedVideoChunk({
+        type: keyframe ? 'key' : 'delta',
+        timestamp: frameId * 1000,
+        data: payload
+      })
+      lastDecodedFrameId.value = frameId
+      decoder.decode(chunk)
+      offset += 17 + payloadLen
+      continue
+    }
 
       if (frameType !== 0x02) {
         // 未知子帧类型：无法确定长度，终止本消息解析
@@ -1971,6 +2009,9 @@ const handleMessage = (data) => {
       } else {
         ElMessage.error(message.message || 'Ctrl+Alt+Del 发送失败')
       }
+    } else if (message.type === 'pipeline_stats') {
+      // P1-1.1：引擎分段指标（Capture/Encode/Queue/Send）
+      engineStats.value = message
     } else if (message.type === 'pong') {
       const sentAt = typeof message.timestamp === 'number' ? message.timestamp : lastPingSentAt
       if (sentAt > 0) {
@@ -2887,6 +2928,29 @@ const teardownH264 = () => {
   clearSilentCheckTimer()
 }
 
+// ============ P1-1.2/1.4：媒体面状态机 + 渲染后 ACK ============
+// ACK 语义修正：decoder.decode() 返回 ≠ 已渲染——frame_ack 改在
+// renderVideoFrame（画面真正绘制到 Canvas）之后发送，背压反映真实消费。
+const lastDecodedFrameId = { value: 0 }
+const mediaState = ref('waiting') // waiting → playing
+const decodeFps = ref(0)
+const renderFps = ref(0)
+let lastDecodeTick = 0
+let lastRenderTick = 0
+
+const markMediaPlaying = () => {
+  if (mediaState.value !== 'playing') {
+    mediaState.value = 'playing'
+  }
+}
+
+const resetMediaState = () => {
+  mediaState.value = 'waiting'
+  lastDecodedFrameId.value = 0
+  decodeFps.value = 0
+  renderFps.value = 0
+}
+
 const sendFrameAck = (seq) => {
   if (seq > 0) {
     sendSocketMessage({ type: 'frame_ack', seq })
@@ -2901,6 +2965,14 @@ const renderVideoFrame = (frame) => {
   applyRemoteResolution(frame.displayWidth, frame.displayHeight)
   ctx.drawImage(frame, 0, 0, frame.displayWidth, frame.displayHeight)
   frame.close()
+  // P1-1.2：渲染后 ACK（背压反映真实消费）；P1-1.4：媒体面就绪
+  const now = Date.now()
+  if (lastRenderTick > 0) {
+    renderFps.value = Math.round(1000 / Math.max(1, now - lastRenderTick))
+  }
+  lastRenderTick = now
+  markMediaPlaying()
+  sendFrameAck(lastDecodedFrameId.value)
 }
 
 const handleH264Frame = (message) => {
@@ -4164,6 +4236,47 @@ const normalizeNumber = (value, fallback) => {
   margin-top: 20px;
   font-size: 16px;
   color: #606266;
+}
+
+.media-waiting-mask {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 24px;
+  pointer-events: none;
+  z-index: 9;
+}
+
+.media-waiting-mask p {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #909399;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 2px 12px;
+  border-radius: 10px;
+}
+
+.zv-pipeline-metrics {
+  font-size: 12px;
+  line-height: 1.9;
+  color: #606266;
+  font-family: Consolas, monospace;
+}
+
+.zv-pipeline-metrics .zv-pm-title {
+  font-weight: 600;
+  color: #303133;
+  margin-top: 4px;
+}
+
+.pipeline-link {
+  color: #409eff;
+  cursor: pointer;
+  font-size: 12px;
 }
 
 .statusbar {

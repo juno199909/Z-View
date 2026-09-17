@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import collections
 import ctypes
 import json
 import base64
@@ -1436,6 +1437,11 @@ class RemoteDesktopSession:
         self._h264_qos_last_eval = 0.0
         # 输入唤醒：收到键鼠输入立即唤醒采集循环，消除"等下一节拍"的反馈延迟
         self._capture_wakeup = asyncio.Event()
+        # P1-X1：抓帧/编码解耦——抓帧入队（latest-wins, maxlen=2），编码循环异步消费
+        self._h264_encode_queue: "collections.deque[dict]" = collections.deque(maxlen=2)
+        self._h264_encode_wakeup = asyncio.Event()
+        self._h264_encode_task: asyncio.Task | None = None
+        self._capture_grab_ms_avg = 0.0
 
         # 获取屏幕信息
         self.screen_info = self._load_screen_info()
@@ -1977,6 +1983,8 @@ class RemoteDesktopSession:
             # 启动屏幕捕获循环
             self._log_session_event("start", "capture_loop_create")
             self.capture_task = asyncio.create_task(self.capture_loop())
+            # P1-X1：编码循环（与抓帧解耦，latest-wins 队列衔接）
+            self._h264_encode_task = asyncio.create_task(self._h264_encode_loop())
 
             # 处理控制消息
             self._log_session_event("start", "message_loop_enter")
@@ -1988,6 +1996,18 @@ class RemoteDesktopSession:
                 self.capture_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.capture_task
+            encode_task = getattr(self, "_h264_encode_task", None)
+            if encode_task:
+                encode_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await encode_task
+                with contextlib.suppress(Exception):
+                    job = None
+                    while self._h264_encode_queue:
+                        job = self._h264_encode_queue.pop()
+                    if job:
+                        with contextlib.suppress(Exception):
+                            job["screenshot"].close()
             # P0-H2：统一会话资源收尾（原 stop() 清理从未被调用，断开即泄漏）
             with contextlib.suppress(Exception):
                 self._finalize_session_resources()
@@ -2119,6 +2139,15 @@ class RemoteDesktopSession:
                     self._close_h264_encoder()
                     self._log_session_event("codec", "switch to jpeg (no h264 ack from viewer)")
                     asyncio.ensure_future(self._send_json({"type": "codec_switch", "codec": "jpeg"}))
+
+                # P1-X1：抓帧已入编码队列，由 _h264_encode_loop 异步编码后入队发送
+                if helper_result.get("encoding_scheduled"):
+                    elapsed = time.perf_counter() - loop_started_at
+                    self._stats_note_tick(elapsed)
+                    self._emit_pipeline_stats(profile)
+                    frame_interval = 1.0 / profile["fps"]
+                    await self._sleep_until_next_tick(max(0, frame_interval - elapsed))
+                    continue
 
                 # H.264 包分发（循环级独立分支——V1.9.19 修复：此前被错误嵌套进上面的
                 # no-ack 回退块内，健康会话（acked>0）的 h264_packets 落到 frame 路径
@@ -3203,6 +3232,23 @@ class RemoteDesktopSession:
                     f"win_frames={win['frames']} skipped={win['skipped']} empty={win['empty']}"
                 ),
             )
+            # P1-1.1：分段指标推送（观看端状态栏七段展开：Capture/Encode/Queue/Send/…）
+            asyncio.ensure_future(self._send_json({
+                "type": "pipeline_stats",
+                "capture_ms": self._capture_grab_ms_avg,
+                "encode_ms": float(getattr(self, "_h264_encode_ms_avg", 0.0) or 0.0),
+                "queue_depth": len(self._h264_encode_queue),
+                "sent_fps": round(fps_actual, 1),
+                "fps_req": profile["fps"],
+                "inflight": inflight,
+                "ack_rate": round(ack_rate, 1),
+                "codec": codec,
+                "backend": backend,
+                "win_frames": win["frames"],
+                "skipped": win["skipped"],
+                "empty": win["empty"],
+                "drops_bp": self._h264_stats["drops_backpressure"],
+            }))
         except Exception as exc:
             self._log_session_event("stats", f"emit failed type={type(exc).__name__} error={exc}")
         finally:
@@ -3284,15 +3330,21 @@ class RemoteDesktopSession:
             pass
 
     async def _capture_frame_h264(self, profile: dict) -> dict:
-        """H.264 路径：capture_raw → PyAV 编码 → 入队（含背压丢帧）。"""
-        # 抓帧带超时：session 0 无头桌面上 mss/GDI 可能永久阻塞（84 号 0 帧率根因），
-        # 超时即回退服务助手路径
+        """H.264 路径：capture_raw → 入编码队列（P1-X1 解耦：抓帧与编码并行）。
+
+        抓帧带超时：session 0 无头桌面上 mss/GDI 可能永久阻塞（84 号 0 帧率根因），
+        超时即回退服务助手路径。编码由 _h264_encode_loop 异步消费（latest-wins）。
+        """
+        grab_t0 = time.perf_counter()
         try:
             screenshot = await asyncio.wait_for(
                 asyncio.to_thread(self.capturer.capture_raw), timeout=2.0
             )
         except (asyncio.TimeoutError, TimeoutError):
             return {"empty": True, "captured_at": time.time(), "capture_context": {}}
+        grab_ms = (time.perf_counter() - grab_t0) * 1000
+        prev_grab = float(getattr(self, "_capture_grab_ms_avg", 0.0) or 0.0)
+        self._capture_grab_ms_avg = round(prev_grab * 0.7 + grab_ms * 0.3, 1) if prev_grab else round(grab_ms, 1)
         if screenshot is None:
             return {"empty": True, "captured_at": time.time(), "capture_context": {}}
         try:
@@ -3316,6 +3368,7 @@ class RemoteDesktopSession:
             inflight = self._h264_sent_seq - self._h264_acked_seq
             if inflight > 30 and not keyframe_needed:
                 self._h264_stats["drops_backpressure"] += 1
+                screenshot.close()
                 return {
                     "unchanged": True,
                     "signature": signature,
@@ -3324,26 +3377,68 @@ class RemoteDesktopSession:
                     "h264_dropped": True,
                 }
 
-            def _encode_job():
-                scaled = self._apply_h264_scale(screenshot)
-                t0 = time.perf_counter()
-                pkts = self._h264_encode_pil(scaled, keyframe=keyframe_needed)
-                self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
-                return pkts
-
-            packets = await asyncio.to_thread(_encode_job)
-            self.h264_encode_fail_streak = 0
-            results = self._h264_results_from(packets, width, height)
+            # P1-X1：入编码队列（latest-wins, maxlen=2），由 _h264_encode_loop 消费；
+            # screenshot 的关闭移交给编码循环（编码完成后释放）
+            self._h264_encode_queue.append({
+                "screenshot": screenshot,
+                "profile": dict(profile),
+                "keyframe": keyframe_needed,
+                "width": width,
+                "height": height,
+                "signature": signature,
+                "captured_at": time.time(),
+            })
+            self._h264_encode_wakeup.set()
             return {
-                "h264_packets": results,
+                "encoding_scheduled": True,
                 "signature": signature,
                 "captured_at": time.time(),
                 "capture_context": {},
-                "frame_size": sum(len(p["data"]) for p in packets),
             }
-        finally:
+        except Exception:
             with contextlib.suppress(Exception):
                 screenshot.close()
+            raise
+
+    async def _h264_encode_loop(self):
+        """P1-X1：编码循环——消费抓帧队列（latest-wins），编码后整帧入队发送。
+
+        与抓帧解耦后帧率 = max(grab, encode)；本循环内的异常不再杀死采集。
+        """
+        while True:
+            try:
+                await self._h264_encode_wakeup.wait()
+                self._h264_encode_wakeup.clear()
+                job = None
+                while self._h264_encode_queue:
+                    job = self._h264_encode_queue.pop()
+                if job is None or not self.running:
+                    continue
+                screenshot = job["screenshot"]
+
+                def _encode_job(img=screenshot):
+                    scaled = self._apply_h264_scale(img)
+                    t0 = time.perf_counter()
+                    pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
+                    self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
+                    return pkts
+
+                packets = await asyncio.to_thread(_encode_job)
+                self.h264_encode_fail_streak = 0
+                results = self._h264_results_from(packets, job["width"], job["height"])
+                frame_size = sum(len(p["data"]) for p in packets)
+                self._enqueue_h264_frame_group(results, frame_size)
+                self.frame_count += len(results)
+                self._stats_win["frames"] += len(results)
+                self._stats_win["bytes"] += frame_size
+                self.last_frame_sent_at = time.time()
+                with contextlib.suppress(Exception):
+                    screenshot.close()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._log_session_event("h264_encode_loop", f"error: {type(exc).__name__} {exc}")
+                await asyncio.sleep(0.1)
 
     def handle_mouse_in_executor(self, message: dict):
         """把鼠标处理调度到输入专用线程，避免阻塞事件循环。"""
