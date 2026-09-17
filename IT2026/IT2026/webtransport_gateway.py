@@ -83,7 +83,9 @@ class AgentBridge:
             if frame_type == 0:  # text JSON 控制消息
                 await self.upstream_ws.send(payload.decode("utf-8"))
             else:  # binary 屏幕帧
-                await self.upstream_ws.send_bytes(payload)
+                # 新版 websockets（asyncio ClientConnection）统一用 send()，
+                # 旧 API 的 send_bytes 已不存在（会导致 WT 数据路径全断）
+                await self.upstream_ws.send(payload)
         except Exception as exc:
             logger.warning(f"[{self.asset_ip}] wt→agent send failed: {exc}")
 
