@@ -1279,7 +1279,10 @@ const connect = async () => {
     const relayUrl = `${wsProtocol}://${window.location.host}${sessionInfo.ws_url}`
     // 传输候选：WebTransport (UDP/QUIC) 优先，失败/超时自适应回落 WebSocket (TCP)。
     // HTTPS 页面下 ws:// 直连属于混合内容会被浏览器拦截，自动走 wss 中继。
-    if (window.WebTransport && sessionInfo.wt_url && sessionInfo.wt_cert_hash && Date.now() > wtDisabledUntil) {
+    // P2-UDP 暂停：UDP/QUIC 链路在真实环境稳定性未达标（多进程投递/回程帧/竞态已修但待打磨），
+    // 按用户决策暂回退为纯 TCP（WebSocket 中继）；恢复 UDP 时删除下方 wtTransportEnabled=false 即可。
+    const wtTransportEnabled = false
+    if (wtTransportEnabled && window.WebTransport && sessionInfo.wt_url && sessionInfo.wt_cert_hash && Date.now() > wtDisabledUntil) {
       try {
         const adapter = await openWebTransportAdapter(sessionInfo)
         wtFailCount = 0
