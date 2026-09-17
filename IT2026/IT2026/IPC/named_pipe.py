@@ -377,7 +377,11 @@ class NamedPipeCommandServer:
         if not image_path:
             return False
         try:
-            trusted = os.path.normcase(os.path.abspath(image_path)) == os.path.normcase(os.path.abspath(sys.executable))
+            # realpath 解析 current 目录 Junction：升级后客户端镜像位于 versions/<ver>/，
+            # 服务进程经 current Junction 启动——abspath 不解析 Junction 会导致误拒
+            trusted = os.path.normcase(os.path.realpath(image_path)) == os.path.normcase(
+                os.path.realpath(sys.executable)
+            )
         except Exception:
             return False
         if trusted:

@@ -1645,81 +1645,95 @@ const markSessionConnected = () => {
 
 const handleBinaryFrame = async (arrayBuffer) => {
   announceCapabilities()
-  // 二进制帧协议：
+  // 二进制帧协议（支持一条消息内多个子帧——H264 整帧原子投递，避免 SPS/PPS 被拆丢）：
   // 0x02 JPEG：[1B type][4B frameId][4B width][4B height][4B payloadLen][jpeg bytes]
   // 0x03 H264：[1B type][4B seq][4B width][4B height][4B payloadLen][1B keyframe][payload bytes]
   try {
     const view = new DataView(arrayBuffer)
-    if (arrayBuffer.byteLength < 17) return
-    const frameType = view.getUint8(0)
-    const frameId = view.getUint32(1)
-    const width = view.getUint32(5)
-    const height = view.getUint32(9)
-    const payloadLen = view.getUint32(13)
-    if (arrayBuffer.byteLength < 17 + payloadLen) return
+    let bitmapChain = Promise.resolve()
+    let offset = 0
+    while (arrayBuffer.byteLength >= offset + 17) {
+      const frameType = view.getUint8(offset)
+      const frameId = view.getUint32(offset + 1)
+      const width = view.getUint32(offset + 5)
+      const height = view.getUint32(offset + 9)
+      const payloadLen = view.getUint32(offset + 13)
+      if (arrayBuffer.byteLength < offset + 17 + payloadLen) break
 
-    if (frameType === 0x03) {
-      // H.264：Annex-B 裸流，解码后渲染并回 ACK（背压依据）
-      const keyframe = view.getUint8(17) === 1
-      const payload = new Uint8Array(arrayBuffer, 18, payloadLen)
+      if (frameType === 0x03) {
+        // H.264：Annex-B 裸流，解码后渲染并回 ACK（背压依据）
+        const keyframe = view.getUint8(offset + 17) === 1
+        const payload = new Uint8Array(arrayBuffer, offset + 18, payloadLen)
+        markRemoteSessionInitialized()
+        markSessionConnected()
+        h264Mode = true
+        clearCapabilitiesRetry()
+        const decoder = ensureH264Decoder()
+        if (!decoder || decoder.state !== 'configured') {
+          // 解码器不可用：丢弃并要求关键帧/回退
+          sendFrameAck(frameId)
+          offset += 17 + payloadLen
+          continue
+        }
+        const now = Date.now()
+        if (lastFrameTime > 0) {
+          fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+        }
+        lastFrameTime = now
+        frameCounter++
+        streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+        if (frameCounter % 10 === 0) {
+          bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
+        }
+        const chunk = new EncodedVideoChunk({
+          type: keyframe ? 'key' : 'delta',
+          timestamp: frameId * 1000,
+          data: payload
+        })
+        decoder.decode(chunk)
+        sendFrameAck(frameId)
+        offset += 17 + payloadLen
+        continue
+      }
+
+      if (frameType !== 0x02) {
+        // 未知子帧类型：无法确定长度，终止本消息解析
+        break
+      }
+
+      // JPEG (0x02)
+      const jpegBytes = new Uint8Array(arrayBuffer, offset + 17, payloadLen)
+
       markRemoteSessionInitialized()
       markSessionConnected()
-      h264Mode = true
-      clearCapabilitiesRetry()
-      const decoder = ensureH264Decoder()
-      if (!decoder || decoder.state !== 'configured') {
-        // 解码器不可用：丢弃并要求关键帧/回退
-        sendFrameAck(frameId)
-        return
-      }
+      latestFrameId += 1
+
+      // 更新FPS
       const now = Date.now()
       if (lastFrameTime > 0) {
-        fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+        const delta = now - lastFrameTime
+        fps.value = Math.round(1000 / delta)
       }
       lastFrameTime = now
       frameCounter++
+
+      // 更新推流分辨率
       streamResolution.value = formatResolutionText(width, height, streamResolution.value)
+      // 更新带宽
       if (frameCounter % 10 === 0) {
-        bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
+        const dataSize = payloadLen / 1024
+        bandwidth.value = `${Math.round(dataSize * fps.value)} KB/s`
       }
-      const chunk = new EncodedVideoChunk({
-        type: keyframe ? 'key' : 'delta',
-        timestamp: frameId * 1000,
-        data: payload
-      })
-      decoder.decode(chunk)
-      sendFrameAck(frameId)
-      return
+
+      // 用 createImageBitmap 解码（比 new Image + base64 快且无 base64 开销）
+      const blob = new Blob([jpegBytes], { type: 'image/jpeg' })
+      // 保序异步渲染：解码为异步操作，链式串行避免乱序绘制
+      bitmapChain = bitmapChain
+        .then(() => createImageBitmap(blob))
+        .then((bitmap) => drawBitmapFrame(bitmap, width, height, frameId))
+        .catch(() => {})
+      offset += 17 + payloadLen
     }
-
-    // JPEG (0x02)
-    const jpegBytes = new Uint8Array(arrayBuffer, 17, payloadLen)
-
-    markRemoteSessionInitialized()
-    markSessionConnected()
-    latestFrameId += 1
-
-    // 更新FPS
-    const now = Date.now()
-    if (lastFrameTime > 0) {
-      const delta = now - lastFrameTime
-      fps.value = Math.round(1000 / delta)
-    }
-    lastFrameTime = now
-    frameCounter++
-
-    // 更新推流分辨率
-    streamResolution.value = formatResolutionText(width, height, streamResolution.value)
-    // 更新带宽
-    if (frameCounter % 10 === 0) {
-      const dataSize = payloadLen / 1024
-      bandwidth.value = `${Math.round(dataSize * fps.value)} KB/s`
-    }
-
-    // 用 createImageBitmap 解码（比 new Image + base64 快且无 base64 开销）
-    const blob = new Blob([jpegBytes], { type: 'image/jpeg' })
-    const bitmap = await createImageBitmap(blob)
-    drawBitmapFrame(bitmap, width, height, frameId)
   } catch (e) {
     console.warn('[remote-desktop] binary frame decode failed', e)
   }

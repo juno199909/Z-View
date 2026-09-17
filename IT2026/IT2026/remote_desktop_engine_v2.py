@@ -1988,7 +1988,22 @@ class RemoteDesktopSession:
                 self.capture_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.capture_task
-            await asyncio.to_thread(self._restore_original_resolution)
+            # P0-H2：统一会话资源收尾（原 stop() 清理从未被调用，断开即泄漏）
+            with contextlib.suppress(Exception):
+                self._finalize_session_resources()
+            # P0-H6：分辨率恢复限时收口，防止半装显示驱动上永久悬挂
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._restore_original_resolution), timeout=25.0
+                )
+            except asyncio.TimeoutError:
+                self._log_session_event(
+                    "shutdown", "restore_original_resolution timed out; abandoned"
+                )
+            except Exception as exc:
+                self._log_session_event(
+                    "shutdown", f"restore_original_resolution error: {exc}"
+                )
 
     async def _send_screen_info(self):
         """发送屏幕信息给控制端"""
@@ -2110,8 +2125,12 @@ class RemoteDesktopSession:
                 # 触发 KeyError 'data'，capture_loop 整条死亡；本地 h264 流由此从未
                 # 在该结构下正常工作过）
                 if helper_result.get("h264_packets") is not None:
-                    for h264_msg in helper_result["h264_packets"]:
-                        self._enqueue_frame(h264_msg)
+                    # P0-H3：整帧原子入队（一帧多 Annex-B 包合并为一个队列单元），
+                    # 修复单槽覆盖竞态丢 SPS/PPS → 观看端解码失败到下一 IDR
+                    self._enqueue_h264_frame_group(
+                        helper_result["h264_packets"],
+                        int(helper_result.get("frame_size") or 0),
+                    )
                     self.frame_count += len(helper_result["h264_packets"])
                     self._stats_win["frames"] += len(helper_result["h264_packets"])
                     self._stats_win["bytes"] += int(helper_result.get("frame_size") or 0)
@@ -3074,15 +3093,15 @@ class RemoteDesktopSession:
         """编码包 → 入队消息列表（统一 seq/背压计数）。"""
         results = []
         for pkt in packets:
-            self._h264_sent_seq += 1
             results.append({
                 "type": "h264",
                 "data": base64.b64encode(pkt["data"]).decode("ascii"),
                 "keyframe": bool(pkt["keyframe"]),
-                "seq": self._h264_sent_seq,
                 "width": width,
                 "height": height,
             })
+        # P0-H4：seq 统一在发送侧（_send_binary_frame）分配——编码侧不再预分配，
+        # 修复 inflight = sent - acked 被双重递增虚高一倍的问题
         self._h264_stats["frames"] += len(results)
         self._h264_stats["bytes"] += sum(len(p["data"]) for p in packets)
         return results
@@ -4506,6 +4525,25 @@ class RemoteDesktopSession:
                 pass
             self.modifier_states[key] = False
 
+    def _enqueue_h264_frame_group(self, packets: list, frame_size: int) -> bool:
+        """P0-H3：同一帧的多个 Annex-B 包合并为一个原子队列单元。
+
+        此前逐包入队单槽 `_latest_frame_payload`，发送协程取走前被下一个包
+        覆盖 → IDR 重建帧的 SPS/PPS 导包被静默丢弃 → 观看端解码失败直到
+        下一 IDR（表现为偶发黑屏/12s 无 ack 回退 JPEG）。
+        """
+        if not packets:
+            return False
+        frame_payload = {
+            "type": "h264_group",
+            "packets": packets,
+            "width": int(packets[0].get("width") or 0),
+            "height": int(packets[0].get("height") or 0),
+            "keyframe": any(bool(p.get("keyframe")) for p in packets),
+            "frame_size": frame_size,
+        }
+        return self._enqueue_frame(frame_payload)
+
     def _enqueue_frame(self, frame_payload: dict) -> bool:
         """异步发送帧：fire-and-forget，不阻塞 capture_loop。
         二进制帧协议：
@@ -4537,6 +4575,29 @@ class RemoteDesktopSession:
         import struct
         async with self.send_lock:
             try:
+                if frame_payload.get("type") == "h264_group":
+                    # P0-H3：整帧多包原子投递——同组包共用一个 frame_id，
+                    # 观看端 ack 一次即代表整组（一帧）确认
+                    self._h264_sent_seq = int(getattr(self, "_h264_sent_seq", 0)) + 1
+                    frame_id = self._h264_sent_seq
+                    self._h264_send_times[frame_id] = time.monotonic()
+                    if len(self._h264_send_times) > 256:
+                        for stale_seq in sorted(self._h264_send_times)[:128]:
+                            self._h264_send_times.pop(stale_seq, None)
+                    wire = bytearray()
+                    keyframe_flag = 1 if frame_payload.get("keyframe") else 0
+                    width = int(frame_payload.get("width") or 0)
+                    height = int(frame_payload.get("height") or 0)
+                    for pkt in frame_payload.get("packets") or []:
+                        p_bytes = base64.b64decode(pkt.get("data", ""))
+                        p_width = int(pkt.get("width") or width)
+                        p_height = int(pkt.get("height") or height)
+                        wire += struct.pack(
+                            ">BIIIIB", 0x03, frame_id, p_width, p_height, len(p_bytes), keyframe_flag
+                        )
+                        wire += p_bytes
+                    await self.websocket.send_bytes(bytes(wire))
+                    return
                 data_b64 = frame_payload.get("data", "")
                 width = int(frame_payload.get("width") or 0)
                 height = int(frame_payload.get("height") or 0)
@@ -4597,34 +4658,80 @@ class RemoteDesktopSession:
         self.last_skip_log_at = 0.0
 
     def _restore_original_resolution(self):
-        if self._resolution_restored:
-            return
-        self._resolution_restored = True
-        success, message, _ = self.display_manager.restore_original_mode()
-        if success:
-            print(f"[RemoteDesktop] {message}")
-        else:
-            print(f"[RemoteDesktop] Restore desktop resolution skipped: {message}")
+        """恢复原始分辨率（P0-H6：限时 + 一次重试，杜绝半装显示驱动上永久悬挂）。"""
+        attempts = 0
+        while attempts < 2 and not self._resolution_restored:
+            attempts += 1
+            done = threading.Event()
 
-    def stop(self):
-        """停止会话"""
-        self.running = False
-        for transfer_id in list(self.file_transfer_manager._incoming_transfers.keys()):
-            self.file_transfer_manager.cancel_upload(transfer_id)
+            def _attempt():
+                try:
+                    success, message, _ = self.display_manager.restore_original_mode()
+                    if success:
+                        print(f"[RemoteDesktop] {message}")
+                    else:
+                        print(f"[RemoteDesktop] Restore desktop resolution skipped: {message}")
+                except Exception as exc:
+                    print(f"[RemoteDesktop] Restore desktop resolution error: {exc}")
+                finally:
+                    done.set()
+
+            worker = threading.Thread(
+                target=_attempt, daemon=True, name="rd-restore-resolution"
+            )
+            worker.start()
+            if not done.wait(timeout=10.0):
+                print(
+                    f"[RemoteDesktop] Restore desktop resolution timed out (attempt {attempts})"
+                )
+                continue
+            self._resolution_restored = True
+
+    def _finalize_session_resources(self) -> None:
+        """会话资源统一收尾（P0-H2）：观看端断开与显式 stop 共用同一清理口径。
+
+        顺序：取消传输 → 释放修饰键 → 停输入注入/执行器 → 取消帧发送 →
+        关编码器 → 关采集器。
+        """
+        try:
+            for transfer_id in list(self.file_transfer_manager._incoming_transfers.keys()):
+                self.file_transfer_manager.cancel_upload(transfer_id)
+        except Exception:
+            pass
         for transfer_id, task in list(self._download_tasks.items()):
             self._canceled_downloads.add(transfer_id)
             if not task.done():
                 task.cancel()
-        self._release_pressed_inputs()
-        self._restore_original_resolution()
-        self.input_injector.stop()
+        try:
+            self._release_pressed_inputs()
+        except Exception:
+            pass
+        try:
+            self.input_injector.stop()
+        except Exception:
+            pass
         try:
             self._input_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+        sender_task = getattr(self, "_frame_sender_task", None)
+        if sender_task is not None:
+            sender_task.cancel()
+        with contextlib.suppress(Exception):
+            self._close_h264_encoder()
         with contextlib.suppress(Exception):
             if self.capturer is not None:
                 self.capturer.close()
+        print(f"[RemoteDesktop] Session resources finalized: id={self.session_id}")
+
+    def stop(self):
+        """停止会话（兼容入口：与观看端断开清理同口径，P0-H2 修复后不再是死代码）"""
+        self.running = False
+        self._teardown_shell()
+        if self.capture_task:
+            self.capture_task.cancel()
+        self._finalize_session_resources()
+        self._restore_original_resolution()
         print(f"[RemoteDesktop] Session stopped: id={self.session_id}")
 
 

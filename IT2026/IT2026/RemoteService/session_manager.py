@@ -1114,6 +1114,10 @@ class SessionManager:
         last_blocked_substrate_signature = ""
         last_virtual_display_ensure_signature = ""
         last_virtual_display_ensure_at = 0.0
+        # P0-H7：虚拟显示器供给连续失败计数（指数退避）。此前 ensure 无失败熔断，
+        # 驱动永久装不上时（VMware 上 mm.inf 无法完成安装）以 ≥20s 节奏无限重试
+        # 8-10 个子进程/次，刷屏 agent-runtime.log 且阻塞维护线程。
+        self._virtual_display_ensure_fail_count = 0
         last_virtual_display_repair_signature = ""
         last_virtual_display_repair_at = 0.0
         # 虚拟显示器修复连续失败计数：指数退避，避免 45s 一次的失败修复
@@ -1432,6 +1436,13 @@ class SessionManager:
                             ]
                         )
                         ensure_cooldown_seconds = max(float(self.retry_seconds), 20.0)
+                        # P0-H7：连续失败指数退避（20s→40s→80s→…封顶 600s），
+                        # 驱动永久装不上时不再无限高频重试；成功/有进展即清零
+                        if self._virtual_display_ensure_fail_count > 0:
+                            ensure_cooldown_seconds = min(
+                                20.0 * (2 ** min(self._virtual_display_ensure_fail_count, 5)),
+                                600.0,
+                            )
                         if (
                             ensure_signature != last_virtual_display_ensure_signature
                             or (now - last_virtual_display_ensure_at) >= ensure_cooldown_seconds
@@ -1441,10 +1452,12 @@ class SessionManager:
                             try:
                                 ensure_status = self.ensure_virtual_display()
                             except Exception as exc:
+                                self._virtual_display_ensure_fail_count += 1
                                 self.bridge.log_runtime_event(
                                     "VirtualDisplay",
                                     "automatic ensure_virtual_display failed: "
-                                    f"error={exc} blocked_signature={blocked_signature}",
+                                    f"error={exc} blocked_signature={blocked_signature} "
+                                    f"fail_count={self._virtual_display_ensure_fail_count}",
                                 )
                             else:
                                 ensure_state = str(
@@ -1454,11 +1467,23 @@ class SessionManager:
                                 ensure_attached = bool(
                                     ensure_status.get("attached_virtual_display", False)
                                 )
+                                if ensure_attached or ensure_state == "attached":
+                                    self._virtual_display_ensure_fail_count = 0
+                                elif ensure_changed or ensure_state in {
+                                    "driver_package_ready_install_pending",
+                                    "installed_detached",
+                                    "installed_missing_enablement",
+                                }:
+                                    # 有进展（状态机推进）不累计失败，但保持退避节奏
+                                    pass
+                                else:
+                                    self._virtual_display_ensure_fail_count += 1
                                 self.bridge.log_runtime_event(
                                     "VirtualDisplay",
                                     "automatic ensure_virtual_display result: "
                                     f"changed={ensure_changed} attached={ensure_attached} "
-                                    f"state={ensure_state}",
+                                    f"state={ensure_state} "
+                                    f"fail_count={self._virtual_display_ensure_fail_count}",
                                 )
                                 if (
                                     not ensure_status.get("skipped_by_env")
@@ -3199,20 +3224,40 @@ class SessionManager:
                 f"role={normalized_helper_role} session={session_id} command={command}",
             )
         client = NamedPipeCommandClient(get_high_integrity_helper_pipe_name(session_id))
+        # P0-H5：超时对齐——helper 内 input worker 8s / capture worker 12s，
+        # 服务端管道客户端必须 ≥ 最长 helper 超时，否则慢请求被服务端先判失败，
+        # 触发"重启健康 helper + 迟到注入/重复执行"。重启另带指数退避熔断（见下）。
+        client_timeout = 14.0 if normalized_helper_role == "capture" else 10.0
         try:
             response = client.request(
                 {
                     "command": command,
                     "payload": payload or {},
                 },
-                timeout_seconds=5.0,
+                timeout_seconds=client_timeout,
             )
         except Exception as exc:
-            if allow_restart:
+            # P0-H5：一次瞬态失败不再立即重启 helper——按失败签名做指数退避熔断，
+            # 连续 ≥3 次失败才允许重启（此前一次 pipe busy 就杀健康 helper，
+            # 曾造成 84 号 VM"输入/帧反复中断"）。
+            import time as _time
+
+            now = _time.monotonic()
+            fail_key = f"{normalized_helper_role}:{session_id}"
+            fail_state = getattr(self, "_helper_command_fail_state", None)
+            if fail_state is None:
+                fail_state = {}
+                self._helper_command_fail_state = fail_state
+            first_at, count = fail_state.get(fail_key, (now, 0))
+            count += 1
+            fail_state[fail_key] = (first_at if now - first_at < 120 else now, count)
+            if allow_restart and count >= 3:
+                fail_state.pop(fail_key, None)
                 self.bridge.log_runtime_event(
                     "ServiceRuntime",
-                    "helper command failed, restarting helper: "
-                    f"role={normalized_helper_role} session={session_id} command={command} error={exc}",
+                    "helper command failed repeatedly, restarting helper: "
+                    f"role={normalized_helper_role} session={session_id} command={command} "
+                    f"count={count} error={exc}",
                 )
                 if normalized_helper_role == "capture":
                     self.restart_capture_helper(session_id, wait_seconds=2.0)
