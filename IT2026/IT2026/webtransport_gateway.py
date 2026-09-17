@@ -64,6 +64,7 @@ class AgentBridge:
     def set_data_stream(self, stream_id: int) -> None:
         if self.data_stream_id is None:
             self.data_stream_id = stream_id
+            self._wt_stream_header_sent = False
 
     # ---- WT → Agent ----
 
@@ -95,6 +96,7 @@ class AgentBridge:
         import websockets
 
         upstream_url = f"ws://{self.asset_ip}:9000/remote-desktop?requester=platform"
+        forwarded = 0
         try:
             async with websockets.connect(
                 upstream_url, open_timeout=UPSTREAM_TIMEOUT, max_size=None,
@@ -112,7 +114,14 @@ class AgentBridge:
                     payload, _ftype = _encode_frame(message)
                     stream_id = self.data_stream_id
                     if stream_id is None:
+                        if forwarded == 0:
+                            logger.warning(f"[{self.asset_ip}] agent frame dropped: data_stream_id not set yet "
+                                           f"(len={len(payload)} type={_ftype})")
                         continue
+                    forwarded += 1
+                    if forwarded <= 5:
+                        logger.info(f"[{self.asset_ip}] agent→wt frame #{forwarded}: len={len(payload)} "
+                                    f"type={_ftype} stream_id={stream_id}")
                     self.proto.send_wt_data(stream_id, payload)
         except Exception as exc:
             logger.info(f"[{self.asset_ip}] upstream ended: {exc}")
@@ -250,8 +259,11 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
             bridge = self._bridge
             if bridge is None:
                 return
-            # 记录观看端的数据流 id（服务端回写用）
-            bridge.set_data_stream(event.stream_id)
+            # 记录观看端的数据流 id（服务端回写用）——只接受客户端发起的
+            # 双向流（stream_id % 4 == 0）；单向流服务端不可写（写入即 H3 0x105）
+            if bridge.data_stream_id is None and event.stream_id % 4 == 0:
+                bridge.set_data_stream(event.stream_id)
+                logger.info(f"wt data stream selected: {event.stream_id} (bidi)")
             acc = self._accumulators.setdefault(event.stream_id, FrameAccumulator())
             data = event.data
             if not self._session_prefix_stripped.get(event.stream_id):
@@ -268,7 +280,7 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
             bridge = self._bridge
             if bridge and event.stream_id in self._accumulators:
                 for ftype, payload in self._accumulators[event.stream_id].feed(event.data):
-                    asyncio.ensure_future(bridge.browser_to_agent(payload))
+                    asyncio.ensure_future(bridge.browser_to_agent(0, payload))
 
     def _handle_headers(self, event: HeadersReceived):
         headers = {k.decode().lower(): v.decode() for k, v in event.headers}
@@ -333,8 +345,19 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
                     f"({info['hostname']}) session={session_id}")
 
     def send_wt_data(self, stream_id: int, payload: bytes):
-        """Agent → 观看端：在观看端发起的 WT 双向流上续写 WEBTRANSPORT_STREAM 数据。"""
+        """Agent → 观看端：在观看端发起的 WT 双向流上续写 WEBTRANSPORT_STREAM 数据。
+
+        流建立后服务端首帧前需带 [0x41 WEBTRANSPORT_STREAM 帧类型][session_id]
+        变int头（与观看端建流方向对称），后续帧为纯应用数据。
+        """
         try:
+            if not getattr(self, "_wt_stream_header_sent", False):
+                self._quic.send_stream_data(
+                    stream_id=stream_id,
+                    data=encode_uint_var(0x41)  # FrameType.WEBTRANSPORT_STREAM
+                    + encode_uint_var(self._bridge.connect_stream_id),
+                )
+                self._wt_stream_header_sent = True
             self._quic.send_stream_data(stream_id=stream_id, data=payload)
             self.transmit()
         except Exception as exc:
