@@ -1856,6 +1856,17 @@ def _patched_show_consent_dialog(self, request: dict) -> tuple[bool, str]:
     title = "Z-View 远程控制确认"
     style = MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL
 
+    # 托盘「本机免确认（自动允许）」在主路径同样生效（与 fallback helper 口径一致）
+    try:
+        settings = load_tray_settings()
+        if not settings.get("allow_remote_requests", True):
+            return False, "disabled_by_user"
+        if settings.get("skip_consent_for_session", False):
+            _append_consent_runtime_log("consent skipped by user setting: session_skip_enabled")
+            return True, "session_skip_enabled"
+    except Exception:
+        pass
+
     if load_tray_settings().get("show_balloon_notifications", True):
         _show_tray_balloon(
             self,
