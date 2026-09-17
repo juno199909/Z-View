@@ -1311,10 +1311,18 @@ const connect = async () => {
 // ============ WebTransport (UDP/QUIC) 传输适配 ============
 
 const openWebTransportAdapter = async (sessionInfo) => {
-  // 自签证书通过 serverCertificateHashes 信任（Chrome 97+，要求 ECDSA P-256、有效期 ≤14 天）
-  // 长期证书（3 年）不满足 serverCertificateHashes 的 14 天限制，
-  // 改走系统信任库校验：客户端机器导入 zview-root.cer（受信任的根证书颁发机构）一次即可
-  const wt = new WebTransport(sessionInfo.wt_url)
+  // 证书信任走 serverCertificateHashes 指纹校验：叶子证书 11 天自动轮换、
+  // 指纹随会话 API（可信通道）下发，观看端无需导入任何根证书。
+  // Chrome 要求：ECDSA P-256、有效期 ≤14 天、非 CA、serverAuth——均满足。
+  const hexToBytes = (hex) => {
+    const bytes = new Uint8Array(hex.length / 2)
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
+    return bytes
+  }
+  const wtOptions = sessionInfo.wt_cert_hash
+    ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBytes(sessionInfo.wt_cert_hash) }] }
+    : {}
+  const wt = new WebTransport(sessionInfo.wt_url, wtOptions)
   // 自适应切换的关键：4 秒内未就绪即放弃，快速回落 TCP
   await Promise.race([
     wt.ready,
