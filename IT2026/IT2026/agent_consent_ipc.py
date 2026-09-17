@@ -61,7 +61,8 @@ def load_tray_settings() -> dict[str, Any]:
     settings_path = resolve_tray_settings_path()
 
     try:
-        with open(settings_path, "r", encoding="utf-8") as file:
+        # utf-8-sig：容忍 PowerShell Set-Content -Encoding UTF8 写入的 BOM
+        with open(settings_path, "r", encoding="utf-8-sig") as file:
             saved_settings = json.load(file)
             if isinstance(saved_settings, dict):
                 settings.update(saved_settings)
