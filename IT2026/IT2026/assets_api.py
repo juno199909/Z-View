@@ -4421,30 +4421,34 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
     version = str(latest.get("version") or "")
     if not version:
         return None, None
-    exe_path = os.path.join(UPGRADE_DIR, version, "Z-View.exe")
-    if not os.path.exists(exe_path):
-        return None, None
-    return version, exe_path
+    version_dir = os.path.join(UPGRADE_DIR, version)
+    # 优先找解压后的 exe，其次回退 onedir-zip（上传后未解压的包）
+    for name in ("Z-View.exe", "agent-onedir.zip"):
+        p = os.path.join(version_dir, name)
+        if os.path.exists(p):
+            return version, p
+    return None, None
 
 
 @app.get("/api/v1/console/agent-deploy/package")
 def download_agent_deploy_package(request: Request):
-    """网页自助部署：下载最新版 Agent 安装包（admin）。
+    """网页自助部署：下载最新版 Agent 完整部署包（onedir zip，admin）。
 
-    终端用户拿到包后运行 `Z-View.exe --install --quiet --server-url <中心地址>`，
-    或配合部署脚本自动完成。升级通道已有 SHA256 校验，无需重复签名。
+    包含 Z-View.exe + _internal\（+ updater\），终端解压后运行
+    `Z-View.exe --install --quiet --server-url <中心地址>` 完成安装。
     """
     require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    version, exe_path = _resolve_latest_agent_package()
-    if not exe_path:
+    version, package_path = _resolve_latest_agent_package()
+    if not package_path:
         raise HTTPException(
             status_code=404,
             detail="No agent package available; upload one via /api/v1/agent/upgrade/upload first",
         )
+    filename = f"Z-View-Agent-{version}.zip" if package_path.endswith(".zip") else f"Z-View-Setup-{version}.exe"
     return FileResponse(
-        exe_path,
+        package_path,
         media_type="application/octet-stream",
-        filename=f"Z-View-Setup-{version}.exe",
+        filename=filename,
     )
 
 
@@ -4459,12 +4463,15 @@ $Token  = '{deploy_token}'
 $WorkDir = Join-Path $env:TEMP 'zview-agent-deploy'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
-Write-Host '[1/2] downloading agent package...'
+Write-Host '[1/3] downloading agent package (onedir zip)...'
 Invoke-WebRequest -UseBasicParsing `
     -Uri "$Center/api/v1/agent/upgrade/download?agent_token=$Token" `
-    -OutFile (Join-Path $WorkDir 'Z-View.exe')
+    -OutFile (Join-Path $WorkDir 'agent-onedir.zip')
 
-Write-Host '[2/2] installing service...'
+Write-Host '[2/3] extracting...'
+Expand-Archive -Force -Path (Join-Path $WorkDir 'agent-onedir.zip') -DestinationPath $WorkDir
+
+Write-Host '[3/3] installing service...'
 & (Join-Path $WorkDir 'Z-View.exe') --install --quiet --server-url $Center
 if ($LASTEXITCODE -eq 0) {{
     Write-Host 'Z-View Agent deployed successfully.'
