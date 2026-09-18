@@ -97,8 +97,14 @@ class CoordinateMapper:
         返回:
             (normalized_x, normalized_y): 归一化坐标
         """
+        if canvas_width <= 0 or canvas_height <= 0:
+            raise ValueError("canvas_width and canvas_height must be positive")
+
         normalized_x = x / canvas_width
         normalized_y = y / canvas_height
+
+        normalized_x = max(0.0, min(float(normalized_x), 1.0))
+        normalized_y = max(0.0, min(float(normalized_y), 1.0))
 
         return normalized_x, normalized_y
 
