@@ -526,4 +526,33 @@ def _get_last_upgrade_state() -> Optional[Dict[str, Any]]:
     return None
 
 
+# V1.9.51 跨进程互斥：updater 是独立进程，Agent 内存 in_progress 感知不到它。
+# 升级窗口内（SWITCHING/STARTING 等未决阶段）心跳再次触发会并发拉起第二个
+# 升级进程与 updater 互踩（upgrade.lock 只保护旧单文件流，不覆盖 v2 委托流）。
+_UPGRADE_ACTIVE_STAGES = {
+    "CHECKING", "DOWNLOADING", "VERIFYING", "STAGED",
+    "STOPPING", "SWITCHING", "STARTING", "HEALTH_CHECK",
+}
+_UPGRADE_STATE_STALE_SECONDS = 1800  # 状态超时视为崩溃残留，不再拦截
+
+
+def upgrade_state_busy() -> bool:
+    """upgrade-state.json 处于未决升级阶段（且未超时）时返回 True。"""
+    try:
+        if not _UPGRADE_STATE_PATH.exists():
+            return False
+        state = json.loads(_UPGRADE_STATE_PATH.read_text(encoding="utf-8"))
+        stage = str(state.get("stage") or "")
+        if stage not in _UPGRADE_ACTIVE_STAGES:
+            return False
+        updated_at = str(state.get("updated_at") or "")
+        if updated_at:
+            updated = time.mktime(time.strptime(updated_at, "%Y-%m-%d %H:%M:%S"))
+            if time.time() - updated > _UPGRADE_STATE_STALE_SECONDS:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 

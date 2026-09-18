@@ -86,6 +86,29 @@ def h264_available() -> bool:
     return bool(get_h264_backend_name())
 
 
+def _prepend_stream_header(pkts: list[dict[str, Any]], extradata: Any) -> list[dict[str, Any]]:
+    """将 extradata（SPS/PPS）前置到首个关键帧包 data 前（纯函数，可测）。
+
+    防御场景：硬编后端（nvenc/qsv/amf）重建后首包可能不含 in-band SPS/PPS
+    （仅 extradata 携带），观看端 reset 后首 chunk 将无法解码。前置后保证
+    首个关键帧包自含参数集。libx264 首包已含 in-band 参数集，extradata
+    前置不适用（调用方不传入即可）。
+    """
+    if not extradata or not pkts:
+        return pkts
+    header = bytes(extradata)
+    if not header:
+        return pkts
+    out = list(pkts)
+    idx = next((i for i, p in enumerate(out) if p.get("keyframe")), 0)
+    first = out[idx]
+    out[idx] = {
+        **first,
+        "data": header + bytes(first.get("data") or b""),
+    }
+    return out
+
+
 class H264StreamEncoder:
     """单会话 H.264 流式编码器。
 
@@ -137,6 +160,17 @@ class H264StreamEncoder:
         self._ctx = ctx
         self._codec_name = codec_name
         self._pts = 0
+        # P0-H7 防御：硬编后端首包可能不含 in-band SPS/PPS，捕获 extradata
+        # 并在首个关键帧包前置（libx264 首包已含 in-band 参数集，不受影响）
+        self._hw_stream_header: Any = None
+        self._hw_header_emitted = False
+        if codec_name in _HW_PROBE_BACKENDS:
+            try:
+                extradata = getattr(ctx, "extradata", None)
+                if extradata:
+                    self._hw_stream_header = bytes(extradata)
+            except Exception:
+                self._hw_stream_header = None
 
     def _close(self) -> None:
         try:
@@ -178,6 +212,26 @@ class H264StreamEncoder:
     def crf(self) -> int:
         return self._crf
 
+    def _attach_hw_stream_header(self, packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """硬编防御：未输出过流头时将 extradata 前置到首个关键帧包。
+
+        extradata 在 _open 时可能尚未就绪（PyAV 惰性 open），这里从 ctx
+        现取兜底；一旦成功前置即置 _hw_header_emitted（重建编码器后重置，
+        新 SPS/PPS 随新 IDR 重新下发）。
+        """
+        if not self.is_hardware or self._hw_header_emitted:
+            return packets
+        header = self._hw_stream_header
+        if not header and self._ctx is not None:
+            try:
+                header = getattr(self._ctx, "extradata", None)
+            except Exception:
+                header = None
+        packets = _prepend_stream_header(packets, header)
+        if header:
+            self._hw_header_emitted = True
+        return packets
+
     def encode(self, pil_image: Any, *, keyframe: bool = False) -> list[dict[str, Any]]:
         """编码一帧 PIL RGB 图像，返回 Annex-B 包列表。"""
         if self._ctx is None:
@@ -214,7 +268,7 @@ class H264StreamEncoder:
                         continue
                     keyframe_flag = bool(packet.is_keyframe)
                     packets.append({"data": data, "keyframe": keyframe_flag})
-                return packets
+                return self._attach_hw_stream_header(packets)
             finally:
                 if converted is not None:
                     converted.close()

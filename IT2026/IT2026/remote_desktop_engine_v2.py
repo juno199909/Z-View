@@ -1437,8 +1437,11 @@ class RemoteDesktopSession:
         self._h264_qos_last_eval = 0.0
         # 输入唤醒：收到键鼠输入立即唤醒采集循环，消除"等下一节拍"的反馈延迟
         self._capture_wakeup = asyncio.Event()
-        # P1-X1：抓帧/编码解耦——抓帧入队（latest-wins, maxlen=2），编码循环异步消费
-        self._h264_encode_queue: "collections.deque[dict]" = collections.deque(maxlen=2)
+        # P1-X1：抓帧/编码解耦——抓帧入队，编码循环异步消费。
+        # 淘汰策略由 _enqueue_h264_encode_job 手动执行（等效 maxlen=2）：
+        # 关键帧插队驻留队首，delta latest-wins——deque(maxlen) 的自动淘汰
+        # 方向与插入方向相反（append 淘汰队首），无法保护队首关键帧
+        self._h264_encode_queue: "collections.deque[dict]" = collections.deque(maxlen=8)
         self._h264_encode_wakeup = asyncio.Event()
         self._h264_encode_task: asyncio.Task | None = None
         self._capture_grab_ms_avg = 0.0
@@ -3329,6 +3332,31 @@ class RemoteDesktopSession:
         except Exception:
             pass
 
+    def _enqueue_h264_encode_job(self, job: dict) -> None:
+        """编码队列入队（等效 maxlen=2 的手动淘汰）：
+
+        - 关键帧 job：清空全部滞留 job（新 IDR 使其全部过时），插队入队首；
+        - delta job：队首关键帧永不淘汰，淘汰最旧的 delta（latest-wins 语义）。
+        """
+        queue = self._h264_encode_queue
+        if job.get("keyframe"):
+            while queue:
+                stale = queue.popleft()
+                with contextlib.suppress(Exception):
+                    stale.get("screenshot").close()
+            queue.appendleft(job)
+            return
+        if len(queue) >= 2:
+            if queue[0].get("keyframe") and len(queue) > 1:
+                victim_index = 1  # 保住队首关键帧，淘汰其后的最旧 delta
+            else:
+                victim_index = 0  # 无关键帧：淘汰最旧 delta（latest-wins）
+            victim = queue[victim_index]
+            del queue[victim_index]
+            with contextlib.suppress(Exception):
+                victim.get("screenshot").close()
+        queue.append(job)
+
     async def _capture_frame_h264(self, profile: dict) -> dict:
         """H.264 路径：capture_raw → 入编码队列（P1-X1 解耦：抓帧与编码并行）。
 
@@ -3377,9 +3405,9 @@ class RemoteDesktopSession:
                     "h264_dropped": True,
                 }
 
-            # P1-X1：入编码队列（latest-wins, maxlen=2），由 _h264_encode_loop 消费；
-            # screenshot 的关闭移交给编码循环（编码完成后释放）
-            self._h264_encode_queue.append({
+            # P1-X1：入编码队列（关键帧插队 + latest-wins），由 _h264_encode_loop 消费；
+            # screenshot 的关闭移交给编码循环（编码完成后释放，被淘汰时在入队侧释放）
+            self._enqueue_h264_encode_job({
                 "screenshot": screenshot,
                 "profile": dict(profile),
                 "keyframe": keyframe_needed,
@@ -3400,6 +3428,32 @@ class RemoteDesktopSession:
                 screenshot.close()
             raise
 
+    def _drain_h264_encode_queue(self):
+        """P1-X1 + 关键帧优先：返回 (job, 是否丢弃了携带关键帧请求的旧帧)。
+
+        - 队列中存在关键帧 job（keyframe appendleft 插队，位于队首区域）：
+          从队首向队尾取第一个关键帧，其之前的 delta 一并清空——IDR 之前的
+          delta 已过时；其后的新 delta 留待下轮 latest-wins。关键帧 job
+          本身被消费，不算被挤出。
+        - 无关键帧：保持 latest-wins（保留最新 delta，修复此前 oldest-wins）。
+        """
+        queue = self._h264_encode_queue
+        kf_index = next((i for i, j in enumerate(queue) if j.get("keyframe")), None)
+        if kf_index is not None:
+            job = queue[kf_index]
+            for _ in range(kf_index + 1):
+                queue.popleft()
+            return job, False
+        job = None
+        dropped_keyframe = False
+        while queue:
+            candidate = queue.pop()
+            if job is None:
+                job = candidate  # 最新帧
+            elif candidate.get("keyframe"):
+                dropped_keyframe = True
+        return job, dropped_keyframe
+
     async def _h264_encode_loop(self):
         """P1-X1：编码循环——消费抓帧队列（latest-wins），编码后整帧入队发送。
 
@@ -3409,11 +3463,13 @@ class RemoteDesktopSession:
             try:
                 await self._h264_encode_wakeup.wait()
                 self._h264_encode_wakeup.clear()
-                job = None
-                while self._h264_encode_queue:
-                    job = self._h264_encode_queue.pop()
+                job, dropped_keyframe = self._drain_h264_encode_queue()
                 if job is None or not self.running:
                     continue
+                # P0-H5：被 latest-wins 挤出的旧帧若携带关键帧请求，标志已在
+                # 抓帧侧消费清零——必须重新置位，否则观看端拿不到 IDR 黑屏到下一 GOP
+                if dropped_keyframe:
+                    self._h264_keyframe_requested = True
                 screenshot = job["screenshot"]
 
                 def _encode_job(img=screenshot):
@@ -4648,7 +4704,28 @@ class RemoteDesktopSession:
         """
         # 远程桌面核心原则：视频可以丢帧，绝不积压排队。
         # 只保留最新帧：发送慢时旧帧被新帧直接覆盖（而非排队等待）。
+        # P0-H6 例外：待发的 H.264 关键帧组（SPS/PPS+IDR，参考链起点）不允许被
+        # delta 帧覆盖——一旦被覆盖，观看端解码链断裂黑屏直到下一 GOP（约 2 秒）。
+        # 时效上限：关键帧组保护超过 2.5s（约 1.25 个 GOP）自动过期，允许 delta
+        # 覆盖——否则 12s 无 ack 回退窗口内 inflight 会被长期滞留的关键帧组推高。
+        pending_payload = getattr(self, "_latest_frame_payload", None)
+        if (
+            pending_payload is not None
+            and pending_payload.get("type") == "h264_group"
+            and pending_payload.get("keyframe")
+            and frame_payload.get("type") == "h264_group"
+            and not frame_payload.get("keyframe")
+        ):
+            enqueued_at = pending_payload.get("_enqueued_at")
+            protected = True
+            if enqueued_at is not None and time.monotonic() - float(enqueued_at) > 2.5:
+                protected = False  # 保护过期：放行使 delta 覆盖
+            if protected:
+                self._h264_stats["drops_backpressure"] += 1
+                return True
         self._latest_frame_payload = frame_payload
+        if frame_payload.get("type") == "h264_group" and frame_payload.get("keyframe"):
+            frame_payload["_enqueued_at"] = time.monotonic()
         if getattr(self, "_frame_sender_task", None) is None or self._frame_sender_task.done():
             self._frame_sender_task = asyncio.ensure_future(self._frame_sender_loop())
         return True

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Z-View Agent 包（V1.8.0 模块化）。
 
 模块边界（渐进迁移自 cmdb_agent_unified_v2.py / cmdb_agent_core.py 两个单体）：
@@ -11,4 +11,4 @@ policy（策略执行）、jobs（任务执行端）。单体文件保留为薄�
 """
 
 # Agent 版本号（与 cmdb_agent_core.AGENT_VERSION 同源，发布时 bump）
-__version__ = "1.9.48"
+__version__ = "1.9.51"

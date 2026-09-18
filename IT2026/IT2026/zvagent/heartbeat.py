@@ -33,7 +33,7 @@ from zvagent.auth import (
 )
 from zvagent.collectors.software import _software_payload_hash, collect_software_list
 from zvagent.collectors.system import collect_hardware_info, collect_system_status, get_primary_network_info
-from zvagent.config import SOFTWARE_CONFIG
+from zvagent.config import CONFIG, SOFTWARE_CONFIG, _CONFIG_CANDIDATES
 from zvagent.policy import _apply_agent_policies, _current_interval
 from zvagent.state import _AGENT_STATE
 from zvagent.upgrade import (
@@ -42,9 +42,40 @@ from zvagent.upgrade import (
     _get_last_upgrade_state,
     _upgrade_backoff_remaining,
     perform_self_upgrade,
+    upgrade_state_busy,
 )
 
 print = safe_console_print
+
+
+def _persist_agent_token(token: str) -> None:
+    """V1.9.51 根因补链：把刷新后的 Agent 令牌持久化到 config.local.json。
+
+    upgrade.py 的升级任务令牌来源是 CONFIG["token"]（安装时写入的静态值），
+    平台轮换后失效 → ZViewUpdater 下载 401。心跳 self-heal 刷新内存的同时
+    落盘（json.dump 无 BOM UTF8，写临时文件后原子替换），重启后仍有效。
+    落盘目标取配置加载的最高优先级候选（frozen = ProgramData config.local.json）。
+    """
+    try:
+        config_path = _CONFIG_CANDIDATES[0]
+        data: dict = {}
+        if config_path.exists():
+            try:
+                data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if data.get("token") == token:
+            return
+        data["token"] = token
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = config_path.with_name(config_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(str(tmp_path), str(config_path))
+    except Exception as exc:
+        safe_console_print(f"[Software] agent token persist failed: {exc}")
 
 
 def get_asset_id_from_server() -> int | None:
@@ -200,11 +231,18 @@ def _heartbeat_loop():
                     # P1-软件仓库自愈：平台在心跳响应中下发当前 Agent 令牌，
                     # 配置漂移（安装时的旧 token vs 平台轮换后的新 token）时自动纠正，
                     # 软件任务轮询/下载通道即时恢复，无需人工改配置或重装。
+                    # V1.9.51 根因补链：同步刷新 CONFIG["token"]（升级任务令牌来源）
+                    # 并持久化到 config.local.json，否则平台轮换后 ZViewUpdater
+                    # 用安装时的静态令牌下载 → 401 反复回滚。
                     try:
                         platform_agent_token = str(body.get("agent_token") or "").strip()
-                        if platform_agent_token and platform_agent_token != SOFTWARE_CONFIG.get("token"):
+                        if (platform_agent_token
+                                and (platform_agent_token != SOFTWARE_CONFIG.get("token")
+                                     or platform_agent_token != CONFIG.get("token"))):
+                            CONFIG["token"] = platform_agent_token
                             SOFTWARE_CONFIG["token"] = platform_agent_token
-                            safe_console_print("[Software] agent token refreshed from heartbeat")
+                            _persist_agent_token(platform_agent_token)
+                            safe_console_print("[Software] agent token refreshed from heartbeat (memory + config.local.json)")
                     except Exception as exc:
                         safe_console_print(f"[Software] token refresh failed: {exc}")
                     # V1.8.3 通用任务通道：执行心跳下发的任务，结果随下次心跳上报
@@ -263,17 +301,23 @@ def _heartbeat_loop():
                                 _UPGRADE_STATE["backoff_note_at"] = time.time()
                                 print(f"[Upgrade] target {upgrade_info['version']} backoff {int(backoff_remaining)}s remaining; skip")
                         elif not _UPGRADE_STATE.get("in_progress"):
-                            _UPGRADE_STATE["in_progress"] = True
-                            try:
-                                threading.Thread(
-                                    target=perform_self_upgrade,
-                                    args=(upgrade_info["version"], upgrade_info["sha256"]),
-                                    daemon=True,
-                                    name="agent-self-upgrade",
-                                ).start()
-                            except Exception as exc:
-                                print(f"[Upgrade] trigger failed: {exc}")
-                                _UPGRADE_STATE["in_progress"] = False
+                            # V1.9.51 跨进程互斥：updater 独立进程运行期间
+                            # （upgrade-state.json 处于未决阶段）跳过本次触发，
+                            # 防止并发拉起第二个升级进程互踩。
+                            if upgrade_state_busy():
+                                print("[Upgrade] upgrade-state.json in-progress; skip this trigger")
+                            else:
+                                _UPGRADE_STATE["in_progress"] = True
+                                try:
+                                    threading.Thread(
+                                        target=perform_self_upgrade,
+                                        args=(upgrade_info["version"], upgrade_info["sha256"]),
+                                        daemon=True,
+                                        name="agent-self-upgrade",
+                                    ).start()
+                                except Exception as exc:
+                                    print(f"[Upgrade] trigger failed: {exc}")
+                                    _UPGRADE_STATE["in_progress"] = False
                 consecutive_failures = 0
                 print(f"[Heartbeat] OK (asset_id={asset_id})")
                 # V1.6.0：心跳成功即写入健康标记，ZViewUpdater 健康检查据此判定 COMMIT

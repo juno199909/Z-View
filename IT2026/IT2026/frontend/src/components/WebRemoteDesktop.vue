@@ -876,6 +876,12 @@ let h264Mode = false
 let videoDecoder = null
 let h264DecodeFailStreak = 0
 let h264LastSeq = 0
+// 解码统计：积压丢弃计数（此前未声明，JSON/binary 路径引用会 ReferenceError）
+const decodeStats = { dropped: 0 }
+// H264 配置一致性（黑屏专项）：chunk 时间戳单调化基准 + decoder 已配置分辨率
+let h264LastTimestampUs = 0
+let h264ConfiguredWidth = 0
+let h264ConfiguredHeight = 0
 let isDecodingFrame = false
 let wsCandidates = []
 let wsCandidateIndex = 0
@@ -1685,6 +1691,85 @@ const handleBinaryFrame = async (arrayBuffer) => {
     const view = new DataView(arrayBuffer)
     let bitmapChain = Promise.resolve()
     let offset = 0
+    // P0-H7：同 frame_id 的多 Annex-B 包合并为一个 chunk（见 flushH264Group）
+    let h264Group = null
+    const flushH264Group = () => {
+      const group = h264Group
+      h264Group = null
+      if (!group) return
+      const now = Date.now()
+      if (lastFrameTime > 0) {
+        fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+      }
+      lastFrameTime = now
+      frameCounter++
+      if (lastDecodeTick > 0) {
+        decodeFps.value = Math.round(1000 / Math.max(1, now - lastDecodeTick))
+      }
+      lastDecodeTick = now
+      streamResolution.value = formatResolutionText(group.width, group.height, streamResolution.value)
+      if (frameCounter % 10 === 0) {
+        const totalBytes = group.parts.reduce((n, p) => n + p.byteLength, 0)
+        bandwidth.value = `${Math.round(totalBytes / 1024 * Math.max(fps.value, 1))} KB/s`
+      }
+      // 分辨率变更：keyframe 携带新 SPS/PPS，按新分辨率（必要时升级 level）重建 decoder
+      if (
+        group.keyframe &&
+        h264ConfiguredWidth > 0 &&
+        (group.width !== h264ConfiguredWidth || group.height !== h264ConfiguredHeight)
+      ) {
+        resetH264Decoder()
+      }
+      const decoder = ensureH264Decoder(group.width, group.height)
+      if (!decoder || decoder.state !== 'configured') {
+        // 解码器不可用：丢弃并要求关键帧/回退
+        sendFrameAck(group.frameId)
+        return
+      }
+      // 与 JSON h264 路径一致：解码积压（>2 帧）且收到关键帧 → 重置解码器直跳最新画面
+      if (group.keyframe && decoder.decodeQueueSize > 2) {
+        decodeStats.dropped += decoder.decodeQueueSize
+        resetH264Decoder()
+        const fresh = ensureH264Decoder(group.width, group.height)
+        if (!fresh || fresh.state !== 'configured') {
+          sendFrameAck(group.frameId)
+          return
+        }
+        try {
+          decodeH264Group(fresh, group)
+        } catch (e) {
+          handleH264DecodeError(e, group.frameId)
+        }
+        return
+      }
+      try {
+        decodeH264Group(decoder, group)
+      } catch (e) {
+        handleH264DecodeError(e, group.frameId)
+      }
+    }
+    // 与 JSON h264 路径一致的同步解码失败处理：失败计数 → 请求关键帧 → 回退 JPEG
+    const handleH264DecodeError = (e, seq) => {
+      console.warn('[remote-desktop] h264 chunk decode failed', e)
+      h264DecodeFailStreak += 1
+      sendFrameAck(seq)
+      if (h264DecodeFailStreak <= 2) {
+        sendSocketMessage({ type: 'request_keyframe' })
+      } else if (h264DecodeFailStreak >= 6) {
+        sendSocketMessage({ type: 'viewer_capabilities', webcodecs: false })
+        teardownH264()
+      }
+    }
+    const decodeH264Group = (decoder, group) => {
+      const data = group.parts.length === 1 ? group.parts[0] : concatUint8(group.parts)
+      const chunk = new EncodedVideoChunk({
+        type: group.keyframe ? 'key' : 'delta',
+        timestamp: nextH264TimestampUs(group.frameId),
+        data
+      })
+      lastDecodedFrameId.value = group.frameId
+      decoder.decode(chunk)
+    }
     while (arrayBuffer.byteLength >= offset + 17) {
       const frameType = view.getUint8(offset)
       const frameId = view.getUint32(offset + 1)
@@ -1701,39 +1786,19 @@ const handleBinaryFrame = async (arrayBuffer) => {
       markSessionConnected()
       h264Mode = true
       clearCapabilitiesRetry()
-      const decoder = ensureH264Decoder()
-      if (!decoder || decoder.state !== 'configured') {
-        // 解码器不可用：丢弃并要求关键帧/回退
-        sendFrameAck(frameId)
-        offset += 17 + payloadLen
-        continue
+      if (h264Group && h264Group.frameId !== frameId) {
+        flushH264Group()
       }
-      const now = Date.now()
-      if (lastFrameTime > 0) {
-        fps.value = Math.round(1000 / Math.max(1, now - lastFrameTime))
+      if (!h264Group) {
+        h264Group = { frameId, width, height, keyframe: false, parts: [] }
       }
-      lastFrameTime = now
-      frameCounter++
-      // 解码 FPS
-      if (lastDecodeTick > 0) {
-        decodeFps.value = Math.round(1000 / Math.max(1, now - lastDecodeTick))
-      }
-      lastDecodeTick = now
-      streamResolution.value = formatResolutionText(width, height, streamResolution.value)
-      if (frameCounter % 10 === 0) {
-        bandwidth.value = `${Math.round(payloadLen / 1024 * Math.max(fps.value, 1))} KB/s`
-      }
-      const chunk = new EncodedVideoChunk({
-        type: keyframe ? 'key' : 'delta',
-        timestamp: frameId * 1000,
-        data: payload
-      })
-      lastDecodedFrameId.value = frameId
-      decoder.decode(chunk)
+      if (keyframe) h264Group.keyframe = true
+      h264Group.parts.push(payload)
       offset += 17 + payloadLen
       continue
     }
 
+      flushH264Group()
       if (frameType !== 0x02) {
         // 未知子帧类型：无法确定长度，终止本消息解析
         break
@@ -1772,6 +1837,8 @@ const handleBinaryFrame = async (arrayBuffer) => {
         .catch(() => {})
       offset += 17 + payloadLen
     }
+      // 消息尾部：冲刷最后一个未投递的 H.264 帧组
+      flushH264Group()
   } catch (e) {
     console.warn('[remote-desktop] binary frame decode failed', e)
   }
@@ -2917,15 +2984,61 @@ const resetH264Decoder = () => {
     // ignore
   }
   videoDecoder = null
+  h264ConfiguredWidth = 0
+  h264ConfiguredHeight = 0
 }
 
 const teardownH264 = () => {
   h264Mode = false
   h264DecodeFailStreak = 0
   h264LastSeq = 0
+  h264LastTimestampUs = 0
   resetH264Decoder()
   clearCapabilitiesRetry()
   clearSilentCheckTimer()
+}
+
+// ============ H264 配置一致性（黑屏专项） ============
+
+const concatUint8 = (parts) => {
+  let total = 0
+  for (const p of parts) total += p.byteLength
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const p of parts) {
+    out.set(p, off)
+    off += p.byteLength
+  }
+  return out
+}
+
+// 时间戳单调化：frame_id（引擎 seq）单调递增，但帧被丢弃/分组多包共用 frame_id 时
+// 会出现重复或依赖外部保证——兜底强制非回退，避免 EncodedVideoChunk timestamp
+// 回退触发 decode 异常（WebCodecs 要求 decode 顺序 timestamp 单调不减）
+const nextH264TimestampUs = (frameId) => {
+  const ts = Math.max(h264LastTimestampUs + 1000, frameId * 1000)
+  h264LastTimestampUs = ts
+  return ts
+}
+
+// 按推流分辨率选 H.264 level（High Profile，avc1.6400xx）。
+// 固定 avc1.640028（Level 4.0，上限 8192 宏块）在 2K/4K 桌面（2560×1440=14400MB、
+// 3840×2160=32400MB）与码流实际 level 不匹配，严格实现的浏览器会拒绝解码。
+const H264_LEVELS = [
+  { mbs: 8192, level: '28' },   // L4.0
+  { mbs: 8704, level: '2a' },   // L4.2
+  { mbs: 22080, level: '32' },  // L5.0
+  { mbs: 36864, level: '33' },  // L5.1
+  { mbs: 69632, level: '34' }   // L5.2
+]
+const h264CodecString = (width, height) => {
+  const w = Math.max(1, Math.ceil((Number(width) || 1920) / 16))
+  const h = Math.max(1, Math.ceil((Number(height) || 1080) / 16))
+  const mbs = w * h
+  for (const entry of H264_LEVELS) {
+    if (mbs <= entry.mbs) return `avc1.6400${entry.level}`
+  }
+  return 'avc1.640034'
 }
 
 // ============ P1-1.2/1.4：媒体面状态机 + 渲染后 ACK ============
@@ -3002,6 +3115,22 @@ const handleH264Frame = (message) => {
 
   try {
     let decoder = videoDecoder
+    // 分辨率变更：keyframe 携带新 SPS/PPS，按新分辨率重建 decoder
+    const msgWidth = Number(message.width) || 0
+    const msgHeight = Number(message.height) || 0
+    if (
+      message.keyframe &&
+      decoder &&
+      h264ConfiguredWidth > 0 &&
+      msgWidth > 0 &&
+      (msgWidth !== h264ConfiguredWidth || msgHeight !== h264ConfiguredHeight)
+    ) {
+      resetH264Decoder()
+      decoder = null
+    }
+    if (!decoder || decoder.state !== 'configured') {
+      decoder = ensureH264Decoder(msgWidth, msgHeight)
+    }
     if (!decoder || decoder.state !== 'configured') {
       sendFrameAck(seq)
       return
@@ -3010,7 +3139,7 @@ const handleH264Frame = (message) => {
     if (message.keyframe && decoder.decodeQueueSize > 2) {
       decodeStats.dropped += decoder.decodeQueueSize
       resetH264Decoder()
-      decoder = ensureH264Decoder()
+      decoder = ensureH264Decoder(msgWidth, msgHeight)
       if (!decoder || decoder.state !== 'configured') {
         sendFrameAck(seq)
         return
@@ -3023,7 +3152,7 @@ const handleH264Frame = (message) => {
     }
     const chunk = new EncodedVideoChunk({
       type: message.keyframe ? 'key' : 'delta',
-      timestamp: seq * 1000,
+      timestamp: nextH264TimestampUs(seq),
       data: bytes
     })
     decoder.decode(chunk)
@@ -3044,8 +3173,13 @@ const handleH264Frame = (message) => {
   }
 }
 
-const ensureH264Decoder = () => {
-  if (videoDecoder && videoDecoder.state === 'configured') return videoDecoder
+const ensureH264Decoder = (width = 0, height = 0) => {
+  if (videoDecoder && videoDecoder.state === 'configured') {
+    // 已配置：未指定新分辨率或分辨率未变时直接复用（delta 帧不得触发 reconfigure）
+    if (!width || !height || (width === h264ConfiguredWidth && height === h264ConfiguredHeight)) {
+      return videoDecoder
+    }
+  }
   if (typeof window === 'undefined' || typeof window.VideoDecoder !== 'function') {
     return null
   }
@@ -3065,8 +3199,14 @@ const ensureH264Decoder = () => {
           }
         }
       })
-      // Annex-B 裸流（无 description），x264 默认 High Profile
-      videoDecoder.configure({ codec: 'avc1.640028' })
+      // Annex-B 裸流（无 description），x264 默认 High Profile；
+      // level 按推流分辨率选择（2K/4K 需 ≥L5.0/L5.1），optimizeForLatency 降低解码延迟
+      videoDecoder.configure({
+        codec: h264CodecString(width, height),
+        optimizeForLatency: true
+      })
+      h264ConfiguredWidth = width || 0
+      h264ConfiguredHeight = height || 0
       h264DecodeFailStreak = 0
     } catch (e) {
       console.error('❌ VideoDecoder 初始化失败:', e)

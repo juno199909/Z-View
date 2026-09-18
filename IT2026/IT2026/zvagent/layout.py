@@ -91,7 +91,19 @@ def _run_hidden(cmd: list[str], timeout: int = 60) -> int:
 
 
 def service_query_running(service_name: str = SERVICE_NAME) -> bool:
-    return _run_hidden(["sc", "query", service_name]) == 0
+    """V1.9.51 语义修复：真正查询服务状态为 RUNNING。
+
+    此前只看 sc query 退出码（服务存在即 0，STOPPED 也返回 0），
+    "服务存在"被误当"服务运行中"。现解析输出中的 RUNNING 状态。
+    """
+    try:
+        # 不用 text=True：中文 Windows sc 输出为 GBK，UTF-8 读线程会解码崩溃；
+        # 只判 ASCII 的 "RUNNING"，errors=replace 忽略其余乱码
+        proc = subprocess.run(["sc", "query", service_name], capture_output=True,
+                              creationflags=CREATION_FLAGS, timeout=30)
+        return "RUNNING" in (proc.stdout or b"").decode("utf-8", errors="replace")
+    except Exception:
+        return False
 
 
 def service_stop(service_name: str = SERVICE_NAME, timeout: int = 60) -> None:
@@ -149,28 +161,53 @@ def install_version_from_staging(version: str) -> bool:
         return False
 
 
+def _prune_entry(entry: Path, removed: list[str], protected: str = "") -> None:
+    """删除单个版本目录（rmtree 幂等），成功后记录名称；保护名不删。"""
+    if protected and entry.name == protected:
+        return
+    shutil.rmtree(entry, ignore_errors=True)
+    if not entry.exists():
+        removed.append(entry.name)
+
+
 def prune_old_versions(keep: int = 2, current: str = "") -> list[str]:
-    """保留当前 + 最近 keep-1 个历史版本，其余删除。返回被删除的版本名。"""
-    removed = []
+    """保留当前 + 最近 keep-1 个历史版本目录，并清理 .old-* 升级备份残留。
+
+    V1.9.51 修复：.old-<ts> 备份目录此前与真实目录一起按版本号排序参与
+    保留窗口竞争，同一版本的多个备份互相顶替，导致 versions 目录下累积
+    十余个 .old-* 目录。现按基础版本号分组处理：
+    - 窗口外整组删除；
+    - 窗口内有真实目录 → 备份全部清理（回滚走真实版本目录，备份无消费方）；
+    - 窗口内仅剩备份 → 保留最新一个作为该版本唯一副本。
+    返回被删除的目录名列表。
+    """
+    removed: list[str] = []
     try:
-        entries = []
+        groups: dict[tuple, list[Path]] = {}
         for entry in VERSIONS_DIR.iterdir():
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
-            name = entry.name.split(".old-")[0]
+            base = entry.name.split(".old-")[0]
             try:
-                key = [int(p) for p in name.split(".")]
+                key = tuple(int(p) for p in base.split("."))
             except ValueError:
                 continue
-            entries.append((key, entry.name, entry))
-        entries.sort(key=lambda item: item[0])
-        removable = entries[:-keep] if len(entries) > keep else []
-        for _, name, entry in removable:
-            if name == current:
+            groups.setdefault(key, []).append(entry)
+        ordered = sorted(groups.items(), key=lambda item: item[0])
+        keep_keys = {key for key, _ in ordered[-keep:]}
+        for key, entries in ordered:
+            if key not in keep_keys:
+                for entry in entries:
+                    _prune_entry(entry, removed, protected=current)
                 continue
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                removed.append(name)
+            real = [e for e in entries if ".old-" not in e.name]
+            backups = sorted((e for e in entries if ".old-" in e.name), key=lambda e: e.name)
+            if real:
+                for entry in backups:
+                    _prune_entry(entry, removed)
+            else:
+                for entry in backups[:-1]:
+                    _prune_entry(entry, removed)
     except Exception as exc:
         print(f"[Layout] prune failed: {exc}")
     return removed
