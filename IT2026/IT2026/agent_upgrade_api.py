@@ -280,6 +280,22 @@ async def upload_upgrade(
             size += len(chunk)
     digest = sha.hexdigest()
 
+    # P1-04 部署流程修复：onedir-zip 包解压 Z-View.exe 到版本目录，
+    # 供网页自助部署（/api/v1/console/agent-deploy/package）下载——
+    # 此前版本目录只有 zip 无解压 exe，部署端 404 "No agent package available"
+    if package_type == "onedir-zip":
+        import zipfile as _zipfile
+
+        try:
+            deploy_exe = os.path.join(version_dir, "Z-View.exe")
+            with _zipfile.ZipFile(exe_path, "r") as zf:
+                with zf.open("Z-View.exe") as src_f, open(deploy_exe, "wb") as dst_f:
+                    while chunk := src_f.read(1024 * 512):
+                        dst_f.write(chunk)
+            safe_console_print(f"[AgentUpgrade] deploy exe extracted: {deploy_exe}")
+        except Exception as exc:
+            safe_console_print(f"[AgentUpgrade] deploy exe extraction failed: {exc}")
+
     manifest = _load_manifest()
     manifest.update({
         "version": version,
