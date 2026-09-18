@@ -12,14 +12,14 @@
 
     <el-alert type="info" :closable="false" show-icon class="zv-deploy-tip"
       title="部署流程说明"
-      description="① 下载安装包（或部署脚本）→ ② 终端管理员运行安装（脚本自动完成）→ ③ Agent 注册服务并上线，首个心跳自动完成设备凭据注册。脚本内嵌下载 Token，仅限内部分发，勿公开传播。" />
+      description="① 下载安装器（setup exe）→ ② 拷到终端双击运行，UAC 提权后「下一步 → 安装 → 完成」→ ③ Agent 自动注册服务并上线，首个心跳自动完成设备凭据注册。批量部署请用部署脚本（静默模式），脚本内嵌下载 Token，勿公开传播。" />
 
     <div class="zv-deploy-grid">
       <!-- 安装包下载 -->
       <div class="zv-card zv-card-pad">
         <div class="zv-card-title">安装包</div>
         <div class="zv-deploy-desc">
-          最新版 Z-View.exe（与"Agent 升级"共用同一仓库）。单台部署：下载后在终端以管理员运行安装命令即可。
+          图形化安装器（内含完整 Agent）：下载后双击即可，跟着向导「下一步」完成，无需命令行。下方命令仅供静默/脚本部署。
         </div>
         <div class="zv-deploy-cmd" v-if="installCmd">
           <code>{{ installCmd }}</code>
@@ -44,6 +44,32 @@
         <el-alert type="warning" :closable="false" show-icon
           title="版本一致性"
           description="终端 Agent 版本以「Agent 升级」页下发的最新包为准；新装终端安装后自动进入同一升级通道。" />
+      </div>
+
+      <!-- 退出密码 -->
+      <div class="zv-card zv-card-pad">
+        <div class="zv-card-title">退出密码</div>
+        <div class="zv-deploy-desc">
+          启用后，终端托盘「退出代理」需输入此密码验证（管理台不可达时拒绝退出）。密码仅保存哈希，保存后不可查看。
+        </div>
+        <el-form label-width="0" @submit.prevent>
+          <el-input v-model="exitPassword" type="password" show-password
+            :placeholder="exitPolicy.enabled ? '输入新密码以更换（至少 4 位）' : '设置退出密码（至少 4 位）'"
+            style="max-width: 280px" />
+        </el-form>
+        <div class="zv-deploy-actions" style="margin-top: 10px">
+          <el-tag :type="exitPolicy.enabled ? 'success' : 'info'" size="small">
+            {{ exitPolicy.enabled ? '已启用验证' : '未启用' }}
+          </el-tag>
+          <el-button type="primary" size="small" :loading="exitPolicySaving"
+            :disabled="!exitPassword || exitPassword.length < 4" @click="saveExitPolicy(true)">
+            {{ exitPolicy.enabled ? '更换密码' : '启用验证' }}
+          </el-button>
+          <el-button v-if="exitPolicy.enabled" size="small" :loading="exitPolicySaving"
+            @click="saveExitPolicy(false)">
+            关闭验证
+          </el-button>
+        </div>
       </div>
     </div>
 
@@ -94,9 +120,11 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Document, Download, Refresh } from '@element-plus/icons-vue'
 import request from '@/api/request'
+import { getAuthToken } from '@/api/auth-session'
 import dayjs from 'dayjs'
 
 const loading = ref(false)
@@ -128,22 +156,65 @@ const loadAll = async () => {
   }
 }
 
+const exitPolicy = ref({ enabled: false })
+const exitPolicySaving = ref(false)
+const exitPassword = ref('')
+
+const loadExitPolicy = async () => {
+  try {
+    const resp = await request.get('/console/agent-exit-policy')
+    exitPolicy.value = resp || { enabled: false }
+  } catch (e) {
+    // 错误提示由全局拦截器弹出
+  }
+}
+
+const saveExitPolicy = async (enabled) => {
+  exitPolicySaving.value = true
+  try {
+    const resp = await request.put('/console/agent-exit-policy', {
+      enabled,
+      password: enabled ? exitPassword.value : undefined
+    })
+    ElMessage.success(resp?.message || '已保存')
+    exitPassword.value = ''
+    await loadExitPolicy()
+  } catch (e) {
+    // 错误提示由全局拦截器弹出
+  } finally {
+    exitPolicySaving.value = false
+  }
+}
+
 const triggerDownload = (blob, filename) => {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = filename
   a.click()
-  URL.revokeObjectURL(url)
+  // 大文件场景：延迟回收，避免个别浏览器在下载尚未建立时即失效
+  setTimeout(() => URL.revokeObjectURL(url), 60000)
 }
 
 const downloadPackage = async () => {
   downloading.value = true
   try {
-    const blob = await request.get('/console/agent-deploy/package', { responseType: 'blob' })
-    triggerDownload(blob, `Z-View-Setup-${dayjs().format('YYYYMMDD')}.exe`)
+    // setup exe ~100MB：全局 30s 超时会掐断大包下载，这里显式不限时；
+    // 共享拦截器只回 data、拿不到响应头，故用裸 axios 读取服务端文件名
+    const resp = await axios.get('/api/v1/console/agent-deploy/package', {
+      responseType: 'blob',
+      timeout: 0,
+      headers: getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}
+    })
+    const filename = resp.headers?.['x-agent-package-filename']
+      || `Z-View-Setup-${dayjs().format('YYYYMMDD')}.exe`
+    triggerDownload(resp.data, filename)
     ElMessage.success('安装包已开始下载')
   } catch (e) {
+    const msg = e?.response?.status === 404
+      ? '暂无可用安装包，请先在「Agent 升级」页上传'
+      : '下载失败，请重试'
+    ElMessage.error(msg)
   } finally {
     downloading.value = false
   }
@@ -181,7 +252,10 @@ const formatTime = (v) => {
   return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(v)
 }
 
-onMounted(loadAll)
+onMounted(() => {
+  loadAll()
+  loadExitPolicy()
+})
 </script>
 
 <style lang="scss" scoped>

@@ -221,6 +221,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="install self to Program Files and register/start the CMDB-Agent service (idempotent)",
     )
     parser.add_argument(
+        "--stop-agent",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -303,14 +308,21 @@ def run_self_install(quiet: bool = False, server_url: str = "",
     is_onedir = (source_dir / "_internal").is_dir()
 
     def _run(cmd: list[str]) -> int:
-        completed = _subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            creationflags=creation_flags,
-            timeout=120,
-        )
-        return completed.returncode
+        try:
+            completed = _subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=creation_flags,
+                timeout=120,
+            )
+            return completed.returncode
+        except _subprocess.TimeoutExpired:
+            _say(f"command timeout (treated as pending): {' '.join(map(str, cmd))[:120]}")
+            return 124
+        except Exception as exc:
+            _say(f"command failed: {exc}")
+            return 1
 
     def _write_program_data_config() -> bool:
         try:
@@ -365,26 +377,30 @@ def run_self_install(quiet: bool = False, server_url: str = "",
         version_target = _layout.version_dir(agent_version)
         _say(f"install target: {version_target}")
 
-        # 1. 复制程序目录（exe + _internal + version.txt），运行中的文件锁跳过
-        try:
-            version_target.mkdir(parents=True, exist_ok=True)
-            for item in source_dir.iterdir():
-                if item.name in ("config.local.json", "zv-credential.json"):
-                    continue
-                dest = version_target / item.name
-                try:
-                    if item.is_dir():
-                        if dest.exists():
-                            _shutil.rmtree(dest, ignore_errors=True)
-                        _shutil.copytree(item, dest)
-                    else:
-                        _shutil.copy2(item, dest)
-                except PermissionError:
-                    _say(f"locked file skipped (running?): {item.name}")
-        except Exception as exc:
-            _say(f"copy program files failed: {exc}")
-            _migration_state("FAILED", f"copy program files failed: {exc}")
-            return 1
+        # 1. 复制程序目录（exe + _internal + version.txt），运行中的文件锁跳过；
+        #    同版本已存在时幂等跳过拷贝（重装/向导重跑不因文件锁失败）
+        if version_target.exists() and (version_target / "Z-View.exe").exists():
+            _say(f"version {agent_version} already present at target; skip file copy")
+        else:
+            try:
+                version_target.mkdir(parents=True, exist_ok=True)
+                for item in source_dir.iterdir():
+                    if item.name in ("config.local.json", "zv-credential.json"):
+                        continue
+                    dest = version_target / item.name
+                    try:
+                        if item.is_dir():
+                            if dest.exists():
+                                _shutil.rmtree(dest, ignore_errors=True)
+                            _shutil.copytree(item, dest)
+                        else:
+                            _shutil.copy2(item, dest)
+                    except PermissionError:
+                        _say(f"locked file skipped (running?): {item.name}")
+            except Exception as exc:
+                _say(f"copy program files failed: {exc}")
+                _migration_state("FAILED", f"copy program files failed: {exc}")
+                return 1
 
         # 2. updater 就位
         try:
@@ -410,12 +426,28 @@ def run_self_install(quiet: bool = False, server_url: str = "",
             return 1
         _layout.write_current_version(agent_version)
 
-        # 5. 服务处理：迁移场景旧服务可能正在运行 —— 先停、清残留、改 binPath、再启
+        # 5. 服务处理：迁移场景旧服务可能正在运行 —— 先停、等真正停止、清残留、改 binPath、再启
+        def _service_query_text() -> str:
+            try:
+                completed = _subprocess.run(
+                    ["sc", "query", service_name],
+                    capture_output=True, text=True,
+                    creationflags=creation_flags, timeout=20,
+                )
+                return completed.stdout or ""
+            except Exception:
+                return ""
+
         was_running = _run(["sc", "query", service_name]) == 0
         if was_running:
             _run(["net", "stop", service_name])
             self_pid = os.getpid()
             _run(["taskkill", "/F", "/IM", "Z-View.exe", "/FI", f"PID ne {self_pid}"])
+            # 等服务真正 STOPPED，避免 STOP_PENDING 期间 start 卡死
+            for _ in range(15):
+                if _run(["sc", "query", service_name]) != 0:
+                    break
+                time.sleep(2)
             time.sleep(2)
 
         bin_path = f'"{_layout.CURRENT_LINK / "Z-View.exe"}" --service-host'
@@ -443,9 +475,20 @@ def run_self_install(quiet: bool = False, server_url: str = "",
               "/v", "DelayedAutostart", "/t", "REG_DWORD", "/d", "1", "/f"])
 
         start_rc = _run(["sc", "start", service_name])
-        if start_rc not in (0, 1056):
+        if start_rc not in (0, 1056, 124):
             _say(f"sc start failed: rc={start_rc}")
             _migration_state("FAILED", f"service start failed rc={start_rc}")
+            return 1
+        # start 受理（或等待超时）后轮询确认 RUNNING，不依赖 sc start 的瞬时返回
+        service_running = False
+        for _ in range(45):
+            if "RUNNING" in _service_query_text():
+                service_running = True
+                break
+            time.sleep(2)
+        if not service_running:
+            _say("service did not reach RUNNING within 90s")
+            _migration_state("FAILED", "service start timeout")
             return 1
         _migration_state("COMMITTED")
         _say(f"Z-View Agent {agent_version} installed (onedir) and started.")
@@ -2208,6 +2251,54 @@ def cleanup_stale_mei_dirs(max_age_minutes: int = 30) -> int:
     return removed
 
 
+def run_stop_agent() -> int:
+    """托盘「退出代理」：完整停止 Agent（服务 + 会话进程），控制台随之离线。
+
+    由托盘经 UAC 提权拉起（需管理员）。服务保持停止状态，重启电脑或手动
+    `sc start CMDB-Agent` 恢复；心跳停止后管理台 90 秒内显示离线。
+    """
+    import subprocess as _subprocess
+    import time as _time
+
+    if os.name != "nt":
+        return 1
+    service_name = "CMDB-Agent"
+    creation_flags = getattr(_subprocess, "CREATE_NO_WINDOW", 0)
+
+    def _sc(*args: str, timeout: int = 30) -> int:
+        try:
+            return _subprocess.run(
+                ["sc", *args], capture_output=True, text=True,
+                creationflags=creation_flags, timeout=timeout,
+            ).returncode
+        except Exception as exc:
+            log_runtime_event("StopAgent", f"sc {' '.join(args)} failed: {exc}")
+            return -1
+
+    log_runtime_event("StopAgent", "stop requested via tray exit")
+    sc_rc = _sc("stop", service_name)
+    log_runtime_event("StopAgent", f"sc stop rc={sc_rc}")
+    if sc_rc == 5:
+        log_runtime_event("StopAgent", "access denied; run elevated")
+        return 1
+    if sc_rc in (0, 1056, 1062):
+        for _ in range(20):
+            if _sc("query", service_name) != 0:
+                break
+            _time.sleep(2)
+    # 清理会话残留（用户会话 agent / 特权助手 / 其他托盘），保留自身
+    self_pid = os.getpid()
+    try:
+        _subprocess.run(
+            ["taskkill", "/F", "/IM", "Z-View.exe", "/FI", f"PID ne {self_pid}"],
+            capture_output=True, creationflags=creation_flags, timeout=30,
+        )
+    except Exception as exc:
+        log_runtime_event("StopAgent", f"taskkill orphans failed: {exc}")
+    log_runtime_event("StopAgent", "agent stopped")
+    return 0
+
+
 def main(argv: list[str] | None = None):
     ensure_windows_dpi_awareness()
     try:
@@ -2227,6 +2318,9 @@ def main(argv: list[str] | None = None):
             run_self_install(quiet=args.quiet, server_url=args.server_url,
                              migrate_from=args.migrate_from, migrate_to=args.migrate_to)
         )
+
+    if args.stop_agent:
+        raise SystemExit(run_stop_agent())
 
     if args.restart_user_session_agent:
         raise SystemExit(

@@ -102,6 +102,7 @@ AUTH_EXEMPTIONS = (
     {"path": "/metrics", "methods": ["GET"]},  # P4-04：Prometheus 抓取端点（内网）
     {"path": "/api/v1/agent/heartbeat", "methods": ["POST"]},
     {"path": "/api/v1/agent/policies", "methods": ["GET"]},
+    {"path": "/api/v1/agent/exit/verify", "methods": ["POST"]},
     {"path": "/api/v1/agent/security-policies", "methods": ["GET"]},
     {"path": "/api/v1/agent/security-policy-result", "methods": ["POST"]},
     {"path": "/api/v1/agent/upgrade/download", "methods": ["GET"]},
@@ -162,6 +163,7 @@ from zvplatform.obs import format_log_line, get_request_id, new_request_id, requ
 from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus, set_gauge  # noqa: E402
 from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
+from zvplatform.routers.agent_exit_policy import router as agent_exit_policy_router  # 1.9.55：退出密码策略
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
@@ -4337,6 +4339,7 @@ app.include_router(discovery_platform_router)  # P1-01：终端发现路由
 app.include_router(groups_platform_router)  # P1-01：终端分组路由
 app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
+app.include_router(agent_exit_policy_router)  # 1.9.55：退出密码策略
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
@@ -4413,6 +4416,7 @@ mount_agent_upgrade_api(app)
 
 
 def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
+    import glob as _glob
     import os
 
     from agent_upgrade_api import UPGRADE_DIR, get_latest_upgrade
@@ -4422,8 +4426,16 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
     if not version:
         return None, None
     version_dir = os.path.join(UPGRADE_DIR, version)
-    # 优先找解压后的 exe，其次回退 onedir-zip（上传后未解压的包）
-    for name in ("Z-View.exe", "agent-onedir.zip"):
+    # 网页自助部署优先给图形化安装器（双击下一步式 setup exe）；
+    # 部署脚本/域推送仍走 zip（含 Z-View.exe + _internal）
+    setups = sorted(
+        _glob.glob(os.path.join(version_dir, "Z-View-Setup-*.exe")),
+        reverse=True,
+    )
+    if setups:
+        return version, setups[0]
+    # 部署流程需要完整 onedir 包（zip 含 Z-View.exe + _internal），zip 优先
+    for name in ("agent-onedir.zip", "Z-View.exe"):
         p = os.path.join(version_dir, name)
         if os.path.exists(p):
             return version, p
@@ -4432,11 +4444,13 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
 
 @app.get("/api/v1/console/agent-deploy/package")
 def download_agent_deploy_package(request: Request):
-    """网页自助部署：下载最新版 Agent 完整部署包（onedir zip，admin）。
+    """网页自助部署：下载最新版 Agent 完整部署包（优先图形化 setup exe，admin）。
 
     包含 Z-View.exe + _internal\（+ updater\），终端解压后运行
     `Z-View.exe --install --quiet --server-url <中心地址>` 完成安装。
     """
+    import os
+
     require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
     version, package_path = _resolve_latest_agent_package()
     if not package_path:
@@ -4444,11 +4458,12 @@ def download_agent_deploy_package(request: Request):
             status_code=404,
             detail="No agent package available; upload one via /api/v1/agent/upgrade/upload first",
         )
-    filename = f"Z-View-Agent-{version}.zip" if package_path.endswith(".zip") else f"Z-View-Setup-{version}.exe"
+    filename = os.path.basename(package_path)
     return FileResponse(
         package_path,
         media_type="application/octet-stream",
         filename=filename,
+        headers={"X-Agent-Package-Filename": filename},
     )
 
 

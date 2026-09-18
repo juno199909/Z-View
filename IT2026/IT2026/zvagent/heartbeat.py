@@ -30,6 +30,7 @@ from zvagent.auth import (
     _platform_base,
     _save_device_credentials,
     clear_device_credentials,
+    invalidate_tls_cache,
 )
 from zvagent.collectors.software import _software_payload_hash, collect_software_list
 from zvagent.collectors.system import collect_hardware_info, collect_system_status, get_primary_network_info
@@ -140,6 +141,10 @@ def get_asset_id_from_server() -> int | None:
                     return _AGENT_STATE["asset_id"]
             _log_agent_error(f"global token retry HTTP {resp.status_code}")
     except Exception as exc:
+        exc_str = str(exc).lower()
+        if "ssl" in exc_str or "certificate" in exc_str or "tlsv" in exc_str:
+            print("[Agent] SSL error during registration; invalidating TLS cache")
+            invalidate_tls_cache()
         detail = f"register exception {type(exc).__name__}: {exc}"
         print(f"[Agent] 获取 asset_id 失败: {exc}")
         _log_agent_error(detail + "\n" + traceback.format_exc()[-800:])
@@ -342,6 +347,10 @@ def _heartbeat_loop():
                 print(f"[Heartbeat] HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as exc:
             consecutive_failures += 1
+            exc_str = str(exc).lower()
+            if "ssl" in exc_str or "certificate" in exc_str or "tlsv" in exc_str:
+                print("[Heartbeat] SSL error detected; invalidating TLS cache")
+                invalidate_tls_cache()
             print(f"[Heartbeat] 错误: {exc}")
 
         # P0-06：连续失败自愈（10 次 ≈ 5 分钟）—— 退出由服务重启 worker

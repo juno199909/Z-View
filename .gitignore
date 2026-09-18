@@ -1,78 +1,74 @@
-# 中文注释：Python 运行缓存会占用 C 盘，也会污染发布差异。
+# ============================================================
+# Z-View .gitignore
+# ============================================================
+
+# --- Python runtime caches and bytecode
 __pycache__/
 *.py[cod]
 *$py.class
+.ruff_cache/
+.pytest_cache/
 
-# 中文注释：前端依赖和构建产物应由 package-lock 与构建命令生成，不应手工维护。
+# --- Node / frontend build artifacts
 node_modules/
 dist/
 .vite/
 
-# 中文注释：日志、临时目录和本地工具状态不属于可交付源码。
+# --- Logs and temporary files
 *.log
 *.err.log
 *.tmp
 *.temp
+findings.md
+
+# --- IDE / tool state
 .trae/
 .claude/
+.agents/
+.kilo/
+.playwright-mcp/
+kilo_tmp/
 
-# 中文注释：本项目构建输出统一放到 D:\IT2026-temp 或 GPO 部署包内受控产物。
+# --- Build artifacts and local tool output
 build/
 *.spec.bak
-
-# Runtime secrets and local machine configuration
-IT2026/IT2026/.env
-IT2026/IT2026/.env.local
-IT2026/IT2026/config.json
-IT2026/IT2026/config.local.json
-IT2026/IT2026/auth_secret.txt
-IT2026/IT2026/auth_state.json
-IT2026/IT2026/agent_secret.txt
-
-# Generated frontend artifacts under the current source tree
-IT2026/IT2026/frontend/node_modules/
-IT2026/IT2026/frontend/dist/
-
-# Python runtime caches and logs under the current source tree
-IT2026/IT2026/**/__pycache__/
-IT2026/IT2026/**/*.py[cod]
-IT2026/IT2026/**/*.log
-IT2026/IT2026/**/*.err.log
-
-# P0-1 整改：运行时密钥与部署配置不入库（原规则路径多一层未匹配）
-IT2026/.env
-IT2026/.env.local
-IT2026/config.json
-IT2026/config.local.json
-IT2026/IT2026/.env
-IT2026/IT2026/config.json
-IT2026/GPO部署包/config.json
-*.secret
-IT2026/IT2026/agent_upgrade/
-
-# Code signing private key (P0-05) - never commit
-IT2026/IT2026/IT2026/signing/
-
-
-# Agent 构建产物与发布包（V1.6.0 onedir 流程，二进制不入库）
-IT2026/dist_agent/
-IT2026/dist_agent_onefile/
-IT2026/dist_updater/
-IT2026/build_agent_work/
-IT2026/build_updater_work/
-IT2026/releases/
-IT2026/agent_upgrade/
-
-# 本地临时测试/运维脚本（含敏感 token，不入库）
-IT2026/kilo_tmp/
-kilo_tmp/
 dist_agent/
 dist_agent_onefile/
 dist_updater/
+dist_setup/
 build_agent_work/
 build_updater_work/
+build_setup_work/
+build_setup_meta.json
 releases/
 agent_upgrade/
 
-# 服务管理器部署产物（不入库）
+# --- Secrets, private keys, and local machine config
+# Never commit any private key material
+*-key.pem
+*.key
+*.p12
+*.pfx
+*.secret
+
+# Runtime-generated cert directories (re-generated on demand)
+IT2026/IT2026/frontend/certs/
+IT2026/IT2026/wt_certs/
+
+# Per-machine environment and config
+.env
+.env.local
+config.json
+config.local.json
+auth_secret.txt
+auth_state.json
+agent_secret.txt
+
+# Code signing private key (never commit)
+IT2026/IT2026/IT2026/signing/
+
+# GPO deployment package runtime config
+IT2026/GPO部署包/config.json
+
+# --- Service manager binary (build artifact)
 ZViewServiceManager.exe

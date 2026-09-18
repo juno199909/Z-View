@@ -18,9 +18,19 @@ from mysql.connector import Error
 from agent_upgrade_api import get_latest_upgrade, record_agent_version
 from auth_utils import normalize_actor_name, require_agent_request
 from console_utils import safe_console_print
-from zvplatform.db import format_datetime
+from auth_utils import TOKEN_SECRET
+from zvplatform.db import create_connection, format_datetime
 from zvplatform.models import SystemActivityLogCreate
 from zvplatform.repositories.log_repository import insert_system_activity_log
+from zvplatform.repositories.asset_repository import (
+    fetch_asset_row,
+    record_asset_changes,
+)
+from zvplatform.repositories.agent_credential_repository import (
+    agent_version_tuple as _agent_version_tuple,
+    ensure_agent_credentials_table,
+    issue_agent_device_credential as _issue_agent_device_credential,
+)
 from zvplatform.constants import (
     AGENT_INSTALL_STATUS_INSTALLED,
     AGENT_INSTALL_STATUS_NOT_INSTALLED,
@@ -44,16 +54,7 @@ def agent_heartbeat(data: dict, request: Request):
     authenticated_agent_id = agent_auth.get("agent_id")
 
     # 设备凭据绑定校验：zv1 凭据只能上报自己的资产
-    import assets_api  # noqa: F401  (__file__ 锚定)
-    from assets_api import (
-        _agent_version_tuple,
-        _issue_agent_device_credential,
-        ensure_agent_credentials_table,
-        fetch_asset_row,
-        get_db_connection,
-        record_asset_changes,
-    )
-    conn = get_db_connection()
+    conn = create_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
@@ -690,7 +691,7 @@ def agent_heartbeat(data: dict, request: Request):
             try:
                 # 1.6.0+ Agent 具备凭据保存能力：active 行存在也轮换重发（灰度断点修复）
                 allow_rotate = _agent_version_tuple(data.get("agent_version")) >= (1, 6, 0)
-                heartbeat_credential = _issue_agent_device_credential(asset_id, cursor, allow_rotate=allow_rotate)
+                heartbeat_credential = _issue_agent_device_credential(cursor, asset_id, TOKEN_SECRET, allow_rotate=allow_rotate)
                 conn.commit()
             except Error as cred_err:
                 conn.rollback()

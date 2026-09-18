@@ -70,6 +70,130 @@ IDM_TOGGLE_UAC_INPUT = 2007
 IDM_ABOUT = 2005
 IDM_EXIT = 2006
 
+MB_ICONWARNING = 0x00000030
+
+
+def _launch_agent_stop_via_uac() -> bool:
+    """托盘退出代理：UAC 提权拉起 --stop-agent，完整停止服务与会话进程。
+
+    返回 True 表示提权启动成功（随后托盘自身退出）；False 表示用户取消
+    UAC 或拉起失败，托盘保持驻留。
+    """
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+    else:
+        candidate = Path(sys.executable).with_name("Z-View.exe")
+        if not candidate.exists():
+            return False
+        exe = str(candidate)
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, "--stop-agent", None, 0)
+    return int(rc) > 32
+
+
+def _post_exit_verify(password: str) -> dict:
+    """调用服务端退出密码校验接口；网络/服务异常抛 RuntimeError。"""
+    config = load_agent_config()
+    server_url = str(config.get("server_url") or "").rstrip("/")
+    if not server_url:
+        raise RuntimeError("未配置管理中心地址，无法验证退出密码。")
+    headers = {}
+    token = str(config.get("token") or "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    import requests as _requests
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+    try:
+        resp = _requests.post(
+            f"{server_url}/api/v1/agent/exit/verify",
+            json={"password": password}, headers=headers,
+            timeout=8, verify=False,
+        )
+    except Exception as exc:
+        raise RuntimeError("无法连接管理中心，无法验证退出密码。") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(f"管理中心校验失败（HTTP {resp.status_code}）。")
+    return resp.json() or {}
+
+
+def _prompt_exit_password():
+    """Tk 密码输入框（独立线程）；返回密码字符串，取消/关闭返回 None。"""
+    import tkinter as tk
+    from tkinter import ttk
+    result: dict = {"password": None}
+
+    def _run_dialog():
+        root = tk.Tk()
+        root.title("退出代理")
+        width, height = 380, 190
+        root.geometry(f"{width}x{height}+"
+                      f"{(root.winfo_screenwidth() - width) // 2}+"
+                      f"{(root.winfo_screenheight() - height) // 2}")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+        root.configure(bg="#f4f6fa")
+        header = tk.Frame(root, bg="#1f3b57")
+        header.pack(fill="x")
+        tk.Label(header, text="退出代理", font=("Microsoft YaHei UI", 12, "bold"),
+                 fg="white", bg="#1f3b57").pack(anchor="w", padx=18, pady=(12, 10))
+        body = tk.Frame(root, bg="#f4f6fa")
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="请输入管理台设置的退出密码：",
+                 bg="#f4f6fa").pack(anchor="w", padx=20, pady=(14, 4))
+        entry = ttk.Entry(body, show="●", width=26)
+        entry.pack(padx=20, pady=(0, 12))
+
+        def _confirm(event=None):
+            result["password"] = entry.get().strip()
+            root.destroy()
+
+        def _cancel(event=None):
+            root.destroy()
+
+        btns = tk.Frame(body, bg="#f4f6fa")
+        btns.pack(anchor="e", padx=20, pady=(0, 12))
+        ttk.Button(btns, text="确定", width=9, command=_confirm).pack(side="left", padx=4)
+        ttk.Button(btns, text="取消", width=9, command=_cancel).pack(side="left")
+        root.bind("<Return>", _confirm)
+        root.bind("<Escape>", _cancel)
+        root.protocol("WM_DELETE_WINDOW", _cancel)
+        entry.focus_set()
+        root.mainloop()
+
+    worker = threading.Thread(target=_run_dialog, daemon=True)
+    worker.start()
+    worker.join(timeout=300)
+    return result.get("password")
+
+
+def _exit_password_flow() -> tuple:
+    """托盘退出的密码校验流程；返回 (allowed, message)。
+
+    未设密码直接放行（保持旧行为）；需要密码时弹输入框二次校验；
+    网络不通/校验失败一律拒绝（fail-closed）。
+    """
+    try:
+        data = _post_exit_verify("")
+    except RuntimeError as exc:
+        return False, str(exc)
+    if not data.get("required"):
+        return True, ""
+    password = _prompt_exit_password()
+    if password is None:
+        return False, "已取消退出代理。"
+    try:
+        data = _post_exit_verify(password)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if data.get("valid"):
+        return True, ""
+    if data.get("server_error"):
+        return False, "管理中心暂不可用，无法验证退出密码。"
+    return False, "退出密码错误。"
+
 
 class TASKDIALOG_BUTTON(ctypes.Structure):
     _fields_ = [
@@ -577,13 +701,35 @@ def _build_fallback_module():
                 elif chosen == IDM_EXIT:
                     quit_confirm = user32.MessageBoxW(
                         None,
-                        "退出后管理台将无法对本机发起远程控制，直到代理重新启动。\n\n确定退出 Z-View 代理？",
+                        "退出后本机将停止心跳并在管理台显示离线，远程控制不可用，"
+                        "直到代理重新启动（重启电脑或手动启动服务）。\n"
+                        "如管理台已启用退出密码，接下来需要输入密码验证。\n\n确定退出 Z-View 代理？",
                         "退出确认",
                         MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL,
                     )
                     if quit_confirm == IDYES:
                         _append_consent_runtime_log("tray exit requested by operator")
-                        user32.DestroyWindow(hwnd)
+                        allowed, message = _exit_password_flow()
+                        _append_consent_runtime_log(
+                            f"tray exit verify: allowed={allowed} message={message!r}"
+                        )
+                        if allowed:
+                            if _launch_agent_stop_via_uac():
+                                user32.DestroyWindow(hwnd)
+                            else:
+                                user32.MessageBoxW(
+                                    None,
+                                    "未取得管理员授权，代理未退出。",
+                                    "退出代理",
+                                    MB_TOPMOST | MB_SETFOREGROUND | MB_ICONWARNING,
+                                )
+                        elif message:
+                            user32.MessageBoxW(
+                                None,
+                                message,
+                                "退出代理",
+                                MB_TOPMOST | MB_SETFOREGROUND | MB_ICONWARNING,
+                            )
 
             def window_proc(hwnd, message, wparam, lparam):
                 if message == WM_APP + 1:

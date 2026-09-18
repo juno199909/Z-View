@@ -147,7 +147,16 @@ def _agent_requests_verify():
 
 
 def _platform_base() -> str:
-    """平台基地址：TLS 自动协商。"""
+    """Platform base URL with TLS auto-negotiation.
+
+    Upgrade policy:
+    - Config is HTTP -> probe 8443 HTTPS
+    - Probe OK + cert verify passes -> upgrade to HTTPS, cache 24h (positive)
+    - Probe fails -> stay on HTTP
+      * SSL/cert mismatch with ca-bundle: cache 1h (no point retrying often)
+      * Connect failure: cache 10min (may be transient)
+    - Call invalidate_tls_cache() to force re-probe on SSL errors.
+    """
     base = str(CONFIG.get("server_url") or "").rstrip("/")
     if not base.startswith("http://"):
         return base
@@ -161,29 +170,62 @@ def _platform_base() -> str:
     except Exception:
         cached = {}
     now = time.time()
+
+    # Positive cache: TLS working, reuse for 24h
     if cached.get("tls_ok") and now - float(cached.get("ts", 0)) < 86400:
         return tls_base
-    if cached.get("ts") and not cached.get("tls_ok") and now - float(cached.get("ts", 0)) < 600:
-        return base
+
+    # Negative cache: TLS failed recently, respect fail_ttl
+    fail_ttl = float(cached.get("fail_ttl", 0) or 0)
+    if cached.get("ts") and not cached.get("tls_ok") and fail_ttl > 0:
+        if now - float(cached.get("ts", 0)) < fail_ttl:
+            return base
 
     verify = _agent_requests_verify()
     if not verify:
-        print("[TLS] 警告：ca-bundle 未分发，TLS 探测将以不校验模式进行")
+        print("[TLS] warning: no ca-bundle; probe will skip cert verification")
+
+    ssl_error = False
     try:
         requests.get(urljoin(tls_base, "/"), headers=_agent_headers(), timeout=5, verify=verify)
         ok = True
-    except Exception:
+    except Exception as exc:
         ok = False
+        exc_str = str(exc).lower()
+        ssl_error = "ssl" in exc_str or "certificate" in exc_str or "tlsv" in exc_str
+
+    # 1h backoff for SSL/cert mismatch (ca-bundle is wrong), 10min for connect issues
+    fail_ttl = 3600 if (ssl_error and verify) else 600
     try:
         _AGENT_TLS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _AGENT_TLS_CACHE_PATH.write_text(json.dumps({"tls_ok": ok, "ts": now}), encoding="utf-8")
+        _AGENT_TLS_CACHE_PATH.write_text(
+            json.dumps({"tls_ok": ok, "ts": now, "fail_ttl": fail_ttl}, ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception:
         pass
+
     if ok:
-        print(f"[TLS] 平台 TLS 通道已启用: {tls_base} (verify={'ca-bundle' if verify else 'OFF'})")
+        print(f"[TLS] platform TLS channel up: {tls_base} (verify={'ca-bundle' if verify else 'OFF'})")
         return tls_base
-    print("[TLS] 平台 TLS 探测失败，继续使用 http")
+
+    reason = "SSL cert mismatch" if ssl_error else "connect failed"
+    print(f"[TLS] probe failed ({reason}), staying on HTTP (retry in {fail_ttl:.0f}s)")
     return base
+
+
+def invalidate_tls_cache() -> None:
+    """Force TLS cache expiry so next request re-probes.
+
+    Call when a heartbeat request hits an SSL error, so the agent
+    does not stay pinned to a broken HTTPS endpoint for the full
+    24h positive-cache window.
+    """
+    try:
+        if _AGENT_TLS_CACHE_PATH.exists():
+            _AGENT_TLS_CACHE_PATH.unlink()
+    except Exception:
+        pass
 
 
 def _software_headers() -> dict:

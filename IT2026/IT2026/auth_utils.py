@@ -158,6 +158,9 @@ def resolve_required_permission(path: str, method: str) -> str:
         return "auth:manage"
     if normalized_path.startswith("/api/v1/console/agent-credentials"):
         return "policies:write"
+    if normalized_path.startswith("/api/v1/console/agent-exit-policy"):
+        # Agent 退出密码策略：读 policies:read，写 policies:write
+        return "policies:read" if normalized_method not in WRITE_METHODS else "policies:write"
     if normalized_path.startswith("/api/v1/auth/"):
         return "auth:self"
     if normalized_path.startswith("/api/v1/assets/") and normalized_path.endswith("/remote-control"):
