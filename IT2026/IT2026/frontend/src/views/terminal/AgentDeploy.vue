@@ -141,7 +141,7 @@ const downloadPackage = async () => {
   downloading.value = true
   try {
     const blob = await request.get('/console/agent-deploy/package', { responseType: 'blob' })
-    triggerDownload(blob, `Z-View-Setup-${dayjs().format('YYYYMMDD')}.exe`)
+    triggerDownload(blob, `Z-View-Agent-${dayjs().format('YYYYMMDD')}.zip`)
     ElMessage.success('安装包已开始下载')
   } catch (e) {
   } finally {

@@ -4422,8 +4422,8 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
     if not version:
         return None, None
     version_dir = os.path.join(UPGRADE_DIR, version)
-    # 优先找解压后的 exe，其次回退 onedir-zip（上传后未解压的包）
-    for name in ("Z-View.exe", "agent-onedir.zip"):
+    # 部署流程需要完整 onedir 包（zip 含 Z-View.exe + _internal），zip 优先
+    for name in ("agent-onedir.zip", "Z-View.exe"):
         p = os.path.join(version_dir, name)
         if os.path.exists(p):
             return version, p
