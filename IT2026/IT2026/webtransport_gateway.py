@@ -132,7 +132,7 @@ class AgentBridge:
                     stream_id = self.data_stream_id
                     if stream_id is None:
                         # 数据流未打开：缓冲（控制帧全留，视频帧留最近2帧），打开时按序冲刷
-                        self._bridge._buffer_agent_frame(_ftype, payload)
+                        self._buffer_agent_frame(_ftype, payload)
                         continue
                     forwarded += 1
                     if forwarded <= 5:
