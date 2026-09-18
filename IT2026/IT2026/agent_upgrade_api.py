@@ -27,6 +27,46 @@ from config_utils import get_db_config
 
 router = APIRouter(prefix="/api/v1/agent/upgrade", tags=["agent-upgrade"])
 
+# P1 升级器专项：熔断器管理 API（升级失败 3 次熔断 30min，管理端可查询/解除）
+# 熔断器本体在 zvplatform/routers/agent_heartbeat.py（函数级延迟导入防循环）
+
+
+@router.get("/breakers")
+def list_upgrade_breakers():
+    """升级熔断器状态列表（管理端排障/处置用，admin 权限）。"""
+    from zvplatform.routers.agent_heartbeat import _UPGRADE_FAILURE_BREAKER
+
+    import time as _time
+
+    now = _time.time()
+    breakers = []
+    for asset_id, b in sorted(_UPGRADE_FAILURE_BREAKER.items()):
+        until = float(b.get("until") or 0)
+        breakers.append({
+            "asset_id": asset_id,
+            "to_version": b.get("to_version"),
+            "count": b.get("count"),
+            "open": bool(until and now < until),
+            "cooldown_until": until,
+        })
+    return {"breakers": breakers}
+
+
+@router.delete("/breakers/{asset_id}")
+def clear_upgrade_breaker(asset_id: int):
+    """解除指定资产的升级熔断（管理端处置用，admin 权限）。"""
+    from zvplatform.routers.agent_heartbeat import _UPGRADE_FAILURE_BREAKER
+
+    removed = _UPGRADE_FAILURE_BREAKER.pop(asset_id, None)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="breaker not found")
+    safe_console_print(
+        f"[Upgrade] breaker cleared for asset {asset_id} "
+        f"(was {removed.get('to_version')}, count {removed.get('count')})"
+    )
+    return {"message": "breaker cleared", "asset_id": asset_id}
+
+
 # 升级包存储目录（代码根下，gitignore 防入库）
 UPGRADE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_upgrade")
 MANIFEST_PATH = os.path.join(UPGRADE_DIR, "manifest.json")

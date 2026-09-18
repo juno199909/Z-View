@@ -136,6 +136,10 @@ if (-not (Test-Path -LiteralPath $UpdaterSource -PathType Leaf)) {
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $ReleasePackageDir "updater") | Out-Null
 Copy-Item -LiteralPath $UpdaterSource -Destination (Join-Path $ReleasePackageDir "updater\ZViewUpdater.exe") -Force
+# P0 修复：updater 同步进 onedir 输出（升级 zip 载荷）——升级后 versions\<ver>\updater\
+# 随版本目录保留，后续升级由新版 updater 执行（旧版无 401 重试/kill_stale）
+New-Item -ItemType Directory -Force -Path (Join-Path $DistDir "Z-View\updater") | Out-Null
+Copy-Item -LiteralPath $UpdaterSource -Destination (Join-Path $DistDir "Z-View\updater\ZViewUpdater.exe") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $DistDir "config.json") -Force
 Copy-Item -LiteralPath $RuntimeConfigPath -Destination (Join-Path $ReleasePackageDir "config.json") -Force
 # P1-UDP 远程桌面：WebTransport 根 CA 随包分发（deploy.bat 导入受信任根存储）
