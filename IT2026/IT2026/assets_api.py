@@ -4426,6 +4426,7 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
     if not version:
         return None, None
     version_dir = os.path.join(UPGRADE_DIR, version)
+<<<<<<< HEAD
     # 网页自助部署优先给图形化安装器（双击下一步式 setup exe）；
     # 部署脚本/域推送仍走 zip（含 Z-View.exe + _internal）
     setups = sorted(
@@ -4434,6 +4435,8 @@ def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
     )
     if setups:
         return version, setups[0]
+=======
+>>>>>>> 5008f5d2d3812fb8acdbedcc26f6d151bad8f58b
     # 部署流程需要完整 onedir 包（zip 含 Z-View.exe + _internal），zip 优先
     for name in ("agent-onedir.zip", "Z-View.exe"):
         p = os.path.join(version_dir, name)
