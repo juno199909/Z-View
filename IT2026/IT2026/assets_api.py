@@ -164,6 +164,7 @@ from zvplatform.metrics import inc_counter, observe_histogram, render_prometheus
 from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
 from zvplatform.routers.agent_exit_policy import router as agent_exit_policy_router  # 1.9.55：退出密码策略
+from zvplatform.routers.agent_deploy import router as agent_deploy_router  # 1.9.55：终端部署三件套（#16 迁入）
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
@@ -4340,6 +4341,7 @@ app.include_router(groups_platform_router)  # P1-01：终端分组路由
 app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
 app.include_router(agent_exit_policy_router)  # 1.9.55：退出密码策略
+app.include_router(agent_deploy_router)  # 1.9.55：终端部署三件套（#16 迁入）
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
@@ -4409,118 +4411,8 @@ mount_agent_upgrade_api(app)
 # 设备凭据管理台（admin/policies:write）
 # ============================================================
 # ============================================================
-# 终端部署三件套（P1-04，参照火绒企业版）：
-# 1) 网页自助下载安装包  2) 一键部署脚本（域开机脚本/三方桌管静默推送）
-# Agent 侧配套：Z-View.exe --install --quiet --server-url <center>
+# 终端部署三件套（P1-04）：已迁至 zvplatform/routers/agent_deploy.py（#16 模块化）
 # ============================================================
-
-
-def _resolve_latest_agent_package() -> tuple[Optional[str], Optional[str]]:
-    import glob as _glob
-    import os
-
-    from agent_upgrade_api import UPGRADE_DIR, get_latest_upgrade
-
-    latest = get_latest_upgrade()
-    version = str(latest.get("version") or "")
-    if not version:
-        return None, None
-    version_dir = os.path.join(UPGRADE_DIR, version)
-    # 网页自助部署优先给图形化安装器（双击下一步式 setup exe）；
-    # 部署脚本/域推送仍走 zip（含 Z-View.exe + _internal）
-    setups = sorted(
-        _glob.glob(os.path.join(version_dir, "Z-View-Setup-*.exe")),
-        reverse=True,
-    )
-    if setups:
-        return version, setups[0]
-    # 部署流程需要完整 onedir 包（zip 含 Z-View.exe + _internal），zip 优先
-    for name in ("agent-onedir.zip", "Z-View.exe"):
-        p = os.path.join(version_dir, name)
-        if os.path.exists(p):
-            return version, p
-    return None, None
-
-
-@app.get("/api/v1/console/agent-deploy/package")
-def download_agent_deploy_package(request: Request):
-    """网页自助部署：下载最新版 Agent 完整部署包（优先图形化 setup exe，admin）。
-
-    包含 Z-View.exe + _internal\（+ updater\），终端解压后运行
-    `Z-View.exe --install --quiet --server-url <中心地址>` 完成安装。
-    """
-    import os
-
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    version, package_path = _resolve_latest_agent_package()
-    if not package_path:
-        raise HTTPException(
-            status_code=404,
-            detail="No agent package available; upload one via /api/v1/agent/upgrade/upload first",
-        )
-    filename = os.path.basename(package_path)
-    return FileResponse(
-        package_path,
-        media_type="application/octet-stream",
-        filename=filename,
-        headers={"X-Agent-Package-Filename": filename},
-    )
-
-
-def _build_agent_deploy_ps_script(center_url: str, deploy_token: str) -> str:
-    return f"""# Z-View Agent 一键部署脚本（需管理员权限运行）
-# 生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}   中心: {center_url}
-# 用途: 网页自助部署 / 域开机脚本 / 三方桌管静默推送（火绒企业版同款三件套）
-# 注意: 脚本内嵌 Agent Token，仅限内部分发，勿公开传播
-$ErrorActionPreference = 'Stop'
-$Center = '{center_url}'
-$Token  = '{deploy_token}'
-$WorkDir = Join-Path $env:TEMP 'zview-agent-deploy'
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-
-Write-Host '[1/3] downloading agent package (onedir zip)...'
-Invoke-WebRequest -UseBasicParsing `
-    -Uri "$Center/api/v1/agent/upgrade/download?agent_token=$Token" `
-    -OutFile (Join-Path $WorkDir 'agent-onedir.zip')
-
-Write-Host '[2/3] extracting...'
-Expand-Archive -Force -Path (Join-Path $WorkDir 'agent-onedir.zip') -DestinationPath $WorkDir
-
-Write-Host '[3/3] installing service...'
-& (Join-Path $WorkDir 'Z-View.exe') --install --quiet --server-url $Center
-if ($LASTEXITCODE -eq 0) {{
-    Write-Host 'Z-View Agent deployed successfully.'
-}} else {{
-    Write-Host "deploy failed: exit=$LASTEXITCODE" -ForegroundColor Red
-    exit 1
-}}
-"""
-
-
-@app.get("/api/v1/console/agent-deploy/script")
-def get_agent_deploy_script(
-    request: Request,
-    center: Optional[str] = Query(default=None, description="覆盖中心地址（终端访问用的 IP/域名），默认取当前访问地址"),
-):
-    """生成终端一键部署脚本（内嵌中心地址与下载 Token，admin 专用，勿外发）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    if center:
-        base_url = center.rstrip("/")
-    else:
-        host = request.headers.get("host") or request.url.netloc
-        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-        base_url = f"{scheme}://{host}"
-    from auth_utils import get_expected_agent_token
-
-    token = get_expected_agent_token()
-    if not token:
-        raise HTTPException(status_code=500, detail="agent token not configured on server")
-    content = _build_agent_deploy_ps_script(base_url, token)
-    return Response(
-        content=content,
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=deploy-zview-agent.ps1"},
-    )
 
 
 # ============================================================
