@@ -65,7 +65,7 @@ auth_state.json
 agent_secret.txt
 
 # Code signing private key (never commit)
-IT2026/IT2026/IT2026/signing/
+IT2026/IT2026/signing/
 
 # GPO deployment package runtime config
 IT2026/GPO部署包/config.json
