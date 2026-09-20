@@ -91,23 +91,40 @@ if (-not (Test-Path $ExePath)) {
 # 中文注释：Authenticode 代码签名（P0-05）。企业自建代码签名证书，
 # 需配合 GPO 把证书分发到终端的 Root + TrustedPublisher 存储。
 # 证书缺失时告警但不阻断构建（开发环境允许未签名）。
-$SignCertThumbprint = [Environment]::GetEnvironmentVariable("ZVIEW_CODESIGN_THUMBPRINT")
-if ([string]::IsNullOrWhiteSpace($SignCertThumbprint)) {
-    $SignCertThumbprint = "93C05132E7AD481010C68B37BAF25A1DA71CEADD"
+$ConfiguredThumbprint = [Environment]::GetEnvironmentVariable("ZVIEW_CODESIGN_THUMBPRINT")
+$SignCert = $null
+if (-not [string]::IsNullOrWhiteSpace($ConfiguredThumbprint)) {
+    # Explicit thumbprints remain supported for controlled release environments.
+    $SignCert = @(
+        Get-ChildItem "Cert:\CurrentUser\My\$ConfiguredThumbprint" -ErrorAction SilentlyContinue
+        Get-ChildItem "Cert:\LocalMachine\My\$ConfiguredThumbprint" -ErrorAction SilentlyContinue
+    ) | Where-Object { $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date) } | Select-Object -First 1
+} else {
+    # Pick the newest usable Z-View certificate, so rotations do not require a
+    # source change or a stale thumbprint in the build script.
+    $SignCert = @(
+        Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue
+        Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue
+    ) |
+        Where-Object {
+            $_.Subject -match 'Z-View' -and
+            $_.HasPrivateKey -and
+            $_.NotAfter -gt (Get-Date)
+        } |
+        Sort-Object NotAfter -Descending |
+        Select-Object -First 1
 }
-$SignCert = Get-ChildItem "Cert:\CurrentUser\My\$SignCertThumbprint" -ErrorAction SilentlyContinue
-if (-not $SignCert) {
-    $SignCert = Get-ChildItem "Cert:\LocalMachine\My\$SignCertThumbprint" -ErrorAction SilentlyContinue
-}
+$SignCertThumbprint = if ($SignCert) { $SignCert.Thumbprint } else { $ConfiguredThumbprint }
 if ($SignCert) {
     Write-Host "==> Authenticode signing (P0-05)"
     $Signature = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $SignCert -HashAlgorithm SHA256
     if ($Signature.Status -ne "Valid") {
         throw "Authenticode signing failed: $($Signature.Status) $($Signature.StatusMessage)"
     }
-    Write-Host ("    Signed by: {0}" -f $Signature.SignerCertificate.Subject)
+    Write-Host ("    Signed by: {0} (expires {1:yyyy-MM-dd})" -f $Signature.SignerCertificate.Subject, $SignCert.NotAfter)
 } else {
-    Write-Host "==> WARNING: code signing certificate not found (thumbprint $SignCertThumbprint); exe left UNSIGNED"
+    $displayThumbprint = if ($ConfiguredThumbprint) { $ConfiguredThumbprint } else { "auto-selection" }
+    Write-Host "==> WARNING: code signing certificate not found ($displayThumbprint); exe left UNSIGNED"
 }
 if (-not (Test-Path $VerifyScript)) {
     throw "Release verification script not found: $VerifyScript"
