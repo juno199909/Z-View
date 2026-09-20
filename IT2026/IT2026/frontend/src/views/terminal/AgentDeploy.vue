@@ -199,7 +199,6 @@ const triggerDownload = (blob, filename) => {
 const downloadPackage = async () => {
   downloading.value = true
   try {
-<<<<<<< HEAD
     // setup exe ~100MB：全局 30s 超时会掐断大包下载，这里显式不限时；
     // 共享拦截器只回 data、拿不到响应头，故用裸 axios 读取服务端文件名
     const resp = await axios.get('/api/v1/console/agent-deploy/package', {
@@ -210,10 +209,6 @@ const downloadPackage = async () => {
     const filename = resp.headers?.['x-agent-package-filename']
       || `Z-View-Setup-${dayjs().format('YYYYMMDD')}.exe`
     triggerDownload(resp.data, filename)
-=======
-    const blob = await request.get('/console/agent-deploy/package', { responseType: 'blob' })
-    triggerDownload(blob, `Z-View-Agent-${dayjs().format('YYYYMMDD')}.zip`)
->>>>>>> 5008f5d2d3812fb8acdbedcc26f6d151bad8f58b
     ElMessage.success('安装包已开始下载')
   } catch (e) {
     const msg = e?.response?.status === 404
