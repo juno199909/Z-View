@@ -167,6 +167,7 @@ from zvplatform.routers.agent_exit_policy import router as agent_exit_policy_rou
 from zvplatform.routers.agent_deploy import router as agent_deploy_router  # 1.9.55：终端部署三件套（#16 迁入）
 from zvplatform.routers.alert_settings import router as alert_settings_router  # 1.9.55：告警通知/阈值配置（#16 迁入）
 from zvplatform.routers.agent_credentials import router as agent_credentials_router  # 1.9.55：设备凭据管理（#16 迁入）
+from zvplatform.routers.patch_management import router as patch_management_router  # 1.9.55：补丁管理（#16 迁入）
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
@@ -4346,6 +4347,7 @@ app.include_router(agent_exit_policy_router)  # 1.9.55：退出密码策略
 app.include_router(agent_deploy_router)  # 1.9.55：终端部署三件套（#16 迁入）
 app.include_router(alert_settings_router)  # 1.9.55：告警通知/阈值配置（#16 迁入）
 app.include_router(agent_credentials_router)  # 1.9.55：设备凭据管理（#16 迁入）
+app.include_router(patch_management_router)  # 1.9.55：补丁管理（#16 迁入）
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
@@ -4424,46 +4426,7 @@ mount_agent_upgrade_api(app)
 # ============================================================
 
 
-@app.get("/api/v1/console/patch-status")
-def list_patch_status_api(request: Request, asset_id: Optional[int] = None):
-    """补丁状态列表（admin）：各终端 WU 待安装补丁（Patch Management Phase 1）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    cursor = conn.cursor(dictionary=True)
-    try:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS agent_patches (
-                asset_id INT PRIMARY KEY,
-                pending_count INT NOT NULL DEFAULT 0,
-                reboot_required TINYINT(1) NOT NULL DEFAULT 0,
-                last_scan DATETIME NULL,
-                patches JSON NULL,
-                error VARCHAR(500) NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        if asset_id:
-            cursor.execute(
-                "SELECT p.*, a.hostname, a.ip_address FROM agent_patches p "
-                "JOIN assets a ON a.id = p.asset_id WHERE p.asset_id = %s",
-                (asset_id,),
-            )
-        else:
-            cursor.execute(
-                "SELECT p.*, a.hostname, a.ip_address FROM agent_patches p "
-                "JOIN assets a ON a.id = p.asset_id ORDER BY p.pending_count DESC"
-            )
-        rows = cursor.fetchall() or []
-        total_pending = sum(int(r.get("pending_count") or 0) for r in rows)
-        reboot_count = sum(1 for r in rows if r.get("reboot_required"))
-        return {"terminals": rows, "total": len(rows),
-                "total_pending": total_pending, "reboot_required_count": reboot_count}
-    finally:
-        cursor.close()
-        conn.close()
+# 补丁管理端点：已迁至 zvplatform/routers/patch_management.py（#16 模块化）
 
 
 # 设备凭据管理端点：已迁至 zvplatform/routers/agent_credentials.py（#16 模块化）
