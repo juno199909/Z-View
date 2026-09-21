@@ -4208,7 +4208,7 @@ def start_background_workers():
             ensure_assets_agent_schema(conn)
             ensure_asset_changes_table(conn)
             try:
-                from security_api import ensure_security_tables
+                from zvplatform.routers.security import ensure_security_tables
                 ensure_security_tables(conn)
             except Exception as exc:
                 safe_console_print(f"[Startup] security tables ensure warn: {exc}")
@@ -4322,12 +4322,10 @@ set_agent_device_credential_verifier(verify_agent_device_credential)
 # zvplatform/routers/agent_security_policies.py（#16 模块化）
 # ============================================================
 
-from security_api import (
-    mount_security_api,
-)
+from zvplatform.routers.security import router as security_router  # 1.9.55：终端安全管理（#16 迁入）
 
 # 挂载 security router（/api/v1/security/* 走用户认证中间件）
-mount_security_api(app)
+app.include_router(security_router)
 
 # P1-01：告警中心路由（platform.routers.alerts）
 app.include_router(alerts_platform_router)

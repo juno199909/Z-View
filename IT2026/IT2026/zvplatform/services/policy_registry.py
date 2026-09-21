@@ -77,7 +77,7 @@ def _fetch_asset_scope(conn, asset_id: int) -> Tuple[Optional[int], None]:
 
 def resolve_unified_policies(conn, asset_id: int) -> List[Dict[str, Any]]:
     """按统一引擎解析某终端的全部生效策略（asset > group > global，priority 参与）。"""
-    from security_api import ensure_security_tables
+    from zvplatform.routers.security import ensure_security_tables
 
     ensure_security_tables(conn)
     ensure_policy_types(conn)

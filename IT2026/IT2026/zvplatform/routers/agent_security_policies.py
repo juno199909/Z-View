@@ -43,7 +43,7 @@ def agent_get_security_policies(
         raise HTTPException(status_code=500, detail="Database connection failed")
     cursor = conn.cursor(dictionary=True)
     try:
-        from security_api import ensure_security_tables
+        from zvplatform.routers.security import ensure_security_tables
         ensure_security_tables(conn)
         # 查询 asset 的 group_id
         cursor.execute("SELECT group_id FROM assets WHERE id=%s", (asset_id,))
@@ -98,7 +98,7 @@ def agent_security_policy_result(data: dict, request: Request):
         raise HTTPException(status_code=500, detail="Database connection failed")
     cursor = conn.cursor()
     try:
-        from security_api import ensure_security_tables
+        from zvplatform.routers.security import ensure_security_tables
         ensure_security_tables(conn)
         policy_id = data.get("policy_id")
         asset_id = data.get("asset_id")
