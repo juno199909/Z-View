@@ -93,3 +93,7 @@ export function remoteKillProcess(assetId, data) {
 export function remoteIsolate(assetId) {
   return request({ url: `/security/remote/isolate/${assetId}`, method: 'post' })
 }
+
+export function remoteUnisolate(assetId) {
+  return request({ url: `/security/remote/unisolate/${assetId}`, method: 'post' })
+}

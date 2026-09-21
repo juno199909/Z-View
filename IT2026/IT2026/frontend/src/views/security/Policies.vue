@@ -2,7 +2,10 @@
   <div class="zv-sec-page">
     <div class="zv-sec-header">
       <h2 class="zv-sec-title">策略中心</h2>
-      <el-button :icon="Refresh" plain @click="loadData">刷新</el-button>
+      <div>
+        <el-button type="primary" @click="showCreate">新建策略</el-button>
+        <el-button :icon="Refresh" plain @click="loadData">刷新</el-button>
+      </div>
     </div>
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
       统一策略管理（P1-05）：防火墙 / USB管控 / 终端 Agent 策略在「统一策略」页签管理（启用/禁用、绑定范围、版本回滚、执行结果）；软件管控策略（黑名单/白名单/强制安装）在「软件管控」页签维护，其解析排序已收敛到统一策略引擎。
@@ -50,7 +53,7 @@
       </el-tab-pane>
     </el-tabs>
 
-    <el-dialog v-model="bindVisible" title="策略绑定" width="480px">
+    <el-dialog v-model="bindVisible" title="策略绑定" width="560px">
       <p>策略: {{ bindTarget?.policy_name }}（{{ typeLabel(bindTarget?.policy_type) }}）</p>
       <el-form :model="bindForm" label-width="100px" style="margin-top:12px">
         <el-form-item label="绑定范围">
@@ -71,7 +74,40 @@
           </el-select>
         </el-form-item>
       </el-form>
-      <template #footer><el-button @click="bindVisible=false">取消</el-button><el-button type="primary" @click="doBind">绑定</el-button></template>
+      <el-divider>现有绑定</el-divider>
+      <el-table :data="bindings" stripe size="small" v-loading="bindingsLoading" max-height="220">
+        <el-table-column prop="id" label="绑定ID" width="70" />
+        <el-table-column prop="scope_type" label="范围" width="90"><template #default="{row}">{{ {global:'全局',group:'终端组',asset:'终端'}[row.scope_type]||row.scope_type }}</template></el-table-column>
+        <el-table-column prop="scope_id" label="对象ID" width="80"><template #default="{row}">{{ row.scope_id ?? '—' }}</template></el-table-column>
+        <el-table-column prop="created_at" label="绑定时间" width="160" />
+        <el-table-column label="操作" width="80"><template #default="{row}"><el-button link type="danger" @click="doUnbind(row)">解绑</el-button></template></el-table-column>
+      </el-table>
+      <template #footer><el-button @click="bindVisible=false">关闭</el-button><el-button type="primary" @click="doBind">绑定</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="createVisible" title="新建策略" width="560px">
+      <el-form :model="createForm" label-width="90px">
+        <el-form-item label="策略名称" required>
+          <el-input v-model="createForm.policy_name" maxlength="100" placeholder="如：研发部 USB 管控" />
+        </el-form-item>
+        <el-form-item label="策略类型" required>
+          <el-select v-model="createForm.policy_type" style="width:100%">
+            <el-option v-for="t in types" :key="t.v" :label="t.l" :value="t.v" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="优先级">
+          <el-input-number v-model="createForm.priority" :min="0" :max="1000" />
+          <span style="margin-left:8px;color:#909399;font-size:12px">数值越大优先级越高（asset &gt; group &gt; global 组内比较）</span>
+        </el-form-item>
+        <el-form-item label="描述">
+          <el-input v-model="createForm.description" type="textarea" :rows="2" maxlength="255" />
+        </el-form-item>
+        <el-form-item label="配置 JSON">
+          <el-input v-model="createForm.config_json" type="textarea" :rows="5" placeholder='{"rules":[]}' />
+          <span style="color:#909399;font-size:12px">创建后可在「防火墙/USB」页用向导下发规则，或在版本历史中迭代</span>
+        </el-form-item>
+      </el-form>
+      <template #footer><el-button @click="createVisible=false">取消</el-button><el-button type="primary" :loading="creating" @click="doCreate">创建</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="execVisible" title="策略执行结果" width="760px">
@@ -104,7 +140,7 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { getSecurityPolicies, updateSecurityPolicy, bindSecurityPolicy, deleteSecurityPolicy, getSecurityPolicyVersions, getSecurityPolicyExecResults, rollbackSecurityPolicy } from '@/api/security'
+import { getSecurityPolicies, getSecurityPolicyDetail, createSecurityPolicy, updateSecurityPolicy, bindSecurityPolicy, unbindSecurityPolicy, deleteSecurityPolicy, getSecurityPolicyVersions, getSecurityPolicyExecResults, rollbackSecurityPolicy } from '@/api/security'
 import { useAssetGroupOptions } from '@/composables/useAssetGroupOptions'
 import PolicyManagement from '@/views/terminal/components/PolicyManagement.vue'
 
@@ -115,12 +151,33 @@ const statusLabel = (v)=>({success:'成功',failed:'失败',partial:'部分成�
 const loading = ref(false); const policies = ref([])
 const filters = reactive({policy_type:'',enabled:''})
 const bindVisible = ref(false); const bindTarget = ref(null); const bindForm = reactive({scope_type:'global',group_id:null,asset_ids:[]})
+const bindings = ref([]); const bindingsLoading = ref(false)
+const createVisible = ref(false); const creating = ref(false)
+const createForm = reactive({policy_name:'',policy_type:'agent',priority:0,description:'',config_json:'{}'})
 const execVisible = ref(false); const execTarget = ref(null); const execResults = ref([]); const execLoading = ref(false)
 const versionVisible = ref(false); const versionTarget = ref(null); const versions = ref([]); const versionLoading = ref(false)
 const { groups, assets, loadOptions } = useAssetGroupOptions()
 const loadData = async () => { loading.value=true; try{const r=await getSecurityPolicies({page:1,page_size:200,policy_type:filters.policy_type||undefined,enabled:filters.enabled===''?undefined:filters.enabled}); policies.value=(r.data||[]).map(p=>({...p,_toggling:false}))}catch(e){ElMessage.error('加载策略失败')}finally{loading.value=false} }
 const toggleEnabled = async (row, val) => { row._toggling=true; try{ await updateSecurityPolicy(row.id, {enabled:val}); row.enabled=val; ElMessage.success(val?'已启用':'已禁用') }catch(e){ElMessage.error('操作失败')}finally{row._toggling=false} }
-const showBind = (row) => { bindTarget.value=row; bindForm.scope_type='global'; bindForm.group_id=null; bindForm.asset_ids=[]; loadOptions(); bindVisible.value=true }
+const showBind = async (row) => { bindTarget.value=row; bindForm.scope_type='global'; bindForm.group_id=null; bindForm.asset_ids=[]; loadOptions(); bindVisible.value=true; await loadBindings(row) }
+const loadBindings = async (row) => { bindingsLoading.value=true; try{ const d=await getSecurityPolicyDetail(row.id); bindings.value=d.bindings||[] }catch(e){ bindings.value=[] }finally{ bindingsLoading.value=false } }
+const doUnbind = async (b) => {
+  try { await ElMessageBox.confirm(`确定解绑绑定 #${b.id}（${b.scope_type}${b.scope_id ? ' #' + b.scope_id : ''}）？`,'解绑',{type:'warning'})
+    await unbindSecurityPolicy(bindTarget.value.id, b.id)
+    ElMessage.success('已解绑'); await loadBindings(bindTarget.value); loadData()
+  } catch(e){ if(e!=='cancel')ElMessage.error('解绑失败') }
+}
+const showCreate = () => { createForm.policy_name=''; createForm.policy_type='agent'; createForm.priority=0; createForm.description=''; createForm.config_json='{}'; createVisible.value=true }
+const doCreate = async () => {
+  if (!createForm.policy_name.trim()) { ElMessage.warning('策略名称不能为空'); return }
+  try { JSON.parse(createForm.config_json || '{}') } catch(e) { ElMessage.warning('配置不是合法 JSON'); return }
+  creating.value = true
+  try {
+    await createSecurityPolicy({ policy_name: createForm.policy_name.trim(), policy_type: createForm.policy_type,
+      priority: createForm.priority, description: createForm.description || null, config_json: createForm.config_json || '{}' })
+    ElMessage.success('策略已创建'); createVisible.value = false; loadData()
+  } catch(e){ ElMessage.error('创建失败') } finally { creating.value = false }
+}
 const doBind = async () => {
   try {
     if (bindForm.scope_type==='asset') {
