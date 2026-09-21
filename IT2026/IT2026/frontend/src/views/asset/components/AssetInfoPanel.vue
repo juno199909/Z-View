@@ -215,6 +215,20 @@
         </div>
       </div>
 
+      <!-- 自定义字段 -->
+      <div v-if="customFieldEntries.length" class="zv-card zv-section zv-section-full">
+        <h3 class="zv-section-title">
+          <el-icon><DocumentCopy /></el-icon>
+          自定义字段
+        </h3>
+        <div class="zv-info-grid">
+          <div v-for="([k, v], idx) in customFieldEntries" :key="idx" class="zv-info-item">
+            <div class="zv-info-label">{{ k }}</div>
+            <div class="zv-info-value">{{ v }}</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 运行状态 -->
       <div class="zv-card zv-section zv-section-full" v-loading="historyLoading">
         <h3 class="zv-section-title">
@@ -422,12 +436,25 @@
           </el-col>
         </el-row>
       </div>
+
+      <div class="zv-card zv-section">
+        <h3 class="zv-section-title">
+          <el-icon><DocumentCopy /></el-icon>
+          自定义字段
+        </h3>
+        <div v-for="(row, i) in customFieldsRows" :key="i" style="display:flex; gap:8px; margin-bottom:8px">
+          <el-input v-model="row.key" placeholder="字段名（如：机柜编号）" style="width:220px" />
+          <el-input v-model="row.value" placeholder="字段值" style="flex:1" />
+          <el-button link type="danger" @click="customFieldsRows.splice(i,1)">删除</el-button>
+        </div>
+        <el-button style="margin-top:8px" @click="customFieldsRows.push({ key: '', value: '' })">+ 添加字段</el-button>
+      </div>
     </el-form>
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   getAssetChanges, getAssetDetail, getAssetStatus, getAssetStatusHistory, getAssetUptime, updateAsset
 } from '@/api/asset'
@@ -453,6 +480,15 @@ const uptimeSummary = ref(null)
 const historyLoading = ref(false)
 const editMode = ref(false)
 const saving = ref(false)
+const customFieldsRows = ref([])
+const customFieldEntries = computed(() => Object.entries(asset.value.custom_fields || {}))
+
+watch(editMode, (v) => {
+  if (v) {
+    customFieldsRows.value = Object.entries(asset.value.custom_fields || {})
+      .map(([key, value]) => ({ key, value: String(value ?? '') }))
+  }
+})
 
 const loadAssetHistory = async () => {
   historyLoading.value = true
@@ -498,6 +534,11 @@ const saveAsset = async () => {
     for (const key of editableFields) {
       if (asset.value[key] !== undefined) payload[key] = asset.value[key]
     }
+    const customObj = {}
+    for (const row of customFieldsRows.value) {
+      if (row.key && row.key.trim()) customObj[row.key.trim()] = row.value
+    }
+    payload.custom_fields = customObj
     await updateAsset(asset.value.id, payload)
     ElMessage.success('保存成功')
     editMode.value = false

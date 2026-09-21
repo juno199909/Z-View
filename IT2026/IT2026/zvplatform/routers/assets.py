@@ -86,6 +86,7 @@ class Asset(BaseModel):
     retire_date: Optional[str] = None
     retire_reason: Optional[str] = None
     notes: Optional[str] = None
+    custom_fields: Optional[dict] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -565,6 +566,11 @@ def get_asset(asset_id: int):
             raise HTTPException(status_code=404, detail="Asset not found")
 
         asset['status'] = asset.get('real_status') or asset.get('status')
+        if isinstance(asset.get('custom_fields'), str):
+            try:
+                asset['custom_fields'] = json.loads(asset['custom_fields'])
+            except ValueError:
+                asset['custom_fields'] = {}
         for field_name in (
             'last_seen', 'created_at', 'updated_at',
             'purchase_date', 'warranty_start', 'warranty_end',
@@ -635,10 +641,10 @@ def create_asset(asset: Asset, request: Request):
                 purchase_date, purchase_price, supplier, contract_no,
                 warranty_start, warranty_end, warranty_provider,
                 deployment_date, asset_status, user_name, department,
-                retire_date, retire_reason, notes,
+                retire_date, retire_reason, notes, custom_fields,
                 created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         """, (
             asset.asset_type, asset.hostname, asset.ip_address, asset.mac_address,
             asset.serial_number, asset.manufacturer, asset.model, asset.os_type, asset.os_version,
@@ -648,7 +654,8 @@ def create_asset(asset: Asset, request: Request):
             asset.purchase_date, asset.purchase_price, asset.supplier, asset.contract_no,
             asset.warranty_start, asset.warranty_end, asset.warranty_provider,
             asset.deployment_date, asset.asset_status or 'in_stock', asset.user_name, asset.department,
-            asset.retire_date, asset.retire_reason, asset.notes
+            asset.retire_date, asset.retire_reason, asset.notes,
+            json.dumps(asset.custom_fields) if isinstance(asset.custom_fields, dict) else None
         ))
 
         asset_id = cursor.lastrowid
@@ -665,7 +672,7 @@ def create_asset(asset: Asset, request: Request):
                 "owner", "group_id", "purchase_date", "purchase_price", "supplier",
                 "contract_no", "warranty_start", "warranty_end", "warranty_provider",
                 "deployment_date", "asset_status", "user_name", "department",
-                "retire_date", "retire_reason", "notes",
+                "retire_date", "retire_reason", "notes", "custom_fields",
             ],
             change_type="create",
             source_type="manual",
@@ -730,10 +737,27 @@ def update_asset(asset_id: int, data: dict, request: Request):
             'retire_date': 'retire_date',
             'retire_reason': 'retire_reason',
             'notes': 'notes',
+            'custom_fields': 'custom_fields',
         }
 
         for key, value in data.items():
             if key in allowed_fields:
+                if key == "custom_fields":
+                    # 资产自定义字段：JSON 对象（键值对），空值 = 清空
+                    if value is None or value == "":
+                        update_fields.append("custom_fields = %s")
+                        values.append(None)
+                    else:
+                        if isinstance(value, str):
+                            try:
+                                value = json.loads(value)
+                            except ValueError:
+                                raise HTTPException(status_code=422, detail="custom_fields must be a valid JSON object")
+                        if not isinstance(value, dict):
+                            raise HTTPException(status_code=422, detail="custom_fields must be a JSON object")
+                        update_fields.append("custom_fields = %s")
+                        values.append(json.dumps(value))
+                    continue
                 if key == "asset_type" and value and value not in ASSET_TYPE_CHOICES:
                     raise HTTPException(
                         status_code=422,
@@ -1199,6 +1223,11 @@ def get_asset_detail(asset_id: int):
             raise HTTPException(status_code=404, detail="Asset not found")
 
         asset['status'] = asset.get('real_status') or asset.get('status')
+        if isinstance(asset.get('custom_fields'), str):
+            try:
+                asset['custom_fields'] = json.loads(asset['custom_fields'])
+            except ValueError:
+                asset['custom_fields'] = {}
         for field_name in ('last_seen', 'created_at', 'updated_at', 'purchase_date', 'warranty_start', 'warranty_end', 'deployment_date', 'retire_date'):
             if asset.get(field_name):
                 asset[field_name] = format_datetime(asset[field_name])
