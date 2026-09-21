@@ -226,6 +226,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="print effective agent config with sources (JSON) and exit",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -2321,6 +2326,12 @@ def main(argv: list[str] | None = None):
 
     if args.stop_agent:
         raise SystemExit(run_stop_agent())
+
+    if getattr(args, "print_config", False):
+        import json as _json
+        from zvagent.config import build_config_report
+        print(_json.dumps(build_config_report(), ensure_ascii=False, indent=2))
+        raise SystemExit(0)
 
     if args.restart_user_session_agent:
         raise SystemExit(

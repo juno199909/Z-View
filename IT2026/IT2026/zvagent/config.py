@@ -102,6 +102,57 @@ def _load_user_config() -> dict:
     return {}
 
 
+_ACTIVE_CONFIG_FILE: str = ""
+
+
+def _load_user_config() -> dict:
+    global _ACTIVE_CONFIG_FILE
+    for candidate in _CONFIG_CANDIDATES:
+        data = _load_config_from_file(candidate)
+        if data:
+            _ACTIVE_CONFIG_FILE = str(candidate)
+            return data
+    return {}
+
+
+def _config_source_labels(user_config: dict) -> dict:
+    """key -> 来源标签（配置文件路径 / 环境变量 / 默认值），供配置报告使用。"""
+    labels = {}
+    active = _ACTIVE_CONFIG_FILE
+    for key in user_config:
+        labels[key] = f"配置文件({active})" if active else "配置文件"
+    for env_key, attr in (("ZVIEW_AGENT_TOKEN", "token"), ("ZVIEW_SERVER_URL", "server_url"),
+                          ("ZVIEW_AGENT_CONTROL_PORT", "control_port")):
+        if get_env(env_key):
+            labels[attr] = f"环境变量({env_key})"
+    return labels
+
+
+def build_config_report() -> dict:
+    """最终生效配置（敏感项脱敏）+ 来源标签（#17 配置来源可追踪）。"""
+    user_config = _load_user_config()
+    labels = _config_source_labels(user_config)
+    config, software_config = load_configs()
+
+    def _mask(value):
+        return "******" if value else ""
+
+    effective = {k: (_mask(v) if k in ("token", "password") else v) for k, v in config.items()}
+    effective_software = {k: (_mask(v) if k == "token" else v) for k, v in software_config.items()}
+    sources = {"agent": {}, "software": {}}
+    for key in effective:
+        sources["agent"][key] = labels.get(key, "默认值")
+    for key in effective_software:
+        sources["software"][key] = labels.get(key, sources["agent"].get(key, "默认值"))
+    return {
+        "config_file_candidates": [str(p) for p in _CONFIG_CANDIDATES],
+        "active_config_file": _ACTIVE_CONFIG_FILE or None,
+        "effective": effective,
+        "effective_software": effective_software,
+        "sources": sources,
+    }
+
+
 def _apply_env_overrides(config: dict, software_config: dict) -> tuple[dict, dict]:
     merged_config = _merge_config(config, {})
     merged_software_config = _merge_config(software_config, {})

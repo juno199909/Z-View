@@ -171,6 +171,7 @@ from zvplatform.routers.patch_management import router as patch_management_route
 from zvplatform.routers.agent_security_policies import router as agent_security_policies_router  # 1.9.55：终端安全策略 Agent 上报（#16 迁入）
 from zvplatform.routers.assets import router as assets_core_router, bind_helpers as bind_assets_helpers  # 1.9.55：资产 CRUD（#16 迁入）
 from zvplatform.routers.auth import router as auth_router, bind_helpers as bind_auth_helpers  # 1.9.55：认证与用户管理（#16 迁入）
+from zvplatform.routers.config_report import router as config_report_router  # 1.9.55：配置来源报告（#17）
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
@@ -2589,6 +2590,7 @@ app.include_router(patch_management_router)  # 1.9.55：补丁管理（#16 迁�
 app.include_router(agent_security_policies_router)  # 1.9.55：终端安全策略 Agent 上报（#16 迁入）
 app.include_router(assets_core_router)  # 1.9.55：资产 CRUD（#16 迁入）
 app.include_router(auth_router)  # 1.9.55：认证与用户管理（#16 迁入）
+app.include_router(config_report_router)  # 1.9.55：配置来源报告（#17）
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭

@@ -19,6 +19,10 @@ def _strip_wrapping_quotes(value: str) -> str:
     return trimmed
 
 
+_ENV_FILE_SOURCES: Dict[str, str] = {}   # key -> 提供该键的 .env 文件路径（setdefault 生效时记录）
+_ENV_FILES_LOADED: List[str] = []        # 实际加载过的 .env 文件
+
+
 @lru_cache(maxsize=1)
 def ensure_env_loaded() -> None:
     candidate_paths: List[tuple[str, bool]] = []
@@ -41,6 +45,7 @@ def ensure_env_loaded() -> None:
         if path in seen or not os.path.exists(path):
             continue
         seen.add(path)
+        _ENV_FILES_LOADED.append(path)
 
         try:
             with open(path, "r", encoding="utf-8") as env_fp:
@@ -54,10 +59,34 @@ def ensure_env_loaded() -> None:
                         cleaned_value = _strip_wrapping_quotes(value)
                         if allow_override:
                             os.environ[key] = cleaned_value
-                        else:
-                            os.environ.setdefault(key, cleaned_value)
+                            _ENV_FILE_SOURCES[key] = path
+                        elif key not in os.environ:
+                            os.environ[key] = cleaned_value
+                            _ENV_FILE_SOURCES[key] = path
         except OSError:
             continue
+
+
+def get_env_files_loaded() -> List[str]:
+    """实际加载过的 .env 文件路径（按加载顺序）。"""
+    ensure_env_loaded()
+    return list(_ENV_FILES_LOADED)
+
+
+def get_env_file_sources() -> Dict[str, str]:
+    """key -> 提供该键的 .env 文件路径。"""
+    ensure_env_loaded()
+    return dict(_ENV_FILE_SOURCES)
+
+
+def describe_env_source(name: str) -> str:
+    """描述某个环境变量的来源：环境变量 / .env(路径) / 未设置。"""
+    ensure_env_loaded()
+    if name in _ENV_FILE_SOURCES:
+        return f".env({_ENV_FILE_SOURCES[name]})"
+    if os.getenv(name) is not None:
+        return "环境变量"
+    return "未设置"
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
