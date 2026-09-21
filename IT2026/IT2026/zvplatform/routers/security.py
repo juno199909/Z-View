@@ -176,9 +176,63 @@ def security_overview():
         cur.execute("SELECT COUNT(*) AS c FROM security_policy_bindings WHERE enabled=TRUE")
         active_bindings = int((cur.fetchone() or {}).get("c") or 0)
 
+        # 防火墙策略数
+        cur.execute("SELECT COUNT(*) AS c FROM security_policies WHERE policy_type='firewall' AND enabled=TRUE")
+        firewall_policies = int((cur.fetchone() or {}).get("c") or 0)
+
+        # USB 设备与事件（近 24h 事件）
+        cur.execute("SELECT COUNT(*) AS c FROM usb_devices")
+        usb_devices = int((cur.fetchone() or {}).get("c") or 0)
+        cur.execute("SELECT COUNT(*) AS c FROM usb_events WHERE occurred_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)")
+        usb_events_24h = int((cur.fetchone() or {}).get("c") or 0)
+
+        # 近 24h 策略执行结果
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM security_policy_exec_results "
+            "WHERE status='failed' AND executed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+        )
+        exec_failed_24h = int((cur.fetchone() or {}).get("c") or 0)
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM security_policy_exec_results "
+            "WHERE executed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+        )
+        exec_total_24h = int((cur.fetchone() or {}).get("c") or 0)
+
+        # 最近 USB 事件（Top 10）
+        cur.execute("""
+            SELECT ue.occurred_at, ue.event_type, ue.friendly_name, ue.device_id, ue.vid_pid, a.hostname
+            FROM usb_events ue
+            LEFT JOIN assets a ON a.id=ue.asset_id
+            ORDER BY ue.occurred_at DESC LIMIT 10
+        """)
+        recent_usb_events = []
+        for row in cur.fetchall() or []:
+            row["occurred_at"] = fmt_dt(row.get("occurred_at"))
+            recent_usb_events.append(row)
+
+        # 最近失败的策略执行（Top 5）
+        cur.execute("""
+            SELECT sper.policy_id, sp.policy_name, sper.asset_id, a.hostname,
+                   sper.applied_rules, sper.failed_rules, sper.executed_at
+            FROM security_policy_exec_results sper
+            JOIN security_policies sp ON sp.id=sper.policy_id
+            LEFT JOIN assets a ON a.id=sper.asset_id
+            WHERE sper.status='failed'
+            ORDER BY sper.executed_at DESC LIMIT 5
+        """)
+        recent_failed = []
+        for row in cur.fetchall() or []:
+            row["executed_at"] = fmt_dt(row.get("executed_at"))
+            recent_failed.append(row)
+
         return {
             "terminals": {"total": total, "online": online, "offline": total - online},
-            "policies": {"active": active_policies, "bindings": active_bindings},
+            "policies": {"active": active_policies, "bindings": active_bindings,
+                         "firewall": firewall_policies},
+            "usb": {"devices": usb_devices, "events_24h": usb_events_24h},
+            "executions": {"total_24h": exec_total_24h, "failed_24h": exec_failed_24h},
+            "recent_usb_events": recent_usb_events,
+            "recent_failed": recent_failed,
         }
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
