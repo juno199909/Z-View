@@ -56,7 +56,8 @@ def _load_config_from_file(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig 兼容带/不带 BOM 的文件（PowerShell 等工具重写配置会引入 BOM）
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:

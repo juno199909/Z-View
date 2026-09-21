@@ -138,7 +138,8 @@ def resolve_config_path() -> Path:
 def load_agent_config() -> dict[str, Any]:
     config_path = resolve_config_path()
     try:
-        with open(config_path, "r", encoding="utf-8") as file:
+        # utf-8-sig 兼容带/不带 BOM 的配置文件
+        with open(config_path, "r", encoding="utf-8-sig") as file:
             return json.load(file)
     except Exception:
         return {}

@@ -331,7 +331,7 @@ def run_self_install(quiet: bool = False, server_url: str = "",
             existing = {}
             if config_path.exists():
                 try:
-                    existing = json.loads(config_path.read_text(encoding="utf-8"))
+                    existing = json.loads(config_path.read_text(encoding="utf-8-sig"))
                 except Exception:
                     existing = {}
             # V1.6.0 修复：合并构建内置 config.json（token/intervals/远控配置），
