@@ -109,7 +109,24 @@ def build_platform_config_report() -> dict:
         },
     }
 
-    return {"groups": groups, "secrets": secrets_section, "files": files_section}
+    # #17 二阶段：入口审计归类（平台侧 config.json 零消费，已从配置入口除名）
+    entry_audit = {
+        "platform_config_entries": [
+            {"entry": ".env", "kind": "平台配置", "status": "在用（9 键全部被消费）"},
+            {"entry": "环境变量", "kind": "平台配置", "status": "在用（覆盖 .env）"},
+            {"entry": "auth_secret.txt", "kind": "密钥文件", "status": "在用（TOKEN_SECRET 持久化，自动生成）"},
+            {"entry": "代码默认值", "kind": "平台配置", "status": "在用（集中定义于 zvplatform/settings.py）"},
+        ],
+        "reclassified_non_platform": [
+            {"entry": "auth_state.json", "kind": "运行时状态", "note": "用户账号存储（非配置），迁移入库列 #10 专项"},
+            {"entry": "agent_secret.txt", "kind": "密钥文件", "note": "Agent 通道令牌持久化（自动生成）"},
+            {"entry": "config.json", "kind": "Agent 配置模板", "note": "平台侧零消费；Agent frozen 包内嵌 + GPO 分发模板 + 本机 dev 运行配置"},
+            {"entry": "config.local.json", "kind": "Agent 配置", "note": "Agent 安装器写入（ProgramData），平台侧零消费"},
+        ],
+    }
+
+    return {"groups": groups, "secrets": secrets_section, "files": files_section,
+            "entry_audit": entry_audit}
 
 
 @router.get("/api/v1/console/config-report")
