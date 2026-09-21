@@ -165,6 +165,8 @@ from zvplatform.routers.discovery import router as discovery_platform_router
 from zvplatform.routers.agent_heartbeat import router as agent_heartbeat_router  # P1-01：心跳本体
 from zvplatform.routers.agent_exit_policy import router as agent_exit_policy_router  # 1.9.55：退出密码策略
 from zvplatform.routers.agent_deploy import router as agent_deploy_router  # 1.9.55：终端部署三件套（#16 迁入）
+from zvplatform.routers.alert_settings import router as alert_settings_router  # 1.9.55：告警通知/阈值配置（#16 迁入）
+from zvplatform.routers.agent_credentials import router as agent_credentials_router  # 1.9.55：设备凭据管理（#16 迁入）
 from zvplatform.routers.agent_jobs import router as agent_jobs_router  # V1.8.3：通用任务通道
 from zvplatform.routers.log_retention import router as log_retention_router  # V1.9.23：监控中心·日志配置
 from zvplatform.routers.incidents import router as incidents_router  # V1.9.0：事件聚合
@@ -4342,6 +4344,8 @@ app.include_router(agent_policy_router)  # P1-01：Agent 策略路由
 app.include_router(agent_heartbeat_router)  # P1-01：心跳路由
 app.include_router(agent_exit_policy_router)  # 1.9.55：退出密码策略
 app.include_router(agent_deploy_router)  # 1.9.55：终端部署三件套（#16 迁入）
+app.include_router(alert_settings_router)  # 1.9.55：告警通知/阈值配置（#16 迁入）
+app.include_router(agent_credentials_router)  # 1.9.55：设备凭据管理（#16 迁入）
 app.include_router(agent_jobs_router)  # V1.8.3：通用任务通道
 app.include_router(log_retention_router)  # V1.9.23：监控中心·日志配置
 app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
@@ -4416,98 +4420,8 @@ mount_agent_upgrade_api(app)
 
 
 # ============================================================
-# 告警通知配置（P1 告警中心通知层，V1.7.1）
+# 告警通知/阈值配置：已迁至 zvplatform/routers/alert_settings.py（#16 模块化）
 # ============================================================
-
-
-@app.get("/api/v1/console/alert-notify-config")
-def get_alert_notify_config_api(request: Request):
-    """读取告警通知配置（密码脱敏）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    from zvplatform.services.alert_notify import get_notify_config
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        cfg = get_notify_config(conn)
-        cfg["has_smtp_password"] = bool(cfg.get("smtp_password"))
-        cfg.pop("smtp_password", None)
-        return cfg
-    finally:
-        conn.close()
-
-
-@app.put("/api/v1/console/alert-notify-config")
-def update_alert_notify_config_api(request: Request, patch: dict):
-    """更新告警通知配置（合并式；smtp_password 传空串表示保持不变）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    if not isinstance(patch, dict):
-        raise HTTPException(status_code=422, detail="Body must be a JSON object")
-    from zvplatform.services.alert_notify import update_notify_config
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        cfg = update_notify_config(conn, patch)
-        cfg["has_smtp_password"] = bool(cfg.get("smtp_password"))
-        cfg.pop("smtp_password", None)
-        return cfg
-    finally:
-        conn.close()
-
-
-@app.post("/api/v1/console/alert-notify-test")
-def test_alert_notify_config(request: Request):
-    """发送测试通知（admin）：按已保存配置逐通道试发，返回每通道结果。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    from zvplatform.services.alert_notify import send_test_notification
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        return send_test_notification(conn)
-    finally:
-        conn.close()
-
-
-@app.get("/api/v1/console/alert-thresholds")
-def get_alert_thresholds_api(request: Request):
-    """读取告警阈值配置（NULL = 使用默认）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    from zvplatform.services.alert_thresholds import get_threshold_config, get_effective_thresholds
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        return {
-            "config": get_threshold_config(conn),
-            "effective": get_effective_thresholds(conn),
-        }
-    finally:
-        conn.close()
-
-
-@app.put("/api/v1/console/alert-thresholds")
-def update_alert_thresholds_api(request: Request, patch: dict):
-    """更新告警阈值（合并式；NULL/空串 = 回落默认；校验范围与 warning<critical）。"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    if not isinstance(patch, dict):
-        raise HTTPException(status_code=422, detail="Body must be a JSON object")
-    from zvplatform.services.alert_thresholds import get_threshold_config, get_effective_thresholds, update_threshold_config
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        try:
-            update_threshold_config(conn, patch)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        return {
-            "config": get_threshold_config(conn),
-            "effective": get_effective_thresholds(conn),
-        }
-    finally:
-        conn.close()
 
 
 @app.get("/api/v1/console/patch-status")
@@ -4552,85 +4466,7 @@ def list_patch_status_api(request: Request, asset_id: Optional[int] = None):
         conn.close()
 
 
-@app.get("/api/v1/console/agent-credentials")
-def list_agent_credentials(request: Request):
-    """设备凭据注册状态（含未注册资产）"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    cursor = conn.cursor(dictionary=True)
-    try:
-        ensure_agent_credentials_table(conn)
-        cursor.execute("""
-            SELECT a.id AS asset_id, a.hostname, a.ip_address, a.status, a.last_seen,
-                   ac.status AS credential_status, ac.created_at AS enrolled_at, ac.last_used_at
-            FROM assets a
-            LEFT JOIN agent_credentials ac ON ac.asset_id = a.id
-            WHERE a.deleted_at IS NULL
-            ORDER BY (ac.asset_id IS NULL) ASC, a.id ASC
-        """)
-        rows = cursor.fetchall()
-        for r in rows:
-            r["last_seen"] = fmt_dt(r.get("last_seen"))
-            r["enrolled_at"] = fmt_dt(r.get("enrolled_at"))
-            r["last_used_at"] = fmt_dt(r.get("last_used_at"))
-            r["enrolled"] = r.get("credential_status") == "active"
-        enrolled = sum(1 for r in rows if r["enrolled"])
-        return {"data": rows, "total": len(rows), "enrolled": enrolled, "pending": len(rows) - enrolled}
-    except Error as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-
-@app.delete("/api/v1/console/agent-credentials/{asset_id}")
-def revoke_agent_credential(asset_id: int, request: Request):
-    """吊销设备凭据：Agent 下次全局 token 心跳时自动重新签发"""
-    require_request_permission(getattr(request.state, "auth_user", None), request.url.path, request.method)
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    cursor = conn.cursor()
-    try:
-        ensure_agent_credentials_table(conn)
-        cursor.execute(
-            "UPDATE agent_credentials SET status='revoked' WHERE asset_id=%s AND status='active'",
-            (asset_id,),
-        )
-        revoked = cursor.rowcount
-        conn.commit()
-        if not revoked:
-            raise HTTPException(status_code=404, detail="No active credential for this asset")
-        conn.commit()
-        # 写审计
-        try:
-            insert_system_activity_log(cursor, SystemActivityLogCreate(
-                source_type="platform",
-                module="agent_credentials",
-                category="security",
-                action="agent_credential_revoke",
-                level="warning",
-                result="success",
-                asset_id=asset_id,
-                operator_name=get_request_username(request, fallback="console"),
-                title="吊销 Agent 设备凭据",
-                message=f"Agent 设备凭据已吊销，等待全局 token 心跳重新签发 (asset_id={asset_id})",
-                details={"asset_id": asset_id},
-            ))
-            conn.commit()
-        except Error:
-            conn.rollback()
-        return {"status": "success", "asset_id": asset_id, "revoked": True}
-    except HTTPException:
-        raise
-    except Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
+# 设备凭据管理端点：已迁至 zvplatform/routers/agent_credentials.py（#16 模块化）
 
 
 @app.get("/api/v1/agent/security-policies")
