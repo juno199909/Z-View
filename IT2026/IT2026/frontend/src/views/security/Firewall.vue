@@ -19,6 +19,28 @@
       <el-table-column prop="created_at" label="创建时间" width="160" />
     </el-table>
 
+    <div class="zv-sec-section" style="margin-top:24px">
+      <h3 class="zv-fw-sub">终端防火墙状态</h3>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
+        <el-select v-model="statusAssetId" filterable placeholder="选择终端查看最近防火墙策略执行情况"
+          style="width:320px" @change="loadStatus">
+          <el-option v-for="a in assets" :key="a.value" :label="a.label" :value="a.value" />
+        </el-select>
+        <el-button :icon="Refresh" plain :disabled="!statusAssetId" @click="loadStatus">查询</el-button>
+      </div>
+      <el-table :data="statusResults" stripe size="small" v-loading="statusLoading">
+        <el-table-column prop="policy_name" label="策略名" min-width="140" />
+        <el-table-column prop="status" label="下发状态" width="100">
+          <template #default="{row}"><el-tag :type="row.status==='success'?'success':row.status==='partial'?'warning':'danger'" size="small">{{ row.status }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="applied_rules" label="成功规则" width="90" />
+        <el-table-column prop="failed_rules" label="失败规则" width="90" />
+        <el-table-column prop="executed_at" label="执行时间" min-width="160" />
+      </el-table>
+      <el-empty v-if="!statusLoading && statusAssetId && !statusResults.length"
+        description="该终端暂无防火墙策略下发记录" :image-size="60" />
+    </div>
+
     <el-dialog v-model="showApply" title="下发防火墙策略" width="640px">
       <el-form :model="form" label-width="100px">
         <el-form-item label="目标范围">
@@ -56,11 +78,18 @@
 import { ref, reactive, onMounted } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { applyFirewallPolicy, getFirewallRules } from '@/api/security'
+import { applyFirewallPolicy, getFirewallRules, getFirewallStatus } from '@/api/security'
 import { useAssetGroupOptions } from '@/composables/useAssetGroupOptions'
 const showApply = ref(false); const applying = ref(false); const loading = ref(false)
 const ruleList = ref([])
 const { groups, assets, loadOptions } = useAssetGroupOptions()
+const statusAssetId = ref(''); const statusResults = ref([]); const statusLoading = ref(false)
+const loadStatus = async () => {
+  if (!statusAssetId.value) return
+  statusLoading.value = true
+  try { const r = await getFirewallStatus(statusAssetId.value); statusResults.value = r.results || [] }
+  catch (e) { ElMessage.error('加载终端防火墙状态失败') } finally { statusLoading.value = false }
+}
 const form = reactive({ scope_type: 'global', group_id: '', asset_ids: [], rules: [] })
 const loadData = async () => { loading.value=true; try { const r=await getFirewallRules(); ruleList.value=r.data||[] } catch(e){ElMessage.error('加载防火墙策略失败')} finally{loading.value=false} }
 const doApply = async () => {
@@ -90,4 +119,5 @@ onMounted(() => { loadData(); loadOptions() })
 .zv-fw-stat { background:#fff; border-radius:8px; padding:12px 20px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
 .zv-fw-num { font-size:24px; font-weight:700; color:#409eff; }
 .zv-fw-lbl { font-size:12px; color:#909399; margin-top:2px; }
+.zv-fw-sub { font-size:15px; font-weight:600; margin:0 0 10px; color:#303133; }
 </style>
