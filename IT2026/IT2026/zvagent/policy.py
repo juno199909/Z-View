@@ -14,6 +14,12 @@ from typing import Any, Callable
 
 from console_utils import safe_console_print
 from zvagent.config import CONFIG
+import requests
+import threading
+import time
+from urllib.parse import urljoin
+from config_utils import get_env
+from zvagent.auth import _agent_requests_verify, _platform_base
 
 print = safe_console_print
 
@@ -226,3 +232,191 @@ def _current_interval(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(5, min(value, 604800))
+
+
+class SecurityPolicySync:
+    """安全策略自动轮询同步：定时从平台拉取绑定的安全策略并应用，回传执行结果。"""
+
+    _LOG_PATH = Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "logs" / "security-sync.log"
+
+    def __init__(self, asset_id: int):
+        self.asset_id = asset_id
+        self.running = False
+        self.thread: threading.Thread | None = None
+
+    def _log(self, msg: str):
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(f"[SecurityPolicySync] {msg}")
+        try:
+            self._LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, name="security-policy-sync", daemon=True)
+        self.thread.start()
+        self._log(f"启动 (asset_id={self.asset_id})")
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        interval = int(CONFIG.get("intervals", {}).get("security_policy_sync", 300) or 300)
+        interval = max(60, min(interval, 3600))
+        self._log(f"轮询间隔={interval}s")
+        while self.running:
+            try:
+                self._sync_and_apply()
+            except Exception as exc:
+                self._log(f"同步失败: {exc}")
+            time.sleep(interval)
+
+    def _sync_and_apply(self):
+        from security_manager import execute_security_command
+        token = CONFIG.get("token") or ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = urljoin(_platform_base(), f"/api/v1/agent/security-policies?asset_id={self.asset_id}")
+        self._log(f"拉取策略: {url}")
+        resp = requests.get(url, headers=headers, timeout=30, verify=_agent_requests_verify())
+        if resp.status_code != 200:
+            self._log(f"拉取策略 HTTP {resp.status_code}")
+            return
+        data = resp.json()
+        policies = data.get("policies") or []
+        self._log(f"拉取到 {len(policies)} 条安全策略")
+        if not policies:
+            return
+        for p in policies:
+            try:
+                self._apply_one(p, execute_security_command)
+            except Exception as exc:
+                self._log(f"应用策略 {p.get('id')} 失败: {exc}")
+
+    def _apply_one(self, policy: dict, executor):
+        ptype = policy.get("policy_type")
+        config = policy.get("config") or {}
+        policy_id = policy.get("id")
+        scope_type = policy.get("scope_type", "asset")
+        applied = 0
+        failed = 0
+        error_detail = None
+        try:
+            if ptype == "firewall":
+                rules = config.get("rules") or []
+                res = executor("firewall_apply", {"rules": rules})
+                applied = res.get("applied", 0)
+                failed = res.get("failed", 0)
+                if not res.get("success"):
+                    error_detail = res.get("error") or json.dumps(res.get("details", []))[:500]
+            elif ptype == "usb":
+                action = config.get("action", "block")
+                cmd = "usb_block" if action == "block" else "usb_allow"
+                res = executor(cmd, {})
+                if not res.get("success"):
+                    failed = 1
+                    error_detail = res.get("error", "usb apply failed")
+                else:
+                    applied = 1
+            else:
+                error_detail = f"unknown policy_type: {ptype}"
+                failed = 1
+        except Exception as exc:
+            failed = 1
+            error_detail = str(exc)
+
+        self._report_result(policy_id, scope_type, applied, failed, error_detail)
+
+    def _report_result(self, policy_id, scope_type, applied, failed, error_detail):
+        token = CONFIG.get("token") or ""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = urljoin(_platform_base(), "/api/v1/agent/security-policy-result")
+        status = "success" if failed == 0 and applied > 0 else ("partial" if applied > 0 else "failed")
+        payload = {
+            "policy_id": policy_id,
+            "asset_id": self.asset_id,
+            "scope_type": scope_type,
+            "status": status,
+            "applied_rules": applied,
+            "failed_rules": failed,
+            "error_detail": error_detail,
+        }
+        try:
+            requests.post(url, json=payload, headers=headers, timeout=15, verify=_agent_requests_verify())
+        except Exception as exc:
+            print(f"[SecurityPolicySync] 回传结果失败: {exc}")
+
+def apply_agent_firewall_whitelist(server_url: str, logger=None):
+    """R2 防火墙白名单（可选，ZVIEW_FIREWALL_WHITELIST=1 启用）：
+    仅允许平台主机与本机访问 Agent 9000/9001 端口。
+    幂等：规则名固定，先删后建。失败不影响服务启动。
+    """
+    import subprocess
+    import ipaddress
+    from urllib.parse import urlparse
+    try:
+        if get_env("ZVIEW_FIREWALL_WHITELIST", "").strip() not in ("1", "true", "True"):
+            return
+        parsed = urlparse(server_url)
+        platform_host = parsed.hostname or ""
+        try:
+            platform_ip = ipaddress.ip_address(platform_host).exploded
+        except ValueError:
+            import socket
+            platform_ip = socket.gethostbyname(platform_host)
+        allow_remoteip = f"{platform_ip},127.0.0.1"
+        try:
+            lan_net = ipaddress.ip_network(f"{platform_ip}/24", strict=False)
+            if lan_net.prefixlen < 32:
+                allow_remoteip += f",{lan_net.network_address}/{lan_net.prefixlen}"
+        except ValueError:
+            pass
+        # 额外放行网段（跨网段观看端场景）：ZVIEW_EXTRA_FIREWALL_ALLOW="172.17.40.0/24,10.0.0.5"
+        extra_allow = get_env("ZVIEW_EXTRA_FIREWALL_ALLOW", "").strip()
+        if extra_allow:
+            allow_remoteip += f",{extra_allow}"
+            if logger:
+                logger(f"agent firewall extra allow: {extra_allow}")
+        RULE_ALLOW = "zv-agent-allow-platform"
+        RULE_BLOCK = "zv-agent-block-others"
+        for name in (RULE_ALLOW, RULE_BLOCK):
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+                capture_output=True, timeout=15, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name={RULE_ALLOW}",
+             "dir=in", "action=allow", "protocol=TCP",
+             "localport=9000,9001", f"remoteip={allow_remoteip}"],
+            capture_output=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name={RULE_BLOCK}",
+             "dir=in", "action=block", "protocol=TCP", "localport=9000,9001"],
+            capture_output=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if logger:
+            logger(f"agent firewall whitelist applied: allow={platform_ip},127.0.0.1 -> 9000,9001")
+    except Exception as exc:
+        if logger:
+            logger(f"agent firewall whitelist failed (ignored): {exc}")
+
+
+_security_policy_sync_instance: SecurityPolicySync | None = None
+
+
+def start_security_policy_sync(asset_id: int):
+    """启动安全策略自动轮询同步。"""
+    global _security_policy_sync_instance
+    if _security_policy_sync_instance is not None:
+        return
+    _security_policy_sync_instance = SecurityPolicySync(asset_id)
+    _security_policy_sync_instance.start()
+
