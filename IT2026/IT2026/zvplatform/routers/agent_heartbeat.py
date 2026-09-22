@@ -15,7 +15,11 @@ import traceback
 from fastapi import APIRouter, HTTPException, Request
 from mysql.connector import Error
 
-from agent_upgrade_api import get_latest_upgrade, record_agent_version
+from agent_upgrade_api import (
+    get_latest_upgrade,
+    get_upgrade_target_asset_ids,
+    record_agent_version,
+)
 from auth_utils import normalize_actor_name, require_agent_request
 from console_utils import safe_console_print
 from auth_utils import TOKEN_SECRET
@@ -825,7 +829,9 @@ def agent_heartbeat(data: dict, request: Request):
         # 用于引导存量终端到含自动升级逻辑的版本。
         # 已知版本仅在"落后于最新包"时下发：manifest 回退到旧版本时严禁降级，
         # 否则 Agent 每次心跳重试下载/安装，反复重启并占满磁盘（2026-09-09 事故）
-        if latest_upgrade.get("version"):
+        target_asset_ids = get_upgrade_target_asset_ids(latest_upgrade)
+        is_upgrade_target = not target_asset_ids or asset_id in target_asset_ids
+        if latest_upgrade.get("version") and is_upgrade_target:
             should_upgrade = not reported_version
             if not should_upgrade:
                 try:

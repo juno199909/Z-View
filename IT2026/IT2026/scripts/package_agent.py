@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -25,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from cmdb_agent_core import AGENT_VERSION  # noqa: E402
 
-DIST_ONEDIR = PROJECT_ROOT / "dist_agent" / "Z-View"
+DIST_ONEDIR = Path(os.environ.get("ZVIEW_AGENT_DIST_DIR", PROJECT_ROOT / "dist_agent" / "Z-View"))
 DIST_UPDATER = PROJECT_ROOT / "dist_updater" / "ZViewUpdater.exe"
 RELEASES_DIR = PROJECT_ROOT / "releases"
 
@@ -46,7 +47,9 @@ def main() -> int:
             if item.is_file():
                 zf.write(item, item.relative_to(DIST_ONEDIR).as_posix())
         zf.writestr("version.txt", version)
-        zf.write(DIST_UPDATER, "updater/ZViewUpdater.exe")
+        bundled_updater = DIST_ONEDIR / "updater" / "ZViewUpdater.exe"
+        if not bundled_updater.is_file():
+            zf.write(DIST_UPDATER, "updater/ZViewUpdater.exe")
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"packaged: {out_path} ({size_mb:.1f} MB)")

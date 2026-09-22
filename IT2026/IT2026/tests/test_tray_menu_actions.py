@@ -35,6 +35,18 @@ def main():
     original = dict(load_tray_settings())
 
     try:
+        # ---- 0. 冻结版不得加载残留 legacy 字节码 ----
+        sys.frozen = True
+        try:
+            frozen_runtime = cui._load_legacy_module()
+        finally:
+            del sys.frozen
+        record(
+            "冻结版托盘使用当前内置实现",
+            "_build_fallback_module" in frozen_runtime.ConsentTrayApp.__qualname__,
+            f"impl={frozen_runtime.ConsentTrayApp.__qualname__}",
+        )
+
         # ---- 1. 后端链 ----
         order_source = cui._determine_dialog_backends(app)
         record("源码 auto 链 tkinter 优先", order_source[0] == "tkinter", f"order={order_source}")

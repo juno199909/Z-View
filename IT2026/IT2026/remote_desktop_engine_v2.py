@@ -1331,6 +1331,11 @@ class RemoteDesktopSession:
         self._pending_move_message: dict | None = None
         self._move_task_scheduled = False
         self._pending_move_lock = threading.Lock()
+        self._pending_drag_move_message: dict | None = None
+        self._drag_move_task_scheduled = False
+        self._pending_drag_move_lock = threading.Lock()
+        self._mouse_flow_log_interval = 0.5
+        self._last_mouse_flow_log_at = 0.0
         self.capturer = self._initialize_required_component(
             "screen_capturer",
             ScreenCapturer,
@@ -3102,7 +3107,7 @@ class RemoteDesktopSession:
         """把 PIL RGB 帧送入 H.264 编码器（自动处理分辨率/画质档位变化）。"""
         width = int(pil_image.width)
         height = int(pil_image.height)
-        # 预设画质档位（handle_settings 设置）：high→crf19 / balanced→23 / smooth→28，
+        # 预设画质档位（handle_settings 设置）：high→crf17 / balanced→22 / smooth→28，
         # custom=None 时交由 QoS 背压自适应选档
         crf_override = getattr(self, "_h264_crf_override", None)
         effective_crf = int(crf_override) if crf_override else self.QOS_LEVELS[int(self._h264_qos_level)]["crf"]
@@ -3460,6 +3465,7 @@ class RemoteDesktopSession:
         与抓帧解耦后帧率 = max(grab, encode)；本循环内的异常不再杀死采集。
         """
         while True:
+            screenshot = None
             try:
                 await self._h264_encode_wakeup.wait()
                 self._h264_encode_wakeup.clear()
@@ -3474,27 +3480,79 @@ class RemoteDesktopSession:
 
                 def _encode_job(img=screenshot):
                     scaled = self._apply_h264_scale(img)
-                    t0 = time.perf_counter()
-                    pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
-                    self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
-                    return pkts
+                    try:
+                        t0 = time.perf_counter()
+                        pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
+                        self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
+                        return pkts, int(scaled.width), int(scaled.height)
+                    finally:
+                        if scaled is not img:
+                            with contextlib.suppress(Exception):
+                                scaled.close()
 
-                packets = await asyncio.to_thread(_encode_job)
+                packets, encoded_width, encoded_height = await asyncio.to_thread(_encode_job)
                 self.h264_encode_fail_streak = 0
-                results = self._h264_results_from(packets, job["width"], job["height"])
+                results = self._h264_results_from(packets, encoded_width, encoded_height)
                 frame_size = sum(len(p["data"]) for p in packets)
                 self._enqueue_h264_frame_group(results, frame_size)
                 self.frame_count += len(results)
                 self._stats_win["frames"] += len(results)
                 self._stats_win["bytes"] += frame_size
                 self.last_frame_sent_at = time.time()
-                with contextlib.suppress(Exception):
-                    screenshot.close()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 self._log_session_event("h264_encode_loop", f"error: {type(exc).__name__} {exc}")
                 await asyncio.sleep(0.1)
+            finally:
+                if screenshot is not None:
+                    with contextlib.suppress(Exception):
+                        screenshot.close()
+
+    @staticmethod
+    def _is_high_frequency_mouse_action(action: object) -> bool:
+        return str(action or "").strip().lower() in {
+            "move",
+            "mousemove",
+            "drag_move",
+            "dragmove",
+        }
+
+    @staticmethod
+    def _is_drag_move_action(action: object) -> bool:
+        return str(action or "").strip().lower() in {"drag_move", "dragmove"}
+
+    @staticmethod
+    def _message_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _merge_drag_move_message(self, current: dict | None, incoming: dict) -> dict:
+        if current is None:
+            return dict(incoming)
+
+        merged = dict(incoming)
+        merged["delta_x"] = (
+            self._message_int(current.get("delta_x"))
+            + self._message_int(incoming.get("delta_x"))
+        )
+        merged["delta_y"] = (
+            self._message_int(current.get("delta_y"))
+            + self._message_int(incoming.get("delta_y"))
+        )
+        return merged
+
+    def _should_log_mouse_flow(self, action: object) -> bool:
+        if not self._is_high_frequency_mouse_action(action):
+            return True
+
+        now = time.monotonic()
+        if now - self._last_mouse_flow_log_at >= self._mouse_flow_log_interval:
+            self._last_mouse_flow_log_at = now
+            return True
+        return False
 
     def handle_mouse_in_executor(self, message: dict):
         """把鼠标处理调度到输入专用线程，避免阻塞事件循环。"""
@@ -3532,6 +3590,40 @@ class RemoteDesktopSession:
                         )
 
             loop.run_in_executor(self._input_executor, _drain_moves)
+            return
+
+        # Drag uses relative deltas. Keep their total displacement while an earlier
+        # injection is running, so a busy helper cannot make a held pointer trail.
+        if self._is_drag_move_action(action_name):
+            with self._pending_drag_move_lock:
+                self._pending_drag_move_message = self._merge_drag_move_message(
+                    self._pending_drag_move_message,
+                    message,
+                )
+                if self._drag_move_task_scheduled:
+                    return
+                self._drag_move_task_scheduled = True
+
+            def _drain_drag_moves():
+                while True:
+                    with self._pending_drag_move_lock:
+                        pending = self._pending_drag_move_message
+                        self._pending_drag_move_message = None
+                        if pending is None:
+                            self._drag_move_task_scheduled = False
+                            loop.call_soon_threadsafe(self._capture_wakeup.set)
+                            return
+                    try:
+                        _t0 = time.perf_counter()
+                        self.handle_mouse(pending)
+                        self._note_input_inj_ms((time.perf_counter() - _t0) * 1000.0)
+                    except Exception as exc:
+                        self._log_session_event(
+                            "input_executor",
+                            f"drag move failed type={type(exc).__name__} error={exc}",
+                        )
+
+            loop.run_in_executor(self._input_executor, _drain_drag_moves)
             return
 
         def _safe_mouse():
@@ -3605,17 +3697,18 @@ class RemoteDesktopSession:
                 self.last_input_at = time.time()
                 # 输入唤醒：立即抓帧反馈，不等下一节拍
                 self._capture_wakeup.set()
-                log_remote_desktop_flow(
-                    self.session_id,
-                    "handle_control_mouse",
-                    (
-                        f"action={message.get('action')} button={message.get('button')} "
-                        f"buttons={message.get('buttons')} "
-                        f"normalized=({message.get('normalized_x')},{message.get('normalized_y')}) "
-                        f"delta=({message.get('delta_x')},{message.get('delta_y')}) "
-                        f"wheel={message.get('wheel_steps')}"
-                    ),
-                )
+                if not self._is_high_frequency_mouse_action(message.get('action')):
+                    log_remote_desktop_flow(
+                        self.session_id,
+                        "handle_control_mouse",
+                        (
+                            f"action={message.get('action')} button={message.get('button')} "
+                            f"buttons={message.get('buttons')} "
+                            f"normalized=({message.get('normalized_x')},{message.get('normalized_y')}) "
+                            f"delta=({message.get('delta_x')},{message.get('delta_y')}) "
+                            f"wheel={message.get('wheel_steps')}"
+                        ),
+                    )
                 self.handle_mouse_in_executor(message)
             elif msg_type == 'keyboard':
                 self.last_input_at = time.time()
@@ -3694,8 +3787,8 @@ class RemoteDesktopSession:
 
     async def handle_settings(self, message: dict):
         """处理远程桌面会话设置。"""
-        quality = self._clamp_int(message.get('quality'), self.quality, 35, 90)
-        fps = self._clamp_int(message.get('fps'), self.fps, 4, 30)
+        quality = self._clamp_int(message.get('quality'), self.quality, 35, 95)
+        fps = self._clamp_int(message.get('fps'), self.fps, 4, 60)
         scale_percent = self._clamp_int(
             message.get('scale_percent'),
             int(round(self.scale * 100)),
@@ -3725,7 +3818,7 @@ class RemoteDesktopSession:
         self.color_preset = preset
         # P1-画质反馈修复：H264 管线此前完全忽略预设参数——
         # 预设同时驱动 H.264 CRF 档位与推流缩放上限（custom 交还 QoS 自适应）
-        self._h264_crf_override = {"high": 19, "balanced": 23, "smooth": 28}.get(preset)
+        self._h264_crf_override = {"high": 17, "balanced": 22, "smooth": 28}.get(preset)
         self._h264_scale_override = {"high": 1.0, "balanced": 0.85, "smooth": 0.7}.get(preset)
         self._log_session_event(
             "settings",
@@ -4337,17 +4430,19 @@ class RemoteDesktopSession:
             )
             return
 
-        log_remote_desktop_flow(
-            self.session_id,
-            "handle_mouse_parse",
-            (
-                f"action={mouse_message.action.value} button={mouse_message.button.value} "
-                f"normalized=({mouse_message.normalized_x:.4f},{mouse_message.normalized_y:.4f}) "
-                f"buttons_mask={mouse_message.buttons_mask} "
-                f"delta=({mouse_message.delta_x},{mouse_message.delta_y}) "
-                f"wheel_steps={mouse_message.wheel_steps}"
-            ),
-        )
+        log_mouse_flow = self._should_log_mouse_flow(mouse_message.action.value)
+        if log_mouse_flow:
+            log_remote_desktop_flow(
+                self.session_id,
+                "handle_mouse_parse",
+                (
+                    f"action={mouse_message.action.value} button={mouse_message.button.value} "
+                    f"normalized=({mouse_message.normalized_x:.4f},{mouse_message.normalized_y:.4f}) "
+                    f"buttons_mask={mouse_message.buttons_mask} "
+                    f"delta=({mouse_message.delta_x},{mouse_message.delta_y}) "
+                    f"wheel_steps={mouse_message.wheel_steps}"
+                ),
+            )
 
         self.coordinate_mapper.refresh_metrics()
         self.mouse_state.remember_position(
@@ -4359,24 +4454,26 @@ class RemoteDesktopSession:
             mouse_message.normalized_x,
             mouse_message.normalized_y
         )
-        log_remote_desktop_flow(
-            self.session_id,
-            "handle_mouse_denormalize",
-            f"screen=({screen_x},{screen_y})",
-        )
+        if log_mouse_flow:
+            log_remote_desktop_flow(
+                self.session_id,
+                "handle_mouse_denormalize",
+                f"screen=({screen_x},{screen_y})",
+            )
 
         events = self._build_mouse_events(mouse_message, screen_x, screen_y)
         for event in events:
-            log_remote_desktop_flow(
-                self.session_id,
-                "handle_mouse_dispatch",
-                (
-                    f"type={event.type.value} button={event.button.value} "
-                    f"target=({event.x},{event.y}) "
-                    f"normalized=({event.normalized_x},{event.normalized_y}) "
-                    f"delta={event.delta}"
-                ),
-            )
+            if log_mouse_flow:
+                log_remote_desktop_flow(
+                    self.session_id,
+                    "handle_mouse_dispatch",
+                    (
+                        f"type={event.type.value} button={event.button.value} "
+                        f"target=({event.x},{event.y}) "
+                        f"normalized=({event.normalized_x},{event.normalized_y}) "
+                        f"delta={event.delta}"
+                    ),
+                )
             self.input_injector.inject_mouse_event(event)
 
     def _build_mouse_events(self, mouse_message, screen_x: int, screen_y: int) -> list[MouseEvent]:

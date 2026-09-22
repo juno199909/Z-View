@@ -508,6 +508,17 @@ class TestEngineMouseStateMachine(unittest.TestCase):
         self.assertEqual((events[0].x, events[0].y), (1060, 490))
         self.assertFalse(session.mouse_state.drag_in_progress or False)
 
+    def test_drag_message_merge_preserves_total_relative_delta(self):
+        from remote_desktop_engine_v2 import RemoteDesktopSession
+
+        session = RemoteDesktopSession.__new__(RemoteDesktopSession)
+        merged = session._merge_drag_move_message(
+            {"action": "drag_move", "delta_x": 7, "delta_y": -3},
+            {"action": "drag_move", "delta_x": "5", "delta_y": 9, "normalized_x": 0.7},
+        )
+        self.assertEqual((merged["delta_x"], merged["delta_y"]), (12, 6))
+        self.assertEqual(merged["normalized_x"], 0.7)
+
     def test_wheel_event_target(self):
         session = make_engine_session(self.GEOMETRY)
         wheel = parse_mouse_message({"action": "wheel", "wheel_steps": 2, "normalized_x": 0.5, "normalized_y": 0.5})

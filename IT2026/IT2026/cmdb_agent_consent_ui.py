@@ -73,6 +73,31 @@ IDM_EXIT = 2006
 MB_ICONWARNING = 0x00000030
 
 
+def _resolve_exit_verify_tls_setting(config: dict):
+    raw_insecure = str(
+        config.get("allow_insecure_tls")
+        or os.environ.get("ZVIEW_AGENT_ALLOW_INSECURE_TLS")
+        or ""
+    ).strip().lower()
+    if raw_insecure in ("1", "true", "yes", "on"):
+        return False
+
+    candidates = [
+        config.get("ca_bundle"),
+        config.get("ca_bundle_path"),
+        os.environ.get("ZVIEW_AGENT_CA_BUNDLE"),
+        Path(os.environ.get("ProgramData", ".")) / "CMDB-Agent" / "runtime" / "ca-bundle.pem",
+        Path(sys.executable).parent / "ca-bundle.pem",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+    return True
+
+
 def _launch_agent_stop_via_uac() -> bool:
     """托盘退出代理：UAC 提权拉起 --stop-agent，完整停止服务与会话进程。
 
@@ -101,16 +126,12 @@ def _post_exit_verify(password: str) -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     import requests as _requests
-    try:
-        import urllib3
-        urllib3.disable_warnings()
-    except Exception:
-        pass
+    verify_tls = _resolve_exit_verify_tls_setting(config)
     try:
         resp = _requests.post(
             f"{server_url}/api/v1/agent/exit/verify",
             json={"password": password}, headers=headers,
-            timeout=8, verify=False,
+            timeout=8, verify=verify_tls,
         )
     except Exception as exc:
         raise RuntimeError("无法连接管理中心，无法验证退出密码。") from exc
@@ -282,6 +303,14 @@ def _candidate_icon_paths() -> list[Path]:
 
 
 def _load_legacy_module():
+    # Installed agents used to keep a sidecar ``*.legacy.pyc`` while migrating
+    # from the old layout.  An overlay upgrade does not necessarily remove that
+    # file, so loading it in a frozen build can silently resurrect an older tray
+    # implementation.  The current module contains a maintained fallback that
+    # is self-contained in the executable; production builds must always use it.
+    if getattr(sys, "frozen", False):
+        return _build_fallback_module()
+
     for candidate in _candidate_legacy_paths():
         if not candidate.exists():
             continue
@@ -505,6 +534,22 @@ def _build_fallback_module():
             class POINT(ctypes.Structure):
                 _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
+            class MENUITEMINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.UINT),
+                    ("fMask", wintypes.UINT),
+                    ("fType", wintypes.UINT),
+                    ("fState", wintypes.UINT),
+                    ("wID", wintypes.UINT),
+                    ("hSubMenu", wintypes.HANDLE),
+                    ("hbmpChecked", wintypes.HANDLE),
+                    ("hbmpUnchecked", wintypes.HANDLE),
+                    ("dwItemData", ctypes.c_size_t),
+                    ("dwTypeData", wintypes.LPWSTR),
+                    ("cch", wintypes.UINT),
+                    ("hbmpItem", wintypes.HANDLE),
+                ]
+
             NIM_ADD = 0x00000000
             NIM_MODIFY = 0x00000001
             NIM_DELETE = 0x00000002
@@ -522,10 +567,14 @@ def _build_fallback_module():
             WM_APP = 0x8000
             IMAGE_ICON = 1
             LR_LOADFROMFILE = 0x00000010
-            MF_STRING = 0x00000000
-            MF_SEPARATOR = 0x00000800
-            MF_CHECKED = 0x00000008
-            MF_GRAYED = 0x00000003  # 灰显不可点击（信息展示用）
+            MFT_STRING = 0x00000000
+            MFT_SEPARATOR = 0x00000800
+            MFS_CHECKED = 0x00000008
+            MFS_DISABLED = 0x00000003
+            MIIM_STATE = 0x00000001
+            MIIM_ID = 0x00000002
+            MIIM_STRING = 0x00000040
+            MIIM_FTYPE = 0x00000100
             TPM_RIGHTBUTTON = 0x0002
             TPM_NONOTIFY = 0x0080
             TPM_RETURNCMD = 0x0100
@@ -570,12 +619,13 @@ def _build_fallback_module():
             user32.LoadIconW.restype = wintypes.HANDLE
             user32.DestroyIcon.argtypes = [wintypes.HANDLE]
             user32.CreatePopupMenu.restype = wintypes.HANDLE
-            user32.AppendMenuW.argtypes = [
+            user32.InsertMenuItemW.argtypes = [
                 wintypes.HANDLE,
                 wintypes.UINT,
-                ctypes.c_size_t,
-                wintypes.LPCWSTR,
+                wintypes.BOOL,
+                ctypes.POINTER(MENUITEMINFOW),
             ]
+            user32.InsertMenuItemW.restype = wintypes.BOOL
             user32.TrackPopupMenu.argtypes = [
                 wintypes.HANDLE,
                 wintypes.UINT,
@@ -637,33 +687,55 @@ def _build_fallback_module():
             def build_context_menu(hwnd):
                 menu = user32.CreatePopupMenu()
                 if not menu:
-                    return None
+                    return None, None
                 settings = load_tray_settings()
-                allow_checked = MF_CHECKED if settings.get("allow_remote_requests", True) else MF_STRING
-                skip_checked = MF_CHECKED if settings.get("skip_consent_for_session") else MF_STRING
-                balloon_checked = MF_CHECKED if settings.get("show_balloon_notifications", True) else MF_STRING
-                uac_checked = MF_CHECKED if settings.get("allow_secure_desktop_input", True) else MF_STRING
                 version_text = _tray_agent_version_text()
-                user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
-                                   f"Z-View Agent {version_text}".rstrip())
-                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-                user32.AppendMenuW(menu, MF_STRING, IDM_MACHINE_INFO, "查看本机信息(&I)")
-                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-                user32.AppendMenuW(menu, MF_STRING | allow_checked, IDM_TOGGLE_ALLOW_REQUESTS, "允许远程控制请求")
-                user32.AppendMenuW(menu, MF_STRING | skip_checked, IDM_TOGGLE_SKIP_CONSENT, "本机免确认（自动允许）")
-                user32.AppendMenuW(
-                    menu, MF_STRING | balloon_checked, IDM_TOGGLE_BALLOON, "请求到达时弹出气泡提醒"
-                )
-                user32.AppendMenuW(
-                    menu, MF_STRING | uac_checked, IDM_TOGGLE_UAC_INPUT, "允许远程操作 UAC 提示"
-                )
-                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-                user32.AppendMenuW(menu, MF_STRING, IDM_ABOUT, "关于 Z-View…")
-                user32.AppendMenuW(menu, MF_STRING, IDM_EXIT, "退出代理(&X)")
-                return menu
+                items = [
+                    ("text", 0, f"Z-View Agent {version_text}".rstrip(), MFS_DISABLED),
+                    ("separator", 0, "", 0),
+                    ("text", IDM_MACHINE_INFO, "查看本机信息(&I)", 0),
+                    ("separator", 0, "", 0),
+                    ("text", IDM_TOGGLE_ALLOW_REQUESTS, "允许远程控制请求",
+                     MFS_CHECKED if settings.get("allow_remote_requests", True) else 0),
+                    ("text", IDM_TOGGLE_SKIP_CONSENT, "本机免确认（自动允许）",
+                     MFS_CHECKED if settings.get("skip_consent_for_session") else 0),
+                    ("text", IDM_TOGGLE_BALLOON, "请求到达时弹出气泡提醒",
+                     MFS_CHECKED if settings.get("show_balloon_notifications", True) else 0),
+                    ("text", IDM_TOGGLE_UAC_INPUT, "允许远程操作 UAC 提示",
+                     MFS_CHECKED if settings.get("allow_secure_desktop_input", True) else 0),
+                    ("separator", 0, "", 0),
+                    ("text", IDM_ABOUT, "关于 Z-View…", 0),
+                    ("text", IDM_EXIT, "退出代理(&X)", 0),
+                ]
+                # AppendMenuW accepts transient Python strings on most systems, but
+                # some migrated Windows builds render those entries with no text.
+                # InsertMenuItemW receives an explicit Unicode buffer, retained until
+                # the menu closes, so the native control always owns valid text.
+                text_buffers = []
+                for index, (kind, command_id, label, state) in enumerate(items):
+                    item = MENUITEMINFOW()
+                    item.cbSize = ctypes.sizeof(MENUITEMINFOW)
+                    item.fMask = MIIM_FTYPE | MIIM_STATE
+                    item.fType = MFT_SEPARATOR if kind == "separator" else MFT_STRING
+                    item.fState = state
+                    if kind == "text":
+                        buffer = ctypes.create_unicode_buffer(label)
+                        text_buffers.append(buffer)
+                        item.fMask |= MIIM_ID | MIIM_STRING
+                        item.wID = command_id
+                        item.dwTypeData = ctypes.cast(buffer, wintypes.LPWSTR)
+                        item.cch = len(label)
+                    if not user32.InsertMenuItemW(menu, index, True, ctypes.byref(item)):
+                        error = ctypes.get_last_error()
+                        _append_consent_runtime_log(
+                            f"tray menu insert failed: index={index} command={command_id} error={error}"
+                        )
+                        user32.DestroyMenu(menu)
+                        return None, None
+                return menu, text_buffers
 
             def show_context_menu(hwnd):
-                menu = build_context_menu(hwnd)
+                menu, text_buffers = build_context_menu(hwnd)
                 if not menu:
                     return
                 point = POINT()
@@ -685,6 +757,9 @@ def _build_fallback_module():
                     user32.DestroyMenu(menu)
                 except Exception:
                     pass
+                # Keep explicit Unicode buffers alive until Windows has dismissed
+                # the popup and finished consuming every menu item.
+                del text_buffers
 
                 if chosen == IDM_MACHINE_INFO:
                     show_machine_info()
@@ -2045,4 +2120,3 @@ ConsentTrayApp._show_tray_balloon = _show_tray_balloon
 ConsentTrayApp._tray_show_machine_info = _tray_show_machine_info
 ConsentTrayApp._tray_collect_machine_info = _tray_collect_machine_info
 ConsentTrayApp._tray_apply_toggle = _tray_apply_toggle
-

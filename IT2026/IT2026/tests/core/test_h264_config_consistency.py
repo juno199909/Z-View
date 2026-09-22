@@ -24,7 +24,34 @@ from remote_desktop_engine_v2 import RemoteDesktopSession  # noqa: E402
 def make_session():
     s = RemoteDesktopSession.__new__(RemoteDesktopSession)
     s._h264_keyframe_requested = False
+    s._h264_stats = {"frames": 0, "bytes": 0, "drops_backpressure": 0}
     return s
+
+
+def test_hardware_bitrate_quality_mapping():
+    from Codec import h264_encoder as encoder
+
+    assert encoder._hardware_bitrate_for_crf(17) == 12_000_000
+    assert encoder._hardware_bitrate_for_crf(19) == 8_000_000
+    assert encoder._hardware_bitrate_for_crf(23) == 6_000_000
+    assert encoder._hardware_bitrate_for_crf(28) == 2_500_000
+    assert encoder._hardware_bitrate_for_crf(36) == 1_500_000
+
+
+def test_h264_results_report_encoded_dimensions():
+    session = make_session()
+    results = session._h264_results_from(
+        [{"data": b"packet", "keyframe": True}],
+        1280,
+        720,
+    )
+    assert results == [{
+        "type": "h264",
+        "data": base64.b64encode(b"packet").decode("ascii"),
+        "keyframe": True,
+        "width": 1280,
+        "height": 720,
+    }]
 
 
 # ============ P0-H5：编码队列 latest-wins 不丢关键帧 ============

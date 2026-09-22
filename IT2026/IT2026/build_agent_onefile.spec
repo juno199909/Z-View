@@ -86,7 +86,6 @@ if not backup_candidate.exists():
 for candidate in [
     project_root / "config.json",
     backup_candidate,
-    project_root / "cmdb_agent_consent_ui.legacy.pyc",
 ]:
     if candidate.exists():
         datas.append((str(candidate), "."))

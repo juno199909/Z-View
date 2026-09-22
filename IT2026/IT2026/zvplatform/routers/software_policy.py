@@ -15,8 +15,10 @@ from difflib import SequenceMatcher
 from datetime import datetime
 from auth_utils import (
     extract_bearer_token,
+    get_request_agent_auth,
     get_request_username,
     is_exempt_path,
+    require_agent_request,
     require_request_permission,
     verify_access_token,
 )
@@ -31,6 +33,13 @@ print = safe_console_print
 
 POLICY_TARGET_ONLINE_SECONDS = 90  # 原 8082 模块级常量（策略目标在线判定）
 router = APIRouter()
+
+
+def enforce_agent_asset_binding(request: Request, asset_id: int) -> None:
+    auth_info = get_request_agent_auth(request)
+    if auth_info and auth_info.get("agent_auth_type") == "device":
+        if auth_info.get("agent_id") != asset_id:
+            raise HTTPException(status_code=403, detail="Agent credential does not match this asset")
 
 
 # 批次B：原 8082 AUTH_EXEMPTIONS（/api/v1/policies/check/* GET）已并入主服务豁免清单
@@ -1302,12 +1311,15 @@ def delete_policy(policy_id: int):
 @router.get("/api/v1/policies/check/{asset_id}")
 def check_policies(
     asset_id: int,
+    request: Request,
     software_name: Optional[str] = Query(default=None),
     vendor: Optional[str] = Query(default=None),
     category: Optional[str] = Query(default=None),
     package_id: Optional[str] = Query(default=None),
 ):
     """检查软件是否符合策略（供Agent调用）"""
+    require_agent_request(request)
+    enforce_agent_asset_binding(request, asset_id)
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -1431,4 +1443,3 @@ def create_policy_log(payload: PolicyLogCreate):
 
 # 批次B：建表随主服务导入执行一次（原 8082 on_event 等价）
 init_database()
-

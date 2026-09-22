@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """1.9.56 专项 2：自 cmdb_agent_core.py 逐字迁入（#16/#10 模块化，逻辑未改）。"""
 import asyncio
-import datetime
+from datetime import datetime
+import hmac
 import os
 import threading
 import time
@@ -94,6 +95,10 @@ class RemoteDesktopServer:
         async def handler(websocket, path=None):
             self._log(f"客户端连接: {websocket.remote_address}")
             try:
+                if not self._is_authorized(websocket):
+                    self._log(f"拒绝未授权远程桌面连接: {websocket.remote_address}")
+                    await websocket.close(code=4401, reason="unauthorized")
+                    return
                 session = self._create_session(StarletteWebSocketAdapter(websocket))
                 await session.start()
             except Exception as exc:
@@ -114,6 +119,20 @@ class RemoteDesktopServer:
         except Exception as exc:
             self._log("serve 失败", exc)
             print(f"[RemoteDesktop] serve 错误: {exc}")
+
+    @staticmethod
+    def _is_authorized(websocket) -> bool:
+        expected_token = str(CONFIG.get("token") or "").strip()
+        if not expected_token:
+            return False
+        headers = getattr(websocket, "request_headers", None)
+        if headers is None:
+            request = getattr(websocket, "request", None)
+            headers = getattr(request, "headers", None)
+        authorization = str((headers or {}).get("Authorization") or "").strip()
+        if not authorization.lower().startswith("bearer "):
+            return False
+        return hmac.compare_digest(authorization[7:].strip(), expected_token)
 
     def _create_session(self, websocket):
         _load_cached_agent_policies()
@@ -148,4 +167,3 @@ def start_remote_desktop_server(wait: bool = False):
         _server_instance.serve_blocking()
     else:
         _server_instance.start()
-

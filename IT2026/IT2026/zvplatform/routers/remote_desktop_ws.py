@@ -276,12 +276,17 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
 
     ip_address = str(asset.get("ip_address") or "").strip()
     conn = get_db_connection()
+    cur = None
     try:
-        cur = conn.cursor(); cur.execute("UPDATE remote_sessions SET status='connecting' WHERE id=%s", (session_id,)); conn.commit()
+        if conn:
+            cur = conn.cursor(); cur.execute("UPDATE remote_sessions SET status='connecting' WHERE id=%s", (session_id,)); conn.commit()
     except Exception:
         pass
     finally:
-        cur.close(); conn.close()
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
     requester = f"session-{session_id}"
     upstream_url = f"ws://{ip_address}:9000/remote-desktop?requester={requester}"
@@ -296,12 +301,17 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
             await websocket.accept()
             await websocket.send_text(json.dumps({"type": "session_start", "fps": fps_limit}))
             conn = get_db_connection()
+            c2 = None
             try:
-                c2 = conn.cursor(); c2.execute("UPDATE remote_sessions SET status='connected', connected_at=NOW(), transport_type='ws-tcp' WHERE id=%s", (session_id,)); conn.commit()
+                if conn:
+                    c2 = conn.cursor(); c2.execute("UPDATE remote_sessions SET status='connected', connected_at=NOW(), transport_type='ws-tcp' WHERE id=%s", (session_id,)); conn.commit()
             except Exception:
                 pass
             finally:
-                c2.close(); conn.close()
+                if c2:
+                    c2.close()
+                if conn:
+                    conn.close()
 
             browser_to_agent_task = asyncio.create_task(relay_browser_to_agent(
                 websocket, upstream_socket, asset_id=asset_id,
@@ -331,15 +341,19 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
             await send_browser_session_error(websocket, "远程桌面服务不可用", code=1013)
     finally:
         conn = get_db_connection()
+        cur = None
         try:
-            cur = conn.cursor()
-            cur.execute("UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), disconnect_reason='relay_ended' WHERE id=%s AND status!='disconnected'", (session_id,))
-            conn.commit()
+            if conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), disconnect_reason='relay_ended' WHERE id=%s AND status!='disconnected'", (session_id,))
+                conn.commit()
         except Exception:
             pass
         finally:
-            cur.close(); conn.close()
-
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
 
 
 

@@ -86,6 +86,22 @@ def h264_available() -> bool:
     return bool(get_h264_backend_name())
 
 
+def _hardware_bitrate_for_crf(crf: int) -> int:
+    """Map the shared quality scale to stable hardware-encoder bitrates."""
+    crf = max(16, min(36, int(crf)))
+    if crf <= 17:
+        return 12_000_000
+    if crf <= 20:
+        return 8_000_000
+    if crf <= 23:
+        return 6_000_000
+    if crf <= 27:
+        return 4_000_000
+    if crf <= 31:
+        return 2_500_000
+    return 1_500_000
+
+
 def _prepend_stream_header(pkts: list[dict[str, Any]], extradata: Any) -> list[dict[str, Any]]:
     """将 extradata（SPS/PPS）前置到首个关键帧包 data 前（纯函数，可测）。
 
@@ -153,9 +169,7 @@ class H264StreamEncoder:
             }
         else:
             # 硬编按码率控制（CRF 语义不同）：质量档位映射码率
-            ctx.bit_rate = {18: 8_000_000, 22: 6_000_000, 26: 4_000_000, 32: 2_000_000}.get(
-                self._crf, 4_000_000
-            )
+            ctx.bit_rate = _hardware_bitrate_for_crf(self._crf)
             ctx.options = {"preset": "p1", "async_depth": "1"}
         self._ctx = ctx
         self._codec_name = codec_name

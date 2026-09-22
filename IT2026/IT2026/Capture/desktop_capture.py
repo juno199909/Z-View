@@ -1439,6 +1439,10 @@ class DesktopFrameCapturer:
         return time.monotonic() >= float(self._backend_retry_after.get(backend_name, 0.0))
 
     def _mark_backend_retry_after(self, backend_name: str, failure_classification: str = ""):
+        if not hasattr(self, "_backend_fail_streak"):
+            self._backend_fail_streak = {}
+        if not hasattr(self, "_backend_retry_after"):
+            self._backend_retry_after = {}
         cooldown_seconds = 1.0
         normalized_classification = self._normalize_capture_value(failure_classification)
         if backend_name == "dxgi":
@@ -1727,6 +1731,8 @@ class DesktopFrameCapturer:
         return bool(default)
 
     def _note_backend(self, backend_name: str):
+        if not hasattr(self, "_backend_fail_streak"):
+            self._backend_fail_streak = {}
         normalized_backend_name = str(backend_name or "").strip().lower()
         if self.capture_backend != normalized_backend_name:
             print(f"[RemoteDesktop] Capture backend switched: {backend_name}")
