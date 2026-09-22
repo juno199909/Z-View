@@ -113,6 +113,7 @@ AUTH_EXEMPTIONS = (
     {"path": "/api/v1/software/health", "methods": ["GET"]},
     {"pattern": "/api/v1/software/task-results/*", "methods": ["PUT"]},
     {"pattern": "/api/v1/software/task-results/*/logs", "methods": ["POST"]},
+    {"pattern": "/api/v1/policies/check/*", "methods": ["GET"]},  # 1.9.55：软件策略收敛检查（#18 批次B）
 )
 
 # 数据库配置
@@ -2039,7 +2040,9 @@ app.include_router(incidents_router)  # V1.9.0：事件列表/确认/关闭
 # ============================================================
 
 from zvplatform.routers.software_management import router as software_management_router
+from zvplatform.routers.software_policy import router as software_policy_router  # 1.9.55：软件策略（#18 批次B）
 app.include_router(software_management_router)
+app.include_router(software_policy_router)  # 1.9.55：软件策略（#18 批次B）
 
 # 网络监控路由（第一阶段：实时状态 + 历史趋势）
 from zvplatform.routers.network import router as network_router

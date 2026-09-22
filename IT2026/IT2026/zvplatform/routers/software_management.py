@@ -1213,7 +1213,7 @@ def poll_tasks(data: dict, request: Request):
 
         # 强制安装策略持续收敛：领任务前检查该终端是否缺策略要求的软件，缺则补建任务
         try:
-            from software_policy_api import enforce_force_install_convergence
+            from zvplatform.routers.software_policy import enforce_force_install_convergence
             if enforce_force_install_convergence(cursor, asset_id) > 0:
                 conn.commit()
         except Exception as conv_exc:
