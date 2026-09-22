@@ -1280,6 +1280,7 @@ class RemoteDesktopSession:
         )
         self.capture_host_backend = ""
         self.capture_host_session_id: int | None = None
+        self.capture_backend_preference = "auto"
         self.service_managed_session_routing = self.service_client is not None
         self.capture_stack = create_capture_stack(
             runtime_mode=self.capture_runtime_mode,
@@ -1331,6 +1332,11 @@ class RemoteDesktopSession:
         self._pending_move_message: dict | None = None
         self._move_task_scheduled = False
         self._pending_move_lock = threading.Lock()
+        self._pending_drag_move_message: dict | None = None
+        self._drag_move_task_scheduled = False
+        self._pending_drag_move_lock = threading.Lock()
+        self._mouse_flow_log_interval = 0.5
+        self._last_mouse_flow_log_at = 0.0
         self.capturer = self._initialize_required_component(
             "screen_capturer",
             ScreenCapturer,
@@ -1427,6 +1433,22 @@ class RemoteDesktopSession:
         self.h264_activated_at = 0.0  # H.264 激活时间：用于检测观看端是否真的在消费（旧版前端兼容降级）
         self._h264_scale = 1.0  # 动态分辨率：弱机自动降采样保帧率
         self._h264_encode_ms_avg = 0.0  # 编码耗时 EMA
+        self._h264_input_ms_avg = 0.0
+        self._h264_convert_ms_avg = 0.0
+        self._h264_codec_ms_avg = 0.0
+        self._h264_encoder_backend = ""
+        self._h264_encoder_hardware = False
+        self._h264_bitrate_bps = 0
+        # Optional native path: WGC/DXGI texture -> GPU NV12 -> NVENC.  It is
+        # opened only after ABI/capability validation and otherwise falls back
+        # to the existing PyAV path without changing session behavior.
+        self.native_gpu_bridge = None
+        self._native_gpu_bridge_disabled = False
+        self._native_gpu_bridge_reset_attempted = False
+        # Export the optional native path's decision to the observer.  Without
+        # this, a safe fallback to PyAV is indistinguishable from a bridge that
+        # was never included in the package.
+        self._native_gpu_bridge_status = "not_attempted"
 
         # QoS 动态码率：ACK 速率滑动窗口 + 迟滞升降档
         from collections import deque
@@ -1548,6 +1570,7 @@ class RemoteDesktopSession:
             service_payload = {
                 "quality": profile["quality"],
                 "scale": effective_scale,
+                "capture_backend": self.capture_backend_preference,
                 "previous_signature": self.last_frame_signature,
                 "include_desktop_state": include_diagnostics,
                 "include_backend_diagnostics": include_diagnostics,
@@ -2064,6 +2087,7 @@ class RemoteDesktopSession:
             'wheel_speed': self.wheel_speed,
             'mouse_sensitivity': self.mouse_sensitivity,
             'preset': self.color_preset,
+            'capture_backend': self.capture_backend_preference,
             'desktop_width': desktop_mode['width'],
             'desktop_height': desktop_mode['height'],
             'runtime_stack': self.runtime_stack,
@@ -3048,9 +3072,10 @@ class RemoteDesktopSession:
             return
         try:
             from Codec.h264_encoder import h264_available
-            if h264_available():
+            native_bridge_ready = self._maybe_open_native_gpu_bridge()
+            if native_bridge_ready or h264_available():
                 from Codec.h264_encoder import get_h264_backend_name
-                backend_name = get_h264_backend_name()
+                backend_name = "native_d3d11_nvenc" if native_bridge_ready else get_h264_backend_name()
                 self.h264_active = True
                 self._h264_keyframe_requested = True
                 self.h264_activated_at = time.time()
@@ -3073,12 +3098,133 @@ class RemoteDesktopSession:
             self._log_session_event("codec", f"h264 enable failed: {exc}")
 
     def _close_h264_encoder(self):
+        self._close_native_gpu_bridge()
         try:
             if self.h264_encoder is not None:
                 self.h264_encoder.close()
         except Exception:
             pass
         self.h264_encoder = None
+
+    def _close_native_gpu_bridge(self) -> None:
+        bridge, self.native_gpu_bridge = getattr(self, "native_gpu_bridge", None), None
+        if bridge is not None:
+            with contextlib.suppress(Exception):
+                bridge.close()
+
+    def _native_gpu_bridge_backend(self) -> str:
+        preferred = str(getattr(self, "capture_backend_preference", "auto") or "auto").lower()
+        if preferred == "mss":
+            return ""
+        return preferred if preferred in {"auto", "dxgi", "wgc"} else "auto"
+
+    def _native_gpu_bridge_profile(self) -> tuple[int, int, int, int, str] | None:
+        """Return a native-only full-resolution profile, or None for PyAV fallback."""
+        backend = self._native_gpu_bridge_backend()
+        scale_override = getattr(self, "_h264_scale_override", None)
+        scale = float(scale_override) if scale_override is not None else float(getattr(self, "_h264_scale", 1.0) or 1.0)
+        if not backend or scale < 0.99:
+            return None
+        # ScreenInfo uses virtual_* keys for the capture bounds.  Looking up
+        # generic width/height made every native session ineligible even when
+        # the DXGI/PyAV path had a valid desktop.
+        width = int(self.screen_info.get("virtual_width") or self.screen_info.get("width") or 0)
+        height = int(self.screen_info.get("virtual_height") or self.screen_info.get("height") or 0)
+        if width < 2 or height < 2:
+            return None
+        crf_override = getattr(self, "_h264_crf_override", None)
+        effective_crf = int(crf_override) if crf_override else self.QOS_LEVELS[int(self._h264_qos_level)]["crf"]
+        from Codec.h264_encoder import _hardware_bitrate_for_crf
+        return width, height, max(1, int(self.fps)), _hardware_bitrate_for_crf(effective_crf), backend
+
+    def _maybe_open_native_gpu_bridge(self) -> bool:
+        if self.native_gpu_bridge is not None:
+            return True
+        if self._native_gpu_bridge_disabled:
+            return False
+        profile = self._native_gpu_bridge_profile()
+        if profile is None:
+            self._native_gpu_bridge_status = "not_eligible"
+            return False
+        try:
+            from Codec.native_gpu_media_bridge import NativeGpuMediaBridge
+            width, height, fps, bitrate_bps, backend = profile
+            self.native_gpu_bridge = NativeGpuMediaBridge.open(
+                width=width,
+                height=height,
+                fps=fps,
+                bitrate_bps=bitrate_bps,
+                capture_backend=backend,
+            )
+            self._native_gpu_bridge_reset_attempted = False
+            self._native_gpu_bridge_status = f"enabled:{self.native_gpu_bridge.library_path.name}"
+            self._h264_encoder_backend = "native_d3d11_nvenc"
+            self._h264_encoder_hardware = True
+            self._log_session_event(
+                "native_gpu_bridge",
+                f"enabled backend={backend} resolution={width}x{height} fps={fps} "
+                f"library={self.native_gpu_bridge.library_path}",
+            )
+            return True
+        except Exception as exc:
+            self._native_gpu_bridge_disabled = True
+            self._native_gpu_bridge_status = f"unavailable:{type(exc).__name__}:{exc}"
+            self._log_session_event("native_gpu_bridge", f"unavailable error={exc}")
+            return False
+
+    def _disable_native_gpu_bridge(self, reason: str) -> None:
+        self._close_native_gpu_bridge()
+        self._native_gpu_bridge_disabled = True
+        self._native_gpu_bridge_status = f"fallback:{reason}"
+        self._log_session_event("native_gpu_bridge", f"fallback_to_pyav reason={reason}")
+
+    def _note_native_gpu_bridge_metrics(self, frame) -> None:
+        self._h264_encoder_backend = "native_d3d11_nvenc"
+        self._h264_encoder_hardware = True
+        for value, attribute in (
+            (float(frame.capture_ms), "_capture_grab_ms_avg"),
+            (0.0, "_h264_input_ms_avg"),
+            (float(frame.convert_ms), "_h264_convert_ms_avg"),
+            (float(frame.encode_ms), "_h264_codec_ms_avg"),
+        ):
+            previous = float(getattr(self, attribute, 0.0) or 0.0)
+            setattr(self, attribute, round(previous * 0.7 + value * 0.3, 1) if previous else round(value, 1))
+        self._note_h264_encode_ms(float(frame.convert_ms) + float(frame.encode_ms))
+
+    def _capture_frame_via_native_gpu_bridge(self) -> dict | None:
+        bridge = self.native_gpu_bridge
+        if bridge is None:
+            return None
+        keyframe = bool(self._h264_keyframe_requested)
+        try:
+            frame = bridge.capture_encode(force_keyframe=keyframe)
+        except Exception as exc:
+            # A single reset handles transient access/device loss.  Any second
+            # failure closes the bridge and resumes WGC/DXGI/MSS + PyAV.
+            if not self._native_gpu_bridge_reset_attempted:
+                self._native_gpu_bridge_reset_attempted = True
+                try:
+                    bridge.reset()
+                    self._h264_keyframe_requested = True
+                    self._log_session_event("native_gpu_bridge", f"reset_after_error error={exc}")
+                    return {"encoding_scheduled": True, "captured_at": time.time(), "capture_context": {}}
+                except Exception as reset_exc:
+                    exc = RuntimeError(f"{exc}; reset={reset_exc}")
+            self._disable_native_gpu_bridge(str(exc))
+            return None
+        self._native_gpu_bridge_reset_attempted = False
+        self._note_native_gpu_bridge_metrics(frame)
+        if not frame.packets:
+            return {"encoding_scheduled": True, "captured_at": time.time(), "capture_context": {}}
+        self._h264_keyframe_requested = False
+        results = self._h264_results_from(frame.packets, frame.width, frame.height)
+        self.h264_encode_fail_streak = 0
+        return {
+            "h264_packets": results,
+            "frame_size": sum(len(packet["data"]) for packet in frame.packets),
+            "captured_at": time.time(),
+            "capture_context": {},
+        }
 
     def _request_h264_keyframe(self):
         self._h264_keyframe_requested = True
@@ -3102,7 +3248,7 @@ class RemoteDesktopSession:
         """把 PIL RGB 帧送入 H.264 编码器（自动处理分辨率/画质档位变化）。"""
         width = int(pil_image.width)
         height = int(pil_image.height)
-        # 预设画质档位（handle_settings 设置）：high→crf19 / balanced→23 / smooth→28，
+        # 预设画质档位（handle_settings 设置）：high→crf17 / balanced→22 / smooth→28，
         # custom=None 时交由 QoS 背压自适应选档
         crf_override = getattr(self, "_h264_crf_override", None)
         effective_crf = int(crf_override) if crf_override else self.QOS_LEVELS[int(self._h264_qos_level)]["crf"]
@@ -3187,6 +3333,30 @@ class RemoteDesktopSession:
         prev = float(getattr(self, "_h264_encode_ms_avg", 0.0) or 0.0)
         self._h264_encode_ms_avg = round(prev * 0.7 + ms * 0.3, 1) if prev else round(ms, 1)
 
+    def _note_h264_stage_metrics(self) -> None:
+        """Keep CPU frame conversion and the codec invocation separately observable."""
+        encoder = getattr(self, "h264_encoder", None)
+        metrics = getattr(encoder, "last_metrics", {}) if encoder is not None else {}
+        if not isinstance(metrics, dict):
+            return
+        self._h264_encoder_backend = str(metrics.get("backend") or "")
+        self._h264_encoder_hardware = bool(metrics.get("hardware", False))
+        try:
+            self._h264_bitrate_bps = int(metrics.get("bitrate_bps") or getattr(encoder, "target_bitrate_bps", 0) or 0)
+        except (TypeError, ValueError):
+            self._h264_bitrate_bps = 0
+        for key, attribute in (
+            ("input_ms", "_h264_input_ms_avg"),
+            ("convert_ms", "_h264_convert_ms_avg"),
+            ("codec_ms", "_h264_codec_ms_avg"),
+        ):
+            try:
+                value = float(metrics.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            previous = float(getattr(self, attribute, 0.0) or 0.0)
+            setattr(self, attribute, round(previous * 0.7 + value * 0.3, 1) if previous else round(value, 1))
+
     def _note_input_inj_ms(self, ms: float) -> None:
         """P0 监测：输入注入耗时 EMA（收到控制消息 → SendInput 完成）。"""
         prev = float(self._input_inj_ms_avg or 0.0)
@@ -3229,6 +3399,11 @@ class RemoteDesktopSession:
                     f"frame_kb={frame_kb:.1f} net_kbps={net_kbps:.0f} "
                     f"inflight={inflight} ack_rate={ack_rate:.1f} ack_rtt_ms={self._ack_rtt_ms_avg} "
                     f"enc_ms={float(getattr(self, '_h264_encode_ms_avg', 0.0) or 0.0)} "
+                    f"enc_backend={self._h264_encoder_backend or 'unknown'} "
+                    f"bitrate_bps={self._h264_bitrate_bps} "
+                    f"enc_input_ms={self._h264_input_ms_avg} enc_convert_ms={self._h264_convert_ms_avg} "
+                    f"enc_codec_ms={self._h264_codec_ms_avg} "
+                    f"native_bridge={self._native_gpu_bridge_status} "
                     f"input_inj_ms={self._input_inj_ms_avg} "
                     f"drops_bp={self._h264_stats['drops_backpressure']} "
                     f"frames_total={self._h264_stats['frames']} "
@@ -3240,6 +3415,13 @@ class RemoteDesktopSession:
                 "type": "pipeline_stats",
                 "capture_ms": self._capture_grab_ms_avg,
                 "encode_ms": float(getattr(self, "_h264_encode_ms_avg", 0.0) or 0.0),
+                "encode_input_ms": self._h264_input_ms_avg,
+                "encode_convert_ms": self._h264_convert_ms_avg,
+                "encode_codec_ms": self._h264_codec_ms_avg,
+                "encoder_backend": self._h264_encoder_backend or None,
+                "encoder_hardware": self._h264_encoder_hardware,
+                "bitrate_bps": self._h264_bitrate_bps,
+                "native_bridge": self._native_gpu_bridge_status,
                 "queue_depth": len(self._h264_encode_queue),
                 "sent_fps": round(fps_actual, 1),
                 "fps_req": profile["fps"],
@@ -3363,6 +3545,11 @@ class RemoteDesktopSession:
         抓帧带超时：session 0 无头桌面上 mss/GDI 可能永久阻塞（84 号 0 帧率根因），
         超时即回退服务助手路径。编码由 _h264_encode_loop 异步消费（latest-wins）。
         """
+        if self._maybe_open_native_gpu_bridge():
+            native_result = await asyncio.to_thread(self._capture_frame_via_native_gpu_bridge)
+            if native_result is not None:
+                return native_result
+
         grab_t0 = time.perf_counter()
         try:
             screenshot = await asyncio.wait_for(
@@ -3460,6 +3647,7 @@ class RemoteDesktopSession:
         与抓帧解耦后帧率 = max(grab, encode)；本循环内的异常不再杀死采集。
         """
         while True:
+            screenshot = None
             try:
                 await self._h264_encode_wakeup.wait()
                 self._h264_encode_wakeup.clear()
@@ -3474,27 +3662,80 @@ class RemoteDesktopSession:
 
                 def _encode_job(img=screenshot):
                     scaled = self._apply_h264_scale(img)
-                    t0 = time.perf_counter()
-                    pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
-                    self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
-                    return pkts
+                    try:
+                        t0 = time.perf_counter()
+                        pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
+                        self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
+                        self._note_h264_stage_metrics()
+                        return pkts, int(scaled.width), int(scaled.height)
+                    finally:
+                        if scaled is not img:
+                            with contextlib.suppress(Exception):
+                                scaled.close()
 
-                packets = await asyncio.to_thread(_encode_job)
+                packets, encoded_width, encoded_height = await asyncio.to_thread(_encode_job)
                 self.h264_encode_fail_streak = 0
-                results = self._h264_results_from(packets, job["width"], job["height"])
+                results = self._h264_results_from(packets, encoded_width, encoded_height)
                 frame_size = sum(len(p["data"]) for p in packets)
                 self._enqueue_h264_frame_group(results, frame_size)
                 self.frame_count += len(results)
                 self._stats_win["frames"] += len(results)
                 self._stats_win["bytes"] += frame_size
                 self.last_frame_sent_at = time.time()
-                with contextlib.suppress(Exception):
-                    screenshot.close()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 self._log_session_event("h264_encode_loop", f"error: {type(exc).__name__} {exc}")
                 await asyncio.sleep(0.1)
+            finally:
+                if screenshot is not None:
+                    with contextlib.suppress(Exception):
+                        screenshot.close()
+
+    @staticmethod
+    def _is_high_frequency_mouse_action(action: object) -> bool:
+        return str(action or "").strip().lower() in {
+            "move",
+            "mousemove",
+            "drag_move",
+            "dragmove",
+        }
+
+    @staticmethod
+    def _is_drag_move_action(action: object) -> bool:
+        return str(action or "").strip().lower() in {"drag_move", "dragmove"}
+
+    @staticmethod
+    def _message_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _merge_drag_move_message(self, current: dict | None, incoming: dict) -> dict:
+        if current is None:
+            return dict(incoming)
+
+        merged = dict(incoming)
+        merged["delta_x"] = (
+            self._message_int(current.get("delta_x"))
+            + self._message_int(incoming.get("delta_x"))
+        )
+        merged["delta_y"] = (
+            self._message_int(current.get("delta_y"))
+            + self._message_int(incoming.get("delta_y"))
+        )
+        return merged
+
+    def _should_log_mouse_flow(self, action: object) -> bool:
+        if not self._is_high_frequency_mouse_action(action):
+            return True
+
+        now = time.monotonic()
+        if now - self._last_mouse_flow_log_at >= self._mouse_flow_log_interval:
+            self._last_mouse_flow_log_at = now
+            return True
+        return False
 
     def handle_mouse_in_executor(self, message: dict):
         """把鼠标处理调度到输入专用线程，避免阻塞事件循环。"""
@@ -3532,6 +3773,40 @@ class RemoteDesktopSession:
                         )
 
             loop.run_in_executor(self._input_executor, _drain_moves)
+            return
+
+        # Drag uses relative deltas. Keep their total displacement while an earlier
+        # injection is running, so a busy helper cannot make a held pointer trail.
+        if self._is_drag_move_action(action_name):
+            with self._pending_drag_move_lock:
+                self._pending_drag_move_message = self._merge_drag_move_message(
+                    self._pending_drag_move_message,
+                    message,
+                )
+                if self._drag_move_task_scheduled:
+                    return
+                self._drag_move_task_scheduled = True
+
+            def _drain_drag_moves():
+                while True:
+                    with self._pending_drag_move_lock:
+                        pending = self._pending_drag_move_message
+                        self._pending_drag_move_message = None
+                        if pending is None:
+                            self._drag_move_task_scheduled = False
+                            loop.call_soon_threadsafe(self._capture_wakeup.set)
+                            return
+                    try:
+                        _t0 = time.perf_counter()
+                        self.handle_mouse(pending)
+                        self._note_input_inj_ms((time.perf_counter() - _t0) * 1000.0)
+                    except Exception as exc:
+                        self._log_session_event(
+                            "input_executor",
+                            f"drag move failed type={type(exc).__name__} error={exc}",
+                        )
+
+            loop.run_in_executor(self._input_executor, _drain_drag_moves)
             return
 
         def _safe_mouse():
@@ -3605,17 +3880,18 @@ class RemoteDesktopSession:
                 self.last_input_at = time.time()
                 # 输入唤醒：立即抓帧反馈，不等下一节拍
                 self._capture_wakeup.set()
-                log_remote_desktop_flow(
-                    self.session_id,
-                    "handle_control_mouse",
-                    (
-                        f"action={message.get('action')} button={message.get('button')} "
-                        f"buttons={message.get('buttons')} "
-                        f"normalized=({message.get('normalized_x')},{message.get('normalized_y')}) "
-                        f"delta=({message.get('delta_x')},{message.get('delta_y')}) "
-                        f"wheel={message.get('wheel_steps')}"
-                    ),
-                )
+                if not self._is_high_frequency_mouse_action(message.get('action')):
+                    log_remote_desktop_flow(
+                        self.session_id,
+                        "handle_control_mouse",
+                        (
+                            f"action={message.get('action')} button={message.get('button')} "
+                            f"buttons={message.get('buttons')} "
+                            f"normalized=({message.get('normalized_x')},{message.get('normalized_y')}) "
+                            f"delta=({message.get('delta_x')},{message.get('delta_y')}) "
+                            f"wheel={message.get('wheel_steps')}"
+                        ),
+                    )
                 self.handle_mouse_in_executor(message)
             elif msg_type == 'keyboard':
                 self.last_input_at = time.time()
@@ -3694,8 +3970,8 @@ class RemoteDesktopSession:
 
     async def handle_settings(self, message: dict):
         """处理远程桌面会话设置。"""
-        quality = self._clamp_int(message.get('quality'), self.quality, 35, 90)
-        fps = self._clamp_int(message.get('fps'), self.fps, 4, 30)
+        quality = self._clamp_int(message.get('quality'), self.quality, 35, 95)
+        fps = self._clamp_int(message.get('fps'), self.fps, 4, 60)
         scale_percent = self._clamp_int(
             message.get('scale_percent'),
             int(round(self.scale * 100)),
@@ -3715,6 +3991,12 @@ class RemoteDesktopSession:
             preset = 'custom'
         desktop_width = self._clamp_int(message.get('desktop_width'), 0, 0, 16384)
         desktop_height = self._clamp_int(message.get('desktop_height'), 0, 0, 16384)
+        requested_capture_backend = str(
+            message.get('capture_backend', self.capture_backend_preference) or 'auto'
+        ).strip().lower()
+        if requested_capture_backend not in {'auto', 'dxgi', 'wgc', 'mss'}:
+            requested_capture_backend = 'auto'
+        capture_backend_changed = requested_capture_backend != self.capture_backend_preference
 
         self.quality = quality
         self.fps = fps
@@ -3723,21 +4005,44 @@ class RemoteDesktopSession:
         self.wheel_speed = wheel_speed
         self.mouse_sensitivity = mouse_sensitivity
         self.color_preset = preset
+        self.capture_backend_preference = requested_capture_backend
+        # The native session binds resolution, bitrate, fps and capture backend
+        # at creation. Re-open it on settings updates to keep it aligned with
+        # the negotiated profile.
+        if self.native_gpu_bridge is not None:
+            self._close_native_gpu_bridge()
+        # The viewer capabilities message is sent before settings.  A failed
+        # initial AUTO probe must not permanently suppress the explicit DXGI
+        # retry that follows in this settings message.
+        self._native_gpu_bridge_disabled = False
+        self._native_gpu_bridge_reset_attempted = False
+        self._native_gpu_bridge_status = "settings_reopen"
+        if capture_backend_changed:
+            try:
+                self.capturer.set_preferred_backend(self.capture_backend_preference)
+            except Exception as exc:
+                self._log_session_event(
+                    "capture_backend_preference",
+                    f"local_apply_failed backend={self.capture_backend_preference} error={exc}",
+                )
         # P1-画质反馈修复：H264 管线此前完全忽略预设参数——
         # 预设同时驱动 H.264 CRF 档位与推流缩放上限（custom 交还 QoS 自适应）
-        self._h264_crf_override = {"high": 19, "balanced": 23, "smooth": 28}.get(preset)
+        self._h264_crf_override = {"high": 17, "balanced": 22, "smooth": 28}.get(preset)
         self._h264_scale_override = {"high": 1.0, "balanced": 0.85, "smooth": 0.7}.get(preset)
         self._log_session_event(
             "settings",
             f"applied preset={preset} quality={self.quality} fps={self.fps} "
             f"scale={self.scale:.2f} crf_override={self._h264_crf_override} "
-            f"scale_override={self._h264_scale_override} h264_active={self.h264_active}",
+            f"scale_override={self._h264_scale_override} capture_backend={self.capture_backend_preference} "
+            f"h264_active={self.h264_active}",
         )
         self.capture_pressure = 0.0
         self.last_frame_profile_key = None
         self.last_frame_signature = None
         self.last_frame_sent_at = 0.0
         self.last_skip_log_at = 0.0
+        if capture_backend_changed:
+            self._h264_keyframe_requested = True
 
         resolution_result = None
         if desktop_width > 0 and desktop_height > 0:
@@ -3760,7 +4065,8 @@ class RemoteDesktopSession:
         print(
             f"[RemoteDesktop] Session settings updated: quality={self.quality} fps={self.fps} "
             f"scale={self.scale:.2f} adaptive={self.adaptive_streaming} "
-            f"wheel={self.wheel_speed:.2f} sensitivity={self.mouse_sensitivity:.2f} preset={self.color_preset}"
+            f"wheel={self.wheel_speed:.2f} sensitivity={self.mouse_sensitivity:.2f} preset={self.color_preset} "
+            f"capture_backend={self.capture_backend_preference}"
         )
 
         await self._send_session_settings()
@@ -4337,17 +4643,19 @@ class RemoteDesktopSession:
             )
             return
 
-        log_remote_desktop_flow(
-            self.session_id,
-            "handle_mouse_parse",
-            (
-                f"action={mouse_message.action.value} button={mouse_message.button.value} "
-                f"normalized=({mouse_message.normalized_x:.4f},{mouse_message.normalized_y:.4f}) "
-                f"buttons_mask={mouse_message.buttons_mask} "
-                f"delta=({mouse_message.delta_x},{mouse_message.delta_y}) "
-                f"wheel_steps={mouse_message.wheel_steps}"
-            ),
-        )
+        log_mouse_flow = self._should_log_mouse_flow(mouse_message.action.value)
+        if log_mouse_flow:
+            log_remote_desktop_flow(
+                self.session_id,
+                "handle_mouse_parse",
+                (
+                    f"action={mouse_message.action.value} button={mouse_message.button.value} "
+                    f"normalized=({mouse_message.normalized_x:.4f},{mouse_message.normalized_y:.4f}) "
+                    f"buttons_mask={mouse_message.buttons_mask} "
+                    f"delta=({mouse_message.delta_x},{mouse_message.delta_y}) "
+                    f"wheel_steps={mouse_message.wheel_steps}"
+                ),
+            )
 
         self.coordinate_mapper.refresh_metrics()
         self.mouse_state.remember_position(
@@ -4359,24 +4667,26 @@ class RemoteDesktopSession:
             mouse_message.normalized_x,
             mouse_message.normalized_y
         )
-        log_remote_desktop_flow(
-            self.session_id,
-            "handle_mouse_denormalize",
-            f"screen=({screen_x},{screen_y})",
-        )
+        if log_mouse_flow:
+            log_remote_desktop_flow(
+                self.session_id,
+                "handle_mouse_denormalize",
+                f"screen=({screen_x},{screen_y})",
+            )
 
         events = self._build_mouse_events(mouse_message, screen_x, screen_y)
         for event in events:
-            log_remote_desktop_flow(
-                self.session_id,
-                "handle_mouse_dispatch",
-                (
-                    f"type={event.type.value} button={event.button.value} "
-                    f"target=({event.x},{event.y}) "
-                    f"normalized=({event.normalized_x},{event.normalized_y}) "
-                    f"delta={event.delta}"
-                ),
-            )
+            if log_mouse_flow:
+                log_remote_desktop_flow(
+                    self.session_id,
+                    "handle_mouse_dispatch",
+                    (
+                        f"type={event.type.value} button={event.button.value} "
+                        f"target=({event.x},{event.y}) "
+                        f"normalized=({event.normalized_x},{event.normalized_y}) "
+                        f"delta={event.delta}"
+                    ),
+                )
             self.input_injector.inject_mouse_event(event)
 
     def _build_mouse_events(self, mouse_message, screen_x: int, screen_y: int) -> list[MouseEvent]:

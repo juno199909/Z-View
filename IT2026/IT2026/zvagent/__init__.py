@@ -10,4 +10,4 @@
 """
 
 # Agent 版本号（与 cmdb_agent_core.AGENT_VERSION 同源，发布时 bump）
-__version__ = "1.9.57"
+__version__ = "1.9.72"

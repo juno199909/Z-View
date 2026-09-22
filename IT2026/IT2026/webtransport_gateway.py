@@ -18,15 +18,18 @@ import hashlib
 import json
 import logging
 import os
+import struct
 import sys
+import time
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
-from aioquic.h3.connection import H3_ALPN, H3Connection, encode_uint_var
+from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import (
     DataReceived,
+    DatagramReceived,
     HeadersReceived,
     H3Event,
     WebTransportStreamDataReceived,
@@ -35,11 +38,44 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated, QuicEvent
 
 import wt_cert
+from zvplatform.agent_client import build_agent_auth_headers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("wt-gateway")
 
 UPSTREAM_TIMEOUT = 10.0
+MEDIA_DATAGRAM_MAGIC = b"ZVMD"
+MEDIA_DATAGRAM_HEADER = struct.Struct("!4sIHH")
+MEDIA_DATAGRAM_PAYLOAD_BYTES = 1100
+MAX_MEDIA_DATAGRAM_FRAGMENTS = 512
+
+
+def split_media_datagrams(payload: bytes, frame_id: int) -> list[bytes]:
+    """Split one media frame into bounded, independently discardable datagrams."""
+    if not payload:
+        return []
+    fragment_count = (len(payload) + MEDIA_DATAGRAM_PAYLOAD_BYTES - 1) // MEDIA_DATAGRAM_PAYLOAD_BYTES
+    if fragment_count > MAX_MEDIA_DATAGRAM_FRAGMENTS:
+        raise ValueError(f"media frame requires too many datagrams: {fragment_count}")
+    return [
+        MEDIA_DATAGRAM_HEADER.pack(
+            MEDIA_DATAGRAM_MAGIC,
+            frame_id & 0xFFFFFFFF,
+            index,
+            fragment_count,
+        ) + payload[offset:offset + MEDIA_DATAGRAM_PAYLOAD_BYTES]
+        for index, offset in enumerate(range(0, len(payload), MEDIA_DATAGRAM_PAYLOAD_BYTES))
+    ]
+
+
+def is_media_frame(payload: bytes) -> bool:
+    """Only remote desktop JPEG and H.264 frames may use the lossy media path."""
+    return bool(payload) and payload[0] in (0x02, 0x03)
+
+
+def is_h264_keyframe(payload: bytes) -> bool:
+    """H.264 packets carry their keyframe bit after the 17-byte wire header."""
+    return len(payload) >= 18 and payload[0] == 0x03 and payload[17] == 1
 
 
 # ============================================================
@@ -61,6 +97,13 @@ class AgentBridge:
         self._pending_frames: list[tuple[int, bytes]] = []  # 上游未就绪时缓存早期消息
         self._upstream_task: asyncio.Task | None = None
         self._closed = False
+        self._media_frame_id = 0
+        self._media_frames_sent = 0
+        self._media_datagrams_sent = 0
+        self._media_frames_dropped = 0
+        self._media_keyframes_reliable = 0
+        self._last_stats_sent_at = 0.0
+        self._session_close_recorded = False
 
     def _buffer_agent_frame(self, frame_type: int, payload: bytes) -> None:
         """数据流未打开时缓冲 Agent 帧；防膨胀：视频帧只保留最近 2 帧。"""
@@ -78,7 +121,7 @@ class AgentBridge:
             # 冲刷数据流打开前缓冲的 Agent 帧（capabilities/最近视频帧）
             try:
                 for ftype, payload in self._pre_stream_frames:
-                    self.send_wt_data(stream_id, payload)
+                    self.send_agent_frame(stream_id, ftype, payload)
             except Exception as exc:
                 logger.warning(f"pre-stream frame flush failed: {exc}")
             self._pre_stream_frames.clear()
@@ -107,6 +150,49 @@ class AgentBridge:
         except Exception as exc:
             logger.warning(f"[{self.asset_ip}] wt→agent send failed: {exc}")
 
+    def send_agent_frame(self, stream_id: int, frame_type: int, payload: bytes) -> None:
+        """Route media over lossy datagrams and preserve reliable control ordering."""
+        if frame_type == 1 and is_media_frame(payload):
+            if is_h264_keyframe(payload):
+                try:
+                    self.proto.send_keyframe_stream(self.connect_stream_id, payload)
+                    self._media_keyframes_reliable += 1
+                    self._maybe_send_transport_stats(stream_id)
+                    return
+                except Exception as exc:
+                    logger.warning(f"[{self.asset_ip}] reliable keyframe stream failed: {exc}")
+            self._media_frame_id = (self._media_frame_id + 1) & 0xFFFFFFFF
+            try:
+                datagrams = split_media_datagrams(payload, self._media_frame_id)
+                # HTTP/3 datagrams are scoped to the WebTransport CONNECT stream,
+                # not the separate bidirectional stream used for reliable control.
+                self.proto.send_media_datagrams(self.connect_stream_id, datagrams)
+                self._media_frames_sent += 1
+                self._media_datagrams_sent += len(datagrams)
+                self._maybe_send_transport_stats(stream_id)
+                return
+            except Exception as exc:
+                self._media_frames_dropped += 1
+                logger.warning(f"[{self.asset_ip}] media datagram drop: {exc}")
+        self.proto.send_wt_data(stream_id, _encode_wire_frame(frame_type, payload))
+
+    def _maybe_send_transport_stats(self, stream_id: int) -> None:
+        now = time.monotonic()
+        if now - self._last_stats_sent_at < 1.0:
+            return
+        self._last_stats_sent_at = now
+        self.proto.send_wt_data(
+            stream_id,
+            _encode_frame(json.dumps({
+                "type": "transport_stats",
+                "transport": "wt-quic-datagram",
+                "media_frames_sent": self._media_frames_sent,
+                "media_datagrams_sent": self._media_datagrams_sent,
+                "media_frames_dropped": self._media_frames_dropped,
+                "media_keyframes_reliable": self._media_keyframes_reliable,
+            }))[0],
+        )
+
     # ---- Agent → WT ----
 
     async def _upstream_loop(self):
@@ -118,6 +204,9 @@ class AgentBridge:
             async with websockets.connect(
                 upstream_url, open_timeout=UPSTREAM_TIMEOUT, max_size=None,
                 ping_interval=None,
+                additional_headers=build_agent_auth_headers({
+                    "X-Remote-Requester": f"session-{self.session_id}",
+                }),
             ) as upstream:
                 self.upstream_ws = upstream
                 logger.info(f"[{self.asset_ip}] upstream connected")
@@ -128,7 +217,10 @@ class AgentBridge:
                 async for message in upstream:
                     if self._closed:
                         break
-                    payload, _ftype = _encode_frame(message)
+                    if isinstance(message, (bytes, bytearray)):
+                        payload, _ftype = bytes(message), 1
+                    else:
+                        payload, _ftype = str(message).encode("utf-8"), 0
                     stream_id = self.data_stream_id
                     if stream_id is None:
                         # 数据流未打开：缓冲（控制帧全留，视频帧留最近2帧），打开时按序冲刷
@@ -138,7 +230,7 @@ class AgentBridge:
                     if forwarded <= 5:
                         logger.info(f"[{self.asset_ip}] agent→wt frame #{forwarded}: len={len(payload)} "
                                     f"type={_ftype} stream_id={stream_id}")
-                    self.proto.send_wt_data(stream_id, payload)
+                    self.send_agent_frame(stream_id, _ftype, payload)
         except Exception as exc:
             logger.info(f"[{self.asset_ip}] upstream ended: {exc}")
         finally:
@@ -153,6 +245,12 @@ class AgentBridge:
         if self._closed:
             return
         self._closed = True
+        if not self._session_close_recorded:
+            self._session_close_recorded = True
+            try:
+                asyncio.get_running_loop().create_task(self._record_session_closed())
+            except RuntimeError:
+                pass
         try:
             if self.upstream_ws is not None:
                 asyncio.get_event_loop().create_task(self.upstream_ws.close())
@@ -167,6 +265,31 @@ class AgentBridge:
         except Exception:
             pass
 
+    async def _record_session_closed(self) -> None:
+        """Keep the platform session record aligned with the QUIC connection lifecycle."""
+        def update_session() -> None:
+            import mysql.connector
+            from config_utils import get_db_config
+
+            conn = mysql.connector.connect(**get_db_config(), connection_timeout=5)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), "
+                    "disconnect_reason='wt_gateway_closed' "
+                    "WHERE id=%s AND status!='disconnected'",
+                    (self.session_id,),
+                )
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(update_session)
+        except Exception as exc:
+            logger.warning("failed to record WebTransport session close: %s", exc)
+
 
 # ============================================================
 # 长度前缀帧编解码
@@ -179,7 +302,11 @@ def _encode_frame(message) -> tuple[bytes, int]:
     else:
         payload = message.encode("utf-8") if isinstance(message, str) else str(message).encode("utf-8")
         ftype = 0
-    return (len(payload)).to_bytes(4, "big") + bytes([ftype]) + payload, ftype
+    return _encode_wire_frame(ftype, payload), ftype
+
+
+def _encode_wire_frame(frame_type: int, payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "big") + bytes([frame_type]) + payload
 
 
 class FrameAccumulator:
@@ -225,7 +352,7 @@ def validate_session(token: str, session_id: int) -> dict | None:
         cur.execute(
             # P0-07: TTL 强制执行（created_at + max_duration_sec）
             "SELECT asset_id FROM remote_sessions WHERE id=%s AND session_token=%s "
-            "AND status!='disconnected' "
+            "AND status IN ('created', 'connecting', 'connected') "
             "AND created_at > DATE_SUB(NOW(), INTERVAL COALESCE(max_duration_sec,7200) SECOND)",
             (session_id, token_hash),
         )
@@ -256,7 +383,6 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
         self._http: H3Connection | None = H3Connection(self._quic, enable_webtransport=True)
         self._bridge: AgentBridge | None = None
         self._accumulators: dict[int, FrameAccumulator] = {}
-        self._session_prefix_stripped: dict[int, bool] = {}
 
     def quic_event_received(self, event: QuicEvent):
         if isinstance(event, ConnectionTerminated):
@@ -281,14 +407,9 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
                 bridge.set_data_stream(event.stream_id)
                 logger.info(f"wt data stream selected: {event.stream_id} (bidi)")
             acc = self._accumulators.setdefault(event.stream_id, FrameAccumulator())
-            data = event.data
-            if not self._session_prefix_stripped.get(event.stream_id):
-                # 观看端 WT 流的首个 0x41 帧载荷 = session_id varint（即 CONNECT 流 id），
-                # 不属于应用数据，剥离之（否则长度前缀协议错位）
-                n = len(encode_uint_var(bridge.connect_stream_id))
-                data = data[n:]
-                self._session_prefix_stripped[event.stream_id] = True
-            for ftype, payload in acc.feed(data):
+            # aioquic has already consumed the WebTransport stream type and session
+            # identifier before emitting this event, so event.data is application data.
+            for ftype, payload in acc.feed(event.data):
                 asyncio.ensure_future(bridge.browser_to_agent(ftype, payload))
             if event.stream_ended:
                 bridge.close()
@@ -297,6 +418,10 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
             if bridge and event.stream_id in self._accumulators:
                 for ftype, payload in self._accumulators[event.stream_id].feed(event.data):
                     asyncio.ensure_future(bridge.browser_to_agent(0, payload))
+        elif isinstance(event, DatagramReceived):
+            # Client datagrams are intentionally unsupported. Keyboard, mouse, and
+            # session control remain on the reliable bidirectional stream.
+            logger.debug("ignored client datagram stream_id=%s bytes=%s", event.stream_id, len(event.data))
 
     def _handle_headers(self, event: HeadersReceived):
         headers = {k.decode().lower(): v.decode() for k, v in event.headers}
@@ -372,6 +497,25 @@ class WebTransportGatewayProtocol(QuicConnectionProtocol):
             self.transmit()
         except Exception as exc:
             logger.warning(f"send_wt_data failed: {exc}")
+
+    def send_media_datagrams(self, stream_id: int, datagrams: list[bytes]):
+        """Emit every media fragment as an HTTP/3 datagram, then flush once."""
+        for datagram in datagrams:
+            self._http.send_datagram(stream_id, datagram)
+        self.transmit()
+
+    def send_keyframe_stream(self, connect_stream_id: int, payload: bytes):
+        """Send IDR data on its own reliable WT stream, isolated from controls."""
+        stream_id = self._http.create_webtransport_stream(
+            connect_stream_id,
+            is_unidirectional=True,
+        )
+        self._quic.send_stream_data(
+            stream_id,
+            _encode_wire_frame(1, payload),
+            end_stream=True,
+        )
+        self.transmit()
 
 
 # ============================================================

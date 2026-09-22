@@ -24,7 +24,34 @@ from remote_desktop_engine_v2 import RemoteDesktopSession  # noqa: E402
 def make_session():
     s = RemoteDesktopSession.__new__(RemoteDesktopSession)
     s._h264_keyframe_requested = False
+    s._h264_stats = {"frames": 0, "bytes": 0, "drops_backpressure": 0}
     return s
+
+
+def test_hardware_bitrate_quality_mapping():
+    from Codec import h264_encoder as encoder
+
+    assert encoder._hardware_bitrate_for_crf(17) == 28_000_000
+    assert encoder._hardware_bitrate_for_crf(19) == 16_000_000
+    assert encoder._hardware_bitrate_for_crf(23) == 10_000_000
+    assert encoder._hardware_bitrate_for_crf(28) == 2_500_000
+    assert encoder._hardware_bitrate_for_crf(36) == 1_500_000
+
+
+def test_h264_results_report_encoded_dimensions():
+    session = make_session()
+    results = session._h264_results_from(
+        [{"data": b"packet", "keyframe": True}],
+        1280,
+        720,
+    )
+    assert results == [{
+        "type": "h264",
+        "data": base64.b64encode(b"packet").decode("ascii"),
+        "keyframe": True,
+        "width": 1280,
+        "height": 720,
+    }]
 
 
 # ============ P0-H5：编码队列 latest-wins 不丢关键帧 ============
@@ -296,6 +323,17 @@ def test_force_keyframe_produces_idr(libx264_encoder):
     assert any(p["keyframe"] for p in packets)
     keyframe_pkt = next(p for p in packets if p["keyframe"])
     assert {7, 8, 5} <= set(_nal_types(keyframe_pkt["data"]))
+
+
+def test_encoder_reports_conversion_and_codec_timing(libx264_encoder):
+    enc, img = libx264_encoder
+    enc.encode(img)
+    metrics = enc.last_metrics
+    enc.close()
+
+    assert metrics["backend"] == "libx264"
+    assert metrics["hardware"] is False
+    assert all(float(metrics[key]) >= 0 for key in ("input_ms", "convert_ms", "codec_ms", "total_ms"))
 
 
 def test_resolution_change_rebuilds_with_idr(libx264_encoder):

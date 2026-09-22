@@ -38,6 +38,7 @@ AGENT_TOKEN_PREVIOUS_ENV_NAME = "ZVIEW_AGENT_TOKEN_PREVIOUS"
 AGENT_TOKEN_FILE_ENV_NAME = "ZVIEW_AGENT_TOKEN_FILE"
 AGENT_TOKEN_FILE_NAME = "agent_secret.txt"
 LEGACY_AGENT_TOKEN = "cmdb-agent-secret-2024"
+LEGACY_AGENT_TOKEN_ENABLED_ENV_NAME = "ZVIEW_AGENT_LEGACY_TOKEN_ENABLED"
 LEGACY_AGENT_TOKEN_DISABLED_ENV_NAME = "ZVIEW_AGENT_LEGACY_TOKEN_DISABLED"
 AGENT_DEVICE_TOKEN_PREFIX = "zv1:"
 # 设备凭据校验器由宿主应用（assets_api）注入，避免本模块依赖 DB
@@ -52,6 +53,14 @@ def set_agent_device_credential_verifier(verifier) -> None:
 
 def _legacy_token_disabled() -> bool:
     return str(get_env(LEGACY_AGENT_TOKEN_DISABLED_ENV_NAME, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _legacy_token_enabled() -> bool:
+    if _legacy_token_disabled():
+        return False
+    return str(get_env(LEGACY_AGENT_TOKEN_ENABLED_ENV_NAME, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 WEAK_PASSWORD_PATTERNS = (
     "123456",
     "123123",
@@ -975,7 +984,9 @@ def _uses_managed_agent_token() -> bool:
 
 
 def get_expected_agent_token() -> str:
-    if _uses_managed_agent_token():
+    if _legacy_token_enabled() and not _uses_managed_agent_token():
+        return LEGACY_AGENT_TOKEN
+    if not _legacy_token_disabled() or _uses_managed_agent_token():
         return get_or_create_secret(
             AGENT_TOKEN_ENV_NAME,
             AGENT_TOKEN_FILE_ENV_NAME,
@@ -994,6 +1005,8 @@ def _global_token_matches(normalized_token: str) -> Optional[str]:
         if expected_token == LEGACY_AGENT_TOKEN and not _uses_managed_agent_token():
             return "legacy_default"
         return "configured"
+    if _legacy_token_enabled() and hmac.compare_digest(normalized_token, LEGACY_AGENT_TOKEN):
+        return "legacy_default"
     previous_token = str(get_env(AGENT_TOKEN_PREVIOUS_ENV_NAME, "") or "").strip()
     if previous_token and hmac.compare_digest(normalized_token, previous_token):
         return "previous"

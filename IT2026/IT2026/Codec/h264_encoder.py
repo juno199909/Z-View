@@ -86,6 +86,27 @@ def h264_available() -> bool:
     return bool(get_h264_backend_name())
 
 
+def _hardware_bitrate_for_crf(crf: int) -> int:
+    """Map the shared quality scale to hardware-encoder bitrates.
+
+    Remote-desktop text has many hard edges and does not tolerate the video
+    bitrates that look acceptable for camera footage.  The high preset is for
+    a trusted LAN and therefore reserves enough bitrate for a 1080p60 desktop.
+    """
+    crf = max(16, min(36, int(crf)))
+    if crf <= 17:
+        return 28_000_000
+    if crf <= 20:
+        return 16_000_000
+    if crf <= 23:
+        return 10_000_000
+    if crf <= 27:
+        return 4_000_000
+    if crf <= 31:
+        return 2_500_000
+    return 1_500_000
+
+
 def _prepend_stream_header(pkts: list[dict[str, Any]], extradata: Any) -> list[dict[str, Any]]:
     """将 extradata（SPS/PPS）前置到首个关键帧包 data 前（纯函数，可测）。
 
@@ -124,6 +145,8 @@ class H264StreamEncoder:
         self._ctx: Any = None
         self._pts = 0
         self._lock = threading.Lock()
+        self._last_metrics: dict[str, float | str | bool] = {}
+        self._target_bitrate_bps = 0
         self._open()
 
     # ---------- 内部 ----------
@@ -153,10 +176,12 @@ class H264StreamEncoder:
             }
         else:
             # 硬编按码率控制（CRF 语义不同）：质量档位映射码率
-            ctx.bit_rate = {18: 8_000_000, 22: 6_000_000, 26: 4_000_000, 32: 2_000_000}.get(
-                self._crf, 4_000_000
-            )
-            ctx.options = {"preset": "p1", "async_depth": "1"}
+            self._target_bitrate_bps = _hardware_bitrate_for_crf(self._crf)
+            ctx.bit_rate = self._target_bitrate_bps
+            # p1 optimizes throughput above all else.  p4 retains low-latency
+            # operation (B-frames stay disabled below) while spending enough
+            # RDO on desktop text, icons, and thin UI borders.
+            ctx.options = {"preset": "p4", "tune": "ll", "async_depth": "1"}
         self._ctx = ctx
         self._codec_name = codec_name
         self._pts = 0
@@ -246,9 +271,11 @@ class H264StreamEncoder:
 
             converted = None
             try:
+                started_at = time.perf_counter()
                 if pil_image.mode != "RGB":
                     converted = pil_image.convert("RGB")
                     pil_image = converted
+                input_ready_at = time.perf_counter()
                 arr = np.asarray(pil_image, dtype=np.uint8)
                 frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
                 # RGB→YUV 用 BT.709 矩阵并写入 VUI 元数据：浏览器解码高清流默认按
@@ -261,6 +288,7 @@ class H264StreamEncoder:
                 frame.pts = self._pts
                 frame.time_base = Fraction(1, self.fps)
                 self._pts += 1
+                converted_at = time.perf_counter()
                 packets: list[dict[str, Any]] = []
                 for packet in self._ctx.encode(frame):
                     data = bytes(packet)
@@ -268,6 +296,16 @@ class H264StreamEncoder:
                         continue
                     keyframe_flag = bool(packet.is_keyframe)
                     packets.append({"data": data, "keyframe": keyframe_flag})
+                encoded_at = time.perf_counter()
+                self._last_metrics = {
+                    "backend": self._codec_name,
+                    "hardware": self.is_hardware,
+                    "input_ms": round((input_ready_at - started_at) * 1000, 3),
+                    "convert_ms": round((converted_at - input_ready_at) * 1000, 3),
+                    "codec_ms": round((encoded_at - converted_at) * 1000, 3),
+                    "total_ms": round((encoded_at - started_at) * 1000, 3),
+                    "bitrate_bps": self._target_bitrate_bps,
+                }
                 return self._attach_hw_stream_header(packets)
             finally:
                 if converted is not None:
@@ -292,5 +330,13 @@ class H264StreamEncoder:
         return self._codec_name
 
     @property
+    def last_metrics(self) -> dict[str, float | str | bool]:
+        return dict(self._last_metrics)
+
+    @property
     def is_hardware(self) -> bool:
         return self._codec_name in _HW_PROBE_BACKENDS
+
+    @property
+    def target_bitrate_bps(self) -> int:
+        return int(self._target_bitrate_bps)

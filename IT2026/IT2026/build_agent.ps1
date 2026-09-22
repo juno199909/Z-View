@@ -93,7 +93,7 @@ if (-not (Test-Path $ExePath)) {
 # 证书缺失时告警但不阻断构建（开发环境允许未签名）。
 $SignCertThumbprint = [Environment]::GetEnvironmentVariable("ZVIEW_CODESIGN_THUMBPRINT")
 if ([string]::IsNullOrWhiteSpace($SignCertThumbprint)) {
-    $SignCertThumbprint = "93C05132E7AD481010C68B37BAF25A1DA71CEADD"
+    $SignCertThumbprint = "2EE71F46DF8466A1F80ADA623659C2CB308A3D11"
 }
 $SignCert = Get-ChildItem "Cert:\CurrentUser\My\$SignCertThumbprint" -ErrorAction SilentlyContinue
 if (-not $SignCert) {
@@ -102,8 +102,21 @@ if (-not $SignCert) {
 if ($SignCert) {
     Write-Host "==> Authenticode signing (P0-05)"
     $Signature = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $SignCert -HashAlgorithm SHA256
-    if ($Signature.Status -ne "Valid") {
+    $SignerThumbprint = if ($Signature.SignerCertificate) {
+        [string]$Signature.SignerCertificate.Thumbprint
+    } else {
+        ""
+    }
+    if ($SignerThumbprint -ne $SignCert.Thumbprint) {
+        throw "Authenticode signing failed: unexpected signer $SignerThumbprint"
+    }
+    # 企业自签证书尚未导入构建机受信任根时，PowerShell 会把已签名文件报告为
+    # UnknownError；指纹匹配已证明该文件由预期私钥签发，终端仍会按本地信任链校验。
+    if ($Signature.Status -notin @("Valid", "UnknownError")) {
         throw "Authenticode signing failed: $($Signature.Status) $($Signature.StatusMessage)"
+    }
+    if ($Signature.Status -eq "UnknownError") {
+        Write-Host "    WARNING: signature written but the local certificate chain is not trusted"
     }
     Write-Host ("    Signed by: {0}" -f $Signature.SignerCertificate.Subject)
 } else {

@@ -328,6 +328,7 @@ class DesktopFrameCapturer:
     # RustDesk 式回退（参考 libs/scrap "No image, fall back to gdi"）：
     # substrate 缺持久表面时不再封锁，降级到 GDI 系后端继续出帧。
     FALLBACK_BACKEND_ORDER = ("mss", "gdi", "imagegrab", "pyautogui")
+    BACKEND_PREFERENCES = frozenset({"auto", "dxgi", "wgc", "mss"})
 
     def __init__(self, backend_order: tuple[str, ...] | None = None):
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -341,6 +342,10 @@ class DesktopFrameCapturer:
         self._default_backend_order = tuple(
             backend_order or ("dxgi", "wgc", "dwm", "mss", "gdi", "imagegrab", "pyautogui")
         )
+        # 仅用于当前远控会话的 A/B 测试或物理机调优。它只重排现有可用策略，
+        # 不移除回退后端，因此指定后端不可用时仍能持续出帧。
+        self._preferred_backend = ""
+        self._strategy_backend_order = self._default_backend_order
         self.backend_order = self._default_backend_order
         self._backend_retry_after: dict[str, float] = {}
         # V1.9.14：每后端连续失败计数（冷却指数递增用），成功即清零
@@ -457,6 +462,7 @@ class DesktopFrameCapturer:
         return {
             "current_backend": str(self.capture_backend or ""),
             "active_backend": str(self.capture_backend or ""),
+            "preferred_backend": str(getattr(self, "_preferred_backend", "") or "auto"),
             "failure_count": int(self.failure_count or 0),
             "last_failure_reason": str(self.last_failure_reason or ""),
             "blocker_reason": str(self._capture_blocker_reason or ""),
@@ -834,9 +840,11 @@ class DesktopFrameCapturer:
             desktop_signature=normalized_signature,
             desktop_state=desktop_state,
         )
-        next_backend_order, next_context_label, next_transient_backends = self._resolve_backend_strategy(
+        strategy_backend_order, next_context_label, next_transient_backends = self._resolve_backend_strategy(
             desktop_state=desktop_state,
         )
+        self._strategy_backend_order = tuple(strategy_backend_order)
+        next_backend_order = self._apply_backend_preference(strategy_backend_order)
         signature_changed = normalized_signature and normalized_signature != self._desktop_signature
         virtual_signature_changed = bool(current_virtual_signature) and (
             current_virtual_signature != self._virtual_screen_signature
@@ -904,6 +912,39 @@ class DesktopFrameCapturer:
         self._capture_context_label = str(next_context_label or self._capture_context_label)
         self._transient_backends = frozenset(next_transient_backends or ())
         return False
+
+    def set_preferred_backend(self, backend: str | None) -> bool:
+        """Set a non-persistent backend preference for the current capture helper."""
+        normalized = str(backend or "auto").strip().lower() or "auto"
+        if normalized not in self.BACKEND_PREFERENCES:
+            raise ValueError(f"unsupported capture backend preference: {normalized}")
+        normalized = "" if normalized == "auto" else normalized
+        if normalized == getattr(self, "_preferred_backend", ""):
+            return False
+        previous_backend = str(getattr(self, "capture_backend", "") or "").strip().lower()
+        self._preferred_backend = normalized
+        strategy_order = tuple(
+            getattr(self, "_strategy_backend_order", None)
+            or getattr(self, "_default_backend_order", None)
+            or getattr(self, "backend_order", ())
+        )
+        self.backend_order = self._apply_backend_preference(strategy_order)
+        if normalized:
+            getattr(self, "_backend_retry_after", {}).pop(normalized, None)
+        if previous_backend and previous_backend != normalized:
+            backend = getattr(self, "_backend_registry", {}).get(previous_backend)
+            if backend is not None:
+                with contextlib.suppress(Exception):
+                    backend.reset(self, reason="backend_preference_changed")
+            self.capture_backend = None
+        return True
+
+    def _apply_backend_preference(self, backend_order: tuple[str, ...]) -> tuple[str, ...]:
+        preferred = str(getattr(self, "_preferred_backend", "") or "").strip().lower()
+        order = tuple(backend_order or ())
+        if not preferred or preferred not in order:
+            return order
+        return (preferred,) + tuple(name for name in order if name != preferred)
 
     def _grab_with_dxgi(self):
         if dxcam is None:
@@ -1439,6 +1480,10 @@ class DesktopFrameCapturer:
         return time.monotonic() >= float(self._backend_retry_after.get(backend_name, 0.0))
 
     def _mark_backend_retry_after(self, backend_name: str, failure_classification: str = ""):
+        if not hasattr(self, "_backend_fail_streak"):
+            self._backend_fail_streak = {}
+        if not hasattr(self, "_backend_retry_after"):
+            self._backend_retry_after = {}
         cooldown_seconds = 1.0
         normalized_classification = self._normalize_capture_value(failure_classification)
         if backend_name == "dxgi":
@@ -1727,6 +1772,8 @@ class DesktopFrameCapturer:
         return bool(default)
 
     def _note_backend(self, backend_name: str):
+        if not hasattr(self, "_backend_fail_streak"):
+            self._backend_fail_streak = {}
         normalized_backend_name = str(backend_name or "").strip().lower()
         if self.capture_backend != normalized_backend_name:
             print(f"[RemoteDesktop] Capture backend switched: {backend_name}")

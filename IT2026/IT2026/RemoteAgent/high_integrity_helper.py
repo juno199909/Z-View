@@ -1085,6 +1085,14 @@ class HighIntegritySessionHelperRuntime:
         quality = max(25, min(95, int(payload.get("quality") or 75)))
         scale = float(payload.get("scale") or 1.0)
         scale = max(0.2, min(1.0, scale))
+        requested_backend = str(payload.get("capture_backend") or "auto").strip().lower() or "auto"
+        try:
+            backend_preference_changed = self.frame_capturer.set_preferred_backend(requested_backend)
+        except ValueError:
+            requested_backend = "auto"
+            backend_preference_changed = self.frame_capturer.set_preferred_backend(requested_backend)
+        if backend_preference_changed:
+            self.logger(f"capture backend preference changed: {requested_backend}")
         previous_signature = payload.get("previous_signature")
         include_desktop_state = bool(payload.get("include_desktop_state", False))
         include_backend_diagnostics = bool(
@@ -1154,6 +1162,7 @@ class HighIntegritySessionHelperRuntime:
                     "signature": signature,
                     "session_id": self.session_id,
                     "backend": str(self.frame_capturer.capture_backend or ""),
+                    "backend_preference": requested_backend,
                     "captured_at": captured_at,
                     "desktop_signature": desktop_signature,
                     "display_presence": display_presence,

@@ -11,8 +11,9 @@ import hashlib
 import subprocess
 import threading
 import ctypes
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import psutil
 
@@ -22,11 +23,14 @@ except ImportError:
     winreg = None
 
 
-def _run(cmd: str, timeout: int = 30) -> Dict[str, Any]:
+Command = Union[str, Sequence[str]]
+
+
+def _run(cmd: Command, timeout: int = 30) -> Dict[str, Any]:
     """执行命令并返回结构化结果"""
     try:
         r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
+            cmd, shell=isinstance(cmd, str), capture_output=True, text=True,
             errors="replace", timeout=timeout, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -109,8 +113,48 @@ def get_firewall_status() -> Dict[str, Any]:
 
 def enable_firewall(enable: bool = True) -> Dict[str, Any]:
     action = "on" if enable else "off"
-    r = _run(f"netsh advfirewall set allprofiles state {action}", timeout=15)
+    r = _run(["netsh", "advfirewall", "set", "allprofiles", "state", action], timeout=15)
     return {"success": r["success"], "action": action, "message": r.get("stderr") or r.get("stdout")}
+
+
+def _safe_firewall_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name:
+        return f"zv-rule-{int(time.time())}"
+    if len(name) > 120 or any(ch in name for ch in '"\r\n'):
+        raise ValueError("invalid firewall rule name")
+    return name
+
+
+def _safe_firewall_protocol(value: Any) -> str:
+    protocol = str(value or "any").strip().lower()
+    if protocol in ("any", "tcp", "udp", "icmpv4", "icmpv6"):
+        return protocol
+    raise ValueError("invalid firewall protocol")
+
+
+def _safe_firewall_ports(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not re.fullmatch(r"\d{1,5}(?:-\d{1,5})?(?:,\d{1,5}(?:-\d{1,5})?)*", text):
+        raise ValueError("invalid firewall local_port")
+    for part in text.split(","):
+        bounds = [int(item) for item in part.split("-")]
+        if any(port < 1 or port > 65535 for port in bounds):
+            raise ValueError("invalid firewall local_port")
+        if len(bounds) == 2 and bounds[0] > bounds[1]:
+            raise ValueError("invalid firewall local_port")
+    return text
+
+
+def _safe_firewall_remote_ip(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if len(text) > 255 or not re.fullmatch(r"[A-Za-z0-9:.,/_-]+", text):
+        raise ValueError("invalid firewall remote_ip")
+    return text
 
 
 def apply_firewall_rules(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -118,16 +162,26 @@ def apply_firewall_rules(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
     results = []
     success_count = 0
     for rule in rules:
-        name = rule.get("name") or f"zv-rule-{int(time.time())}"
-        direction = "in" if rule.get("direction", "in") == "in" else "out"
-        action = "allow" if rule.get("action", "allow") == "allow" else "block"
-        protocol = rule.get("protocol", "any")
-        local_port = rule.get("local_port")
-        remote_ip = rule.get("remote_ip")
+        try:
+            name = _safe_firewall_name(rule.get("name"))
+            direction = "in" if rule.get("direction", "in") == "in" else "out"
+            action = "allow" if rule.get("action", "allow") == "allow" else "block"
+            protocol = _safe_firewall_protocol(rule.get("protocol", "any"))
+            local_port = _safe_firewall_ports(rule.get("local_port"))
+            remote_ip = _safe_firewall_remote_ip(rule.get("remote_ip"))
+        except ValueError as exc:
+            results.append({
+                "name": str(rule.get("name") or ""),
+                "direction": str(rule.get("direction", "in")),
+                "action": str(rule.get("action", "allow")),
+                "success": False,
+                "error": str(exc),
+            })
+            continue
 
         parts = [
-            "netsh advfirewall firewall add rule",
-            f'name="{name}"',
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={name}",
             f"dir={direction}",
             f"action={action}",
         ]
@@ -155,8 +209,12 @@ def apply_firewall_rules(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def delete_firewall_rule(name: str) -> Dict[str, Any]:
-    r = _run(f'netsh advfirewall firewall delete rule name="{name}"', timeout=15)
-    return {"success": r["success"], "name": name, "message": r.get("stdout")}
+    try:
+        safe_name = _safe_firewall_name(name)
+    except ValueError as exc:
+        return {"success": False, "name": name, "message": str(exc)}
+    r = _run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={safe_name}"], timeout=15)
+    return {"success": r["success"], "name": safe_name, "message": r.get("stdout")}
 
 
 def list_firewall_rules(direction: str = "in") -> Dict[str, Any]:
@@ -385,14 +443,15 @@ def collect_network_connections() -> Dict[str, Any]:
 def isolate_host(control_port: int = 9001) -> Dict[str, Any]:
     """隔离终端：阻断所有入站连接，但保留控制端口"""
     results = []
+    safe_control_port = _safe_firewall_ports(control_port) or "9001"
     # 阻断所有入站
-    r1 = _run('netsh advfirewall firewall add rule name="zv-isolate-block-in" dir=in action=block protocol=any', timeout=15)
+    r1 = _run(["netsh", "advfirewall", "firewall", "add", "rule", "name=zv-isolate-block-in", "dir=in", "action=block", "protocol=any"], timeout=15)
     results.append({"rule": "block-all-inbound", "success": r1["success"]})
     # 允许控制端口入站（覆盖阻断规则，需更高优先级——放最后更具体）
-    r2 = _run(f'netsh advfirewall firewall add rule name="zv-isolate-allow-control" dir=in action=allow protocol=TCP localport={control_port}', timeout=15)
+    r2 = _run(["netsh", "advfirewall", "firewall", "add", "rule", "name=zv-isolate-allow-control", "dir=in", "action=allow", "protocol=TCP", f"localport={safe_control_port}"], timeout=15)
     results.append({"rule": "allow-control-port", "success": r2["success"]})
     # 允许 RDP 用于远控恢复（可选）
-    r3 = _run('netsh advfirewall firewall add rule name="zv-isolate-allow-rdp" dir=in action=allow protocol=TCP localport=3389', timeout=15)
+    r3 = _run(["netsh", "advfirewall", "firewall", "add", "rule", "name=zv-isolate-allow-rdp", "dir=in", "action=allow", "protocol=TCP", "localport=3389"], timeout=15)
     results.append({"rule": "allow-rdp", "success": r3["success"]})
     return {
         "success": all(r["success"] for r in results),
@@ -404,9 +463,9 @@ def isolate_host(control_port: int = 9001) -> Dict[str, Any]:
 
 def unisolate_host() -> Dict[str, Any]:
     """解除隔离：删除隔离规则"""
-    r1 = _run('netsh advfirewall firewall delete rule name="zv-isolate-block-in"', timeout=15)
-    r2 = _run('netsh advfirewall firewall delete rule name="zv-isolate-allow-control"', timeout=15)
-    r3 = _run('netsh advfirewall firewall delete rule name="zv-isolate-allow-rdp"', timeout=15)
+    r1 = _run(["netsh", "advfirewall", "firewall", "delete", "rule", "name=zv-isolate-block-in"], timeout=15)
+    r2 = _run(["netsh", "advfirewall", "firewall", "delete", "rule", "name=zv-isolate-allow-control"], timeout=15)
+    r3 = _run(["netsh", "advfirewall", "firewall", "delete", "rule", "name=zv-isolate-allow-rdp"], timeout=15)
     return {"success": True, "removed": [r1["success"], r2["success"], r3["success"]]}
 
 

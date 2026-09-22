@@ -2,6 +2,7 @@
 """Agent 认证单元测试（无需运行中的服务器）：zv1 设备凭据协议 + 全局 token 轮换窗口"""
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -10,10 +11,13 @@ import auth_utils  # noqa: E402
 
 def _reset(monkeypatch_env=None, verifier=None):
     auth_utils.set_agent_device_credential_verifier(verifier)
+    auth_utils.get_or_create_secret.cache_clear()
     os.environ.pop("ZVIEW_AGENT_TOKEN", None)
     os.environ.pop("ZVIEW_AGENT_TOKEN_PREVIOUS", None)
     os.environ.pop("ZVIEW_AGENT_TOKEN_FILE", None)
+    os.environ.pop(auth_utils.LEGACY_AGENT_TOKEN_ENABLED_ENV_NAME, None)
     os.environ.pop(auth_utils.LEGACY_AGENT_TOKEN_DISABLED_ENV_NAME, None)
+    os.environ["ZVIEW_AGENT_TOKEN_FILE"] = os.path.join(tempfile.gettempdir(), "zview-test-agent-token.txt")
     if monkeypatch_env:
         os.environ.update(monkeypatch_env)
 
@@ -48,10 +52,15 @@ def test_legacy_disabled():
     assert auth_utils.verify_agent_token(auth_utils.LEGACY_AGENT_TOKEN) is None
 
 
-def test_legacy_allowed_by_default():
-    _reset()
+def test_legacy_allowed_only_when_explicitly_enabled():
+    _reset(monkeypatch_env={auth_utils.LEGACY_AGENT_TOKEN_ENABLED_ENV_NAME: "1"})
     auth = auth_utils.verify_agent_token(auth_utils.LEGACY_AGENT_TOKEN)
     assert auth and auth["legacy_compat"] is True
+
+
+def test_legacy_rejected_by_default():
+    _reset()
+    assert auth_utils.verify_agent_token(auth_utils.LEGACY_AGENT_TOKEN) is None
 
 
 def test_device_precedence_over_global():

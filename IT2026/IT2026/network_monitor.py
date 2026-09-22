@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import psutil
+from zvagent.collectors.system import get_platform_route_interface_name
 
 try:  # 仅 Windows Agent 存在；非 Windows（单测环境）自动降级
     import winreg  # noqa: F401
@@ -290,8 +291,25 @@ class NetworkQualityCollector:
         return result
 
 
-def select_primary_interface(interfaces: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """选择当前活跃主网卡（非虚拟、up、有 IPv4，按链路速度优先；回退时排除环回）。"""
+def select_primary_interface(
+    interfaces: List[Dict[str, Any]],
+    routed_interface_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """选择当前活跃主网卡，优先使用实际到平台的路由出口。
+
+    路由出口可用时即使它是 VPN / 隧道也应如实上报；无法解析路由时，保留原有
+    的非虚拟网卡、链路速率优先的降级策略。
+    """
+    if routed_interface_name:
+        route_name = routed_interface_name.casefold()
+        for itf in interfaces:
+            if (
+                str(itf.get("interface_name") or "").casefold() == route_name
+                and itf.get("status") == "up"
+                and itf.get("ipv4")
+            ):
+                return itf
+
     candidates = [
         itf for itf in interfaces
         if itf.get("status") == "up" and itf.get("ipv4")
@@ -348,7 +366,10 @@ class NetworkCollector:
                     "rx_errors", "tx_errors", "rx_drops", "tx_drops",
                 )})
 
-            primary = select_primary_interface(interfaces)
+            primary = select_primary_interface(
+                interfaces,
+                routed_interface_name=get_platform_route_interface_name(),
+            )
             gateway = (primary or {}).get("gateway")
             quality = self._quality.maybe_collect(gateway, (primary or {}).get("dns"), now)
 

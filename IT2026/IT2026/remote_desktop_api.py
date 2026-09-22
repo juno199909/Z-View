@@ -10,7 +10,7 @@ import hashlib
 from typing import Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import mysql.connector
 from mysql.connector import Error
 
@@ -72,16 +72,27 @@ def ensure_remote_sessions_table(conn):
 
 class CreateSessionRequest(BaseModel):
     asset_id: int
-    fps_limit: Optional[int] = 60
-    max_duration_sec: Optional[int] = 7200
+    fps_limit: int = Field(default=60, ge=1, le=60)
+    max_duration_sec: int = Field(default=7200, ge=60, le=7200)
+
+
+def _require_remote_desktop_access(request: Request):
+    auth_user = getattr(request.state, "auth_user", None)
+    if not user_has_permission(auth_user, "remote_desktop:control"):
+        raise HTTPException(status_code=403, detail="Forbidden: missing remote_desktop:control")
+    return auth_user
+
+
+def _require_session_scope(auth_user, group_id) -> None:
+    scoped_group_ids = get_user_scoped_group_ids(auth_user)
+    if scoped_group_ids is not None and group_id not in scoped_group_ids:
+        raise HTTPException(status_code=403, detail="无权访问该终端（资产分组范围限制）")
 
 
 @router.post("/sessions")
 def create_session(payload: CreateSessionRequest, request: Request):
     """创建远程桌面会话，返回短期 session_token + ws_url"""
-    if not user_has_permission({"role": "admin"}, "remote_desktop:control"):
-        # 复用中间件已校验，此处二次确认
-        pass
+    auth_user = _require_remote_desktop_access(request)
     conn = get_db()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -97,9 +108,7 @@ def create_session(payload: CreateSessionRequest, request: Request):
         if not asset.get("ip_address"):
             raise HTTPException(status_code=400, detail="Asset has no IP address")
         # Scoped RBAC：受限用户只能对自己分组范围内的终端发起远控
-        scoped_group_ids = get_user_scoped_group_ids(getattr(request.state, "auth_user", None))
-        if scoped_group_ids is not None and asset.get("group_id") not in scoped_group_ids:
-            raise HTTPException(status_code=403, detail="无权访问该终端（资产分组范围限制）")
+        _require_session_scope(auth_user, asset.get("group_id"))
 
         operator = get_request_username(request, fallback="console")
         token = secrets.token_urlsafe(32)
@@ -118,8 +127,9 @@ def create_session(payload: CreateSessionRequest, request: Request):
             VALUES ('platform','remote-desktop','create_session','info','success',%s,%s,NOW(),NOW())
         """, (payload.asset_id, f"Session {session_id} created by {operator} for {asset.get('hostname')}"))
         conn.commit()
-        # 局域网直连地址：观看端与终端同网段时可绕过平台中继一跳，失败自动回落中继
-        direct_ws_url = f"ws://{asset.get('ip_address')}:9000/remote-desktop?requester=browser"
+        # Browser WebSocket cannot attach the Agent credential, so desktop traffic
+        # must use an authenticated platform relay instead of exposing port 9000.
+        direct_ws_url = None
         # WebTransport (QUIC/UDP) 端点信息：观看端优先尝试 WT，失败回落 WebSocket。
         # WT 网关运行在平台服务器上 —— 必须使用服务器局域网 IP（朝被控端方向的路由出口），
         # 不能用请求 Host 头（观看端可能经隧道/localhost 访问页面，Host 会是 127.0.0.1）。
@@ -162,17 +172,24 @@ def create_session(payload: CreateSessionRequest, request: Request):
 
 
 @router.get("/sessions/{session_id}")
-def get_session(session_id: int):
+def get_session(session_id: int, request: Request):
+    auth_user = _require_remote_desktop_access(request)
     conn = get_db()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     cur = conn.cursor(dictionary=True)
     try:
         ensure_remote_sessions_table(conn)
-        cur.execute("SELECT * FROM remote_sessions WHERE id=%s", (session_id,))
+        cur.execute("""
+            SELECT rs.*, a.group_id
+            FROM remote_sessions rs
+            LEFT JOIN assets a ON a.id = rs.asset_id
+            WHERE rs.id=%s
+        """, (session_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
+        _require_session_scope(auth_user, row.pop("group_id", None))
         row.pop("session_token", None)  # P0-4: 凭据哈希不出查询接口
         for k in ("created_at", "connected_at", "disconnected_at"):
             row[k] = fmt_dt(row.get(k))
@@ -189,16 +206,23 @@ def get_session(session_id: int):
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: int, request: Request):
     """主动断开会话"""
+    auth_user = _require_remote_desktop_access(request)
     conn = get_db()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
     try:
         ensure_remote_sessions_table(conn)
-        cur.execute("SELECT id, asset_id, admin_user FROM remote_sessions WHERE id=%s", (session_id,))
+        cur.execute("""
+            SELECT rs.id, rs.asset_id, rs.admin_user, a.group_id
+            FROM remote_sessions rs
+            LEFT JOIN assets a ON a.id = rs.asset_id
+            WHERE rs.id=%s
+        """, (session_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
+        _require_session_scope(auth_user, row.get("group_id"))
         cur.execute("""
             UPDATE remote_sessions SET status='disconnected', disconnected_at=NOW(), disconnect_reason='admin_closed'
             WHERE id=%s
@@ -207,7 +231,7 @@ def delete_session(session_id: int, request: Request):
         cur.execute("""
             INSERT INTO system_activity_logs (source_type, module, action, level, result, asset_id, message, event_time, created_at)
             VALUES ('platform','remote-desktop','disconnect','info','success',%s,%s,NOW(),NOW())
-        """, (row[1], f"Session {session_id} closed by {operator}"))
+        """, (row["asset_id"], f"Session {session_id} closed by {operator}"))
         conn.commit()
         return {"message": "Session closed", "session_id": session_id}
     except HTTPException:
@@ -222,10 +246,12 @@ def delete_session(session_id: int, request: Request):
 
 @router.get("/sessions")
 def list_sessions(
+    request: Request,
     asset_id: Optional[int] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
+    auth_user = _require_remote_desktop_access(request)
     conn = get_db()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -236,6 +262,13 @@ def list_sessions(
         params = []
         if asset_id:
             where.append("rs.asset_id=%s"); params.append(asset_id)
+        scoped_group_ids = get_user_scoped_group_ids(auth_user)
+        if scoped_group_ids is not None:
+            if not scoped_group_ids:
+                where.append("1=0")
+            else:
+                where.append("a.group_id IN (" + ",".join(["%s"] * len(scoped_group_ids)) + ")")
+                params.extend(scoped_group_ids)
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
         cur.execute(f"SELECT COUNT(*) AS total FROM remote_sessions rs {where_sql}", params)
         total = (cur.fetchone() or {}).get("total", 0)

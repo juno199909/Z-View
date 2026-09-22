@@ -268,6 +268,9 @@
                 <div>丢帧(背压): {{ engineStats?.drops_bp ?? 0 }}</div>
                 <div class="zv-pm-title">网络</div>
                 <div>ACK rate: {{ engineStats?.ack_rate ?? '-' }}/s</div>
+                <div>Transport: {{ transportStats?.transport ?? 'ws-tcp' }}</div>
+                <div>UDP media drop: {{ transportStats?.media_frames_dropped ?? 0 }}</div>
+                <div>Client media drop: {{ transportStats?.media_frames_client_dropped ?? 0 }}</div>
                 <div class="zv-pm-title">观看端</div>
                 <div>Decode FPS: {{ decodeFps || '-' }}</div>
                 <div>Render FPS: {{ renderFps || '-' }}</div>
@@ -339,13 +342,23 @@
         <el-collapse class="zv-advanced-collapse">
           <el-collapse-item title="高级参数" name="advanced">
             <el-form-item label="压缩质量">
-              <el-slider v-model="settingsForm.quality" :min="35" :max="90" :step="5" show-input @change="markPresetCustom" />
+              <el-slider v-model="settingsForm.quality" :min="35" :max="95" :step="5" show-input @change="markPresetCustom" />
             </el-form-item>
             <el-form-item label="帧率">
-              <el-slider v-model="settingsForm.fps" :min="4" :max="30" :step="1" show-input @change="markPresetCustom" />
+              <el-slider v-model="settingsForm.fps" :min="4" :max="60" :step="1" show-input @change="markPresetCustom" />
             </el-form-item>
             <el-form-item label="输出缩放">
               <el-slider v-model="settingsForm.scalePercent" :min="40" :max="100" :step="5" show-input @change="markPresetCustom" />
+            </el-form-item>
+            <el-form-item label="抓屏后端">
+              <el-select v-model="settingsForm.captureBackend" style="width: 100%">
+                <el-option
+                  v-for="option in captureBackendOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
             </el-form-item>
             <el-form-item label="滚轮速度">
               <el-slider v-model="settingsForm.wheelSpeed" :min="0.5" :max="3" :step="0.1" show-input @change="markPresetCustom" />
@@ -748,6 +761,9 @@ const activeTransfers = computed(() => (
 const dialogAppendTarget = computed(() => (
   isFullscreen.value && desktopContainer.value ? desktopContainer.value : 'body'
 ))
+const disconnectConfirmAppendTarget = () => (
+  isFullscreen.value && desktopContainer.value ? desktopContainer.value : document.body
+)
 const clearUploadStatusWaiters = (reason = '远程桌面连接已断开，上传状态确认失败') => {
   uploadStatusWaiters.forEach(waiters => {
     waiters.forEach(waiter => {
@@ -785,6 +801,12 @@ const presetOptions = [
   { label: '均衡', value: 'balanced' },
   { label: '高清', value: 'high' },
   { label: '自定义', value: 'custom' }
+]
+const captureBackendOptions = [
+  { label: '自动（兼容优先）', value: 'auto' },
+  { label: 'WGC（物理机优先）', value: 'wgc' },
+  { label: 'DXGI Desktop Duplication', value: 'dxgi' },
+  { label: 'MSS / GDI 兼容路径', value: 'mss' }
 ]
 const baseResolutionScaleOptions = [50, 60, 70, 80, 90, 100]
 
@@ -838,10 +860,12 @@ const getDesktopResolutionOptions = (currentWidth, currentHeight) => {
   })
 }
 
-const hoverMoveThrottle = 8
+const hoverMoveThrottle = 12
 const dragMoveThrottle = 8
 const dragStartThreshold = 4
 const releaseDedupWindowMs = 1200
+const mouseMoveBackpressureDropBytes = 128 * 1024
+const mouseWheelBackpressureDropBytes = 512 * 1024
 let lastHoverMoveAt = 0
 let lastDragMoveAt = 0
 const pointerState = {
@@ -893,6 +917,11 @@ let silentCheckTimer = null
 // WebTransport (UDP/QUIC) 自适应：连续 2 次失败后 5 分钟内回落 WebSocket(TCP)
 let wtFailCount = 0
 let wtDisabledUntil = 0
+const wtMediaDatagramMagic = [0x5a, 0x56, 0x4d, 0x44]
+const wtMediaDatagramHeaderBytes = 12
+const wtMediaFrameTtlMs = 250
+const wtMediaMaxInflightFrames = 3
+const transportStats = ref(null)
 
 const clearSilentCheckTimer = () => {
   if (silentCheckTimer) {
@@ -1078,7 +1107,8 @@ const refreshCanvasContext = () => {
   })
 
   if (ctx) {
-    ctx.imageSmoothingEnabled = false
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
   }
 }
 
@@ -1315,9 +1345,9 @@ const connect = async () => {
     const relayUrl = `${wsProtocol}://${window.location.host}${sessionInfo.ws_url}`
     // 传输候选：WebTransport (UDP/QUIC) 优先，失败/超时自适应回落 WebSocket (TCP)。
     // HTTPS 页面下 ws:// 直连属于混合内容会被浏览器拦截，自动走 wss 中继。
-    // P2-UDP 暂停：UDP/QUIC 链路在真实环境稳定性未达标（多进程投递/回程帧/竞态已修但待打磨），
-    // 按用户决策暂回退为纯 TCP（WebSocket 中继）；恢复 UDP 时删除下方 wtTransportEnabled=false 即可。
-    const wtTransportEnabled = false
+    // UDP media uses lossy datagrams while session control stays on a reliable stream.
+    // Any unavailable browser or gateway still falls back to the TCP relay below.
+    const wtTransportEnabled = true
     if (wtTransportEnabled && window.WebTransport && sessionInfo.wt_url && sessionInfo.wt_cert_hash && Date.now() > wtDisabledUntil) {
       try {
         const adapter = await openWebTransportAdapter(sessionInfo)
@@ -1368,13 +1398,100 @@ const openWebTransportAdapter = async (sessionInfo) => {
     new Promise((_, reject) => setTimeout(() => reject(new Error('webtransport ready timeout')), 4000))
   ])
 
+  if (!wt.datagrams?.readable || !wt.datagrams?.writable) {
+    wt.close()
+    throw new Error('webtransport datagrams unavailable')
+  }
+
   const stream = await wt.createBidirectionalStream()
   const writer = stream.writable.getWriter()
   const reader = stream.readable.getReader()
+  const datagramReader = wt.datagrams.readable.getReader()
 
   // WT 流是无消息边界的字节流 → 与网关约定长度前缀帧：[4B len][1B type(0=text,1=binary)][payload]
   let closed = false
   let buffer = new Uint8Array(0)
+  const mediaFrames = new Map()
+  const wtMediaStats = { received: 0, dropped: 0, datagrams: 0 }
+  let adapter
+  let lastKeyframeRequestAt = 0
+
+  const publishMediaStats = () => {
+    transportStats.value = {
+      ...(transportStats.value || {}),
+      transport: 'wt-quic-datagram',
+      media_frames_received: wtMediaStats.received,
+      media_datagrams_received: wtMediaStats.datagrams,
+      media_frames_client_dropped: wtMediaStats.dropped
+    }
+  }
+
+  const discardExpiredMediaFrames = (now) => {
+    let dropped = false
+    for (const [frameId, frame] of mediaFrames) {
+      if (now - frame.updatedAt > wtMediaFrameTtlMs) {
+        mediaFrames.delete(frameId)
+        wtMediaStats.dropped += 1
+        dropped = true
+      }
+    }
+    if (dropped) requestKeyframeAfterMediaLoss(now)
+  }
+
+  const requestKeyframeAfterMediaLoss = (now = Date.now()) => {
+    if (!adapter || now - lastKeyframeRequestAt < 1000) return
+    lastKeyframeRequestAt = now
+    adapter.send(JSON.stringify({ type: 'request_keyframe', reason: 'media_datagram_loss' }))
+  }
+
+  const consumeMediaDatagram = (value) => {
+    const datagram = value instanceof Uint8Array ? value : new Uint8Array(value)
+    if (datagram.byteLength < wtMediaDatagramHeaderBytes) return
+    for (let index = 0; index < wtMediaDatagramMagic.length; index += 1) {
+      if (datagram[index] !== wtMediaDatagramMagic[index]) return
+    }
+    const view = new DataView(datagram.buffer, datagram.byteOffset, datagram.byteLength)
+    const frameId = view.getUint32(4)
+    const fragmentIndex = view.getUint16(8)
+    const fragmentCount = view.getUint16(10)
+    if (!fragmentCount || fragmentCount > 512 || fragmentIndex >= fragmentCount) return
+
+    const now = Date.now()
+    discardExpiredMediaFrames(now)
+    let frame = mediaFrames.get(frameId)
+    if (!frame) {
+      let evicted = false
+      while (mediaFrames.size >= wtMediaMaxInflightFrames) {
+        const oldestFrameId = mediaFrames.keys().next().value
+        mediaFrames.delete(oldestFrameId)
+        wtMediaStats.dropped += 1
+        evicted = true
+      }
+      if (evicted) requestKeyframeAfterMediaLoss(now)
+      frame = {
+        fragments: new Array(fragmentCount),
+        receivedCount: 0,
+        updatedAt: now
+      }
+      mediaFrames.set(frameId, frame)
+    }
+    if (frame.fragments.length !== fragmentCount || frame.fragments[fragmentIndex]) return
+
+    frame.fragments[fragmentIndex] = datagram.slice(wtMediaDatagramHeaderBytes)
+    frame.receivedCount += 1
+    frame.updatedAt = now
+    wtMediaStats.datagrams += 1
+    if (frame.receivedCount !== fragmentCount) {
+      publishMediaStats()
+      return
+    }
+
+    mediaFrames.delete(frameId)
+    wtMediaStats.received += 1
+    publishMediaStats()
+    const mediaFrame = concatUint8(frame.fragments)
+    handleBinaryFrame(mediaFrame.buffer)
+  }
 
   const markOpen = () => {
     ws = adapter
@@ -1383,12 +1500,13 @@ const openWebTransportAdapter = async (sessionInfo) => {
     connectionStatus.value = 'connecting'
     awaitingConsent.value = true
     reconnectAttempts = 0
+    transportStats.value = null
     // P1-1.4：媒体面状态复位（新连接从 waiting 开始）
     mediaState.value = 'waiting'
     lastDecodedFrameId.value = 0
   }
 
-  const adapter = {
+  adapter = {
     readyState: WebSocket.OPEN,
     send: (data) => {
       if (closed) return
@@ -1419,26 +1537,44 @@ const openWebTransportAdapter = async (sessionInfo) => {
 
   markOpen()
   markSessionConnected()
+  adapter.send(JSON.stringify({ type: 'transport_ready', transport: 'wt-quic-datagram' }))
+
+  const readReliableStream = async (sourceReader) => {
+    let streamBuffer = new Uint8Array(0)
+    while (true) {
+      const { value, done } = await sourceReader.read()
+      if (done) return
+      streamBuffer = concatU8(streamBuffer, value)
+      while (streamBuffer.length >= 5) {
+        const len = (streamBuffer[0] << 24) | (streamBuffer[1] << 16) | (streamBuffer[2] << 8) | streamBuffer[3]
+        if (len < 0 || streamBuffer.length < 5 + len) break
+        const ftype = streamBuffer[4]
+        const payload = streamBuffer.slice(5, 5 + len)
+        streamBuffer = streamBuffer.slice(5 + len)
+        if (ftype === 0) {
+          handleMessage(new TextDecoder().decode(payload))
+        } else {
+          handleBinaryFrame(payload.buffer)
+        }
+      }
+    }
+  }
 
   ;(async () => {
     try {
       while (true) {
-        const { value, done } = await reader.read()
+        const { value, done } = await datagramReader.read()
         if (done) break
-        buffer = concatU8(buffer, value)
-        while (buffer.length >= 5) {
-          const len = (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3]
-          if (buffer.length < 5 + len) break
-          const ftype = buffer[4]
-          const payload = buffer.slice(5, 5 + len)
-          buffer = buffer.slice(5 + len)
-          if (ftype === 0) {
-            handleMessage(new TextDecoder().decode(payload))
-          } else {
-            handleBinaryFrame(payload.buffer)
-          }
-        }
+        consumeMediaDatagram(value)
       }
+    } catch (e) {
+      console.warn('WebTransport datagram reader ended:', e)
+    }
+  })()
+
+  ;(async () => {
+    try {
+      await readReliableStream(reader)
     } catch (e) {
       console.warn('WebTransport 流读取结束:', e)
     }
@@ -1449,6 +1585,22 @@ const openWebTransportAdapter = async (sessionInfo) => {
       if (!reconnectSuppressed && sessionSettings.value.autoReconnect) {
         scheduleReconnect()
       }
+    }
+  })()
+
+  ;(async () => {
+    const incomingReader = wt.incomingUnidirectionalStreams?.getReader()
+    if (!incomingReader) return
+    try {
+      while (true) {
+        const { value: incomingStream, done } = await incomingReader.read()
+        if (done) return
+        readReliableStream(incomingStream.getReader()).catch((e) => {
+          console.warn('WebTransport 关键帧流读取结束:', e)
+        })
+      }
+    } catch (e) {
+      console.warn('WebTransport 关键帧流接收结束:', e)
     }
   })()
 
@@ -1943,6 +2095,9 @@ const handleMessage = (data) => {
         profile: message.profile || sessionSettings.value.profile,
         wheelSpeed: normalizeNumber(message.wheel_speed, sessionSettings.value.wheelSpeed),
         mouseSensitivity: normalizeNumber(message.mouse_sensitivity, sessionSettings.value.mouseSensitivity),
+        captureBackend: captureBackendOptions.some(option => option.value === message.capture_backend)
+          ? message.capture_backend
+          : sessionSettings.value.captureBackend,
         preset: message.preset || sessionSettings.value.preset,
         desktopWidth: Math.max(
           1,
@@ -2076,6 +2231,11 @@ const handleMessage = (data) => {
       } else {
         ElMessage.error(message.message || 'Ctrl+Alt+Del 发送失败')
       }
+    } else if (message.type === 'transport_stats') {
+      transportStats.value = {
+        ...(transportStats.value || {}),
+        ...message
+      }
     } else if (message.type === 'pipeline_stats') {
       // P1-1.1：引擎分段指标（Capture/Encode/Queue/Send）
       engineStats.value = message
@@ -2091,6 +2251,18 @@ const handleMessage = (data) => {
 }
 
 const isSocketOpen = () => Boolean(ws && ws.readyState === WebSocket.OPEN)
+
+const hasSocketBackpressure = (limit) => isSocketOpen() && Number(ws.bufferedAmount || 0) > limit
+
+const shouldDropMouseEventForBackpressure = (type) => {
+  if (type === 'move' || type === 'mousemove') {
+    return hasSocketBackpressure(mouseMoveBackpressureDropBytes)
+  }
+  if (type === 'wheel') {
+    return hasSocketBackpressure(mouseWheelBackpressureDropBytes)
+  }
+  return false
+}
 
 const sendSocketMessage = (payload) => {
   if (!isSocketOpen()) {
@@ -3423,6 +3595,9 @@ const flushPendingDragMove = (event, force = false) => {
     if (now - lastDragMoveAt < dragMoveThrottle) {
       return
     }
+    if (hasSocketBackpressure(mouseMoveBackpressureDropBytes)) {
+      return
+    }
     lastDragMoveAt = now
   }
 
@@ -3678,6 +3853,10 @@ const sendMouseEvent = (type, event, options = {}) => {
     return
   }
 
+  if (shouldDropMouseEventForBackpressure(type)) {
+    return
+  }
+
   const canvas = desktopCanvas.value
   if (!canvas) {
     return
@@ -3845,8 +4024,8 @@ const getPresetSettings = (preset) => {
   if (preset === 'high') {
     return {
       preset: 'high',
-      quality: 90,
-      fps: 24,
+      quality: 95,
+      fps: 60,
       scalePercent: 100,
       adaptive: false
     }
@@ -3868,13 +4047,16 @@ const markPresetCustom = () => {
 }
 
 const normalizeSettingsState = (source, fallback = sessionSettings.value) => ({
-  quality: Math.max(35, Math.min(90, Math.round(normalizeNumber(source.quality, fallback.quality)))),
-  fps: Math.max(4, Math.min(30, Math.round(normalizeNumber(source.fps, fallback.fps)))),
+  quality: Math.max(35, Math.min(95, Math.round(normalizeNumber(source.quality, fallback.quality)))),
+  fps: Math.max(4, Math.min(60, Math.round(normalizeNumber(source.fps, fallback.fps)))),
   scalePercent: Math.max(40, Math.min(100, Math.round(normalizeNumber(source.scalePercent, fallback.scalePercent)))),
   adaptive: Boolean(source.adaptive),
   profile: source.profile || fallback.profile || 'interactive',
   wheelSpeed: Math.max(0.5, Math.min(3, normalizeNumber(source.wheelSpeed, fallback.wheelSpeed))),
   mouseSensitivity: Math.max(0.5, Math.min(2, normalizeNumber(source.mouseSensitivity, fallback.mouseSensitivity))),
+  captureBackend: captureBackendOptions.some(option => option.value === source.captureBackend)
+    ? source.captureBackend
+    : (captureBackendOptions.some(option => option.value === fallback.captureBackend) ? fallback.captureBackend : 'auto'),
   preset: source.preset || fallback.preset || 'custom',
   desktopWidth: Math.max(
     1,
@@ -3917,6 +4099,7 @@ const sendSettingsPayload = (nextSettings) => {
     adaptive: nextSettings.adaptive,
     wheel_speed: nextSettings.wheelSpeed,
     mouse_sensitivity: nextSettings.mouseSensitivity,
+    capture_backend: nextSettings.captureBackend,
     preset: nextSettings.preset || 'custom'
   })
   return true
@@ -4246,6 +4429,10 @@ const handleClose = () => {
       type: 'warning',
       confirmButtonText: '断开',
       cancelButtonText: '取消',
+      // A browser fullscreen session only renders descendants of the
+      // fullscreen element.  Appending the programmatic MessageBox to body
+      // makes it invisible behind the fullscreen desktop.
+      appendTo: disconnectConfirmAppendTarget(),
     })
       .then(() => void requestDialogClose())
       .catch(() => {})
@@ -4346,10 +4533,7 @@ const normalizeNumber = (value, fallback) => {
   outline: none;
   touch-action: none;
   user-select: none;
-  /* 禁用图像平滑以提高清晰度 */
-  image-rendering: -webkit-optimize-contrast;
-  image-rendering: crisp-edges;
-  image-rendering: pixelated;
+  image-rendering: auto;
   /* 保持原始尺寸，不拉伸 */
   object-fit: contain;
 }

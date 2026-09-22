@@ -111,6 +111,14 @@ class TestClassifyInterfaceType:
 
 
 class TestSelectPrimaryInterface:
+    def test_prefers_actual_platform_route_over_faster_virtual_tunnel(self):
+        ifaces = [
+            {"interface_name": "vgate0", "status": "up", "ipv4": "172.30.242.137", "interface_type": "vpn", "link_speed": 100_000},
+            {"interface_name": "WLAN", "status": "up", "ipv4": "172.17.40.137", "interface_type": "wifi", "link_speed": 866},
+        ]
+        primary = select_primary_interface(ifaces, routed_interface_name="WLAN")
+        assert primary["interface_name"] == "WLAN"
+
     def test_prefers_fastest_physical_up(self):
         ifaces = [
             {"interface_name": "VMware", "status": "up", "ipv4": "192.168.88.1", "interface_type": "virtual", "link_speed": 1000},

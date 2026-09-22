@@ -2205,6 +2205,17 @@ def ensure_windows_dpi_awareness() -> bool:
     return False
 
 
+def should_enable_process_dpi_awareness(raw_args: list[str]) -> bool:
+    """Keep the tray/consent UI DPI-unaware while capture roles stay accurate.
+
+    The interactive helper owns only tray and consent windows.  On some Windows
+    11 sessions, inheriting the remote-capture Per-Monitor context makes native
+    popup-menu metrics scale while their glyphs do not render.  It does not need
+    physical-pixel screen metrics, unlike the service and user-session agent.
+    """
+    return "--consent-ui" not in raw_args
+
+
 def cleanup_stale_mei_dirs(max_age_minutes: int = 30) -> int:
     """自清前代已死进程遗留的 _MEI* 临时解压目录（V1.8.0 起委托 zvagent.hygiene）。"""
     try:
@@ -2305,12 +2316,13 @@ def run_stop_agent() -> int:
 
 
 def main(argv: list[str] | None = None):
-    ensure_windows_dpi_awareness()
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if should_enable_process_dpi_awareness(raw_args):
+        ensure_windows_dpi_awareness()
     try:
         cleanup_stale_mei_dirs()
     except Exception:
         pass
-    raw_args = list(sys.argv[1:] if argv is None else argv)
 
     if should_handle_service_command(raw_args):
         handle_service_command_line(raw_args)

@@ -14,7 +14,7 @@ import json
 import time
 import hashlib
 import shutil
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse
@@ -114,6 +114,41 @@ def get_latest_upgrade() -> Dict[str, Any]:
             LATEST_UPGRADE.update(m)
             _MANIFEST_MTIME = mtime
     return dict(LATEST_UPGRADE)
+
+
+def parse_upgrade_target_asset_ids(value: Any) -> List[int]:
+    """Normalize an optional manifest allowlist of assets for a staged upgrade."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("target_asset_ids must be a JSON array of positive integers") from exc
+    if not isinstance(value, list):
+        raise ValueError("target_asset_ids must be a JSON array of positive integers")
+
+    target_ids = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError("target_asset_ids must be a JSON array of positive integers")
+        try:
+            asset_id = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_asset_ids must be a JSON array of positive integers") from exc
+        if asset_id <= 0 or str(asset_id) != str(item).strip():
+            raise ValueError("target_asset_ids must be a JSON array of positive integers")
+        target_ids.append(asset_id)
+    return sorted(set(target_ids))
+
+
+def get_upgrade_target_asset_ids(manifest: Dict[str, Any]) -> List[int]:
+    """Read the staged-upgrade allowlist, treating a malformed legacy manifest as global."""
+    try:
+        return parse_upgrade_target_asset_ids(manifest.get("target_asset_ids"))
+    except ValueError:
+        safe_console_print("[AgentUpgrade] ignoring malformed target_asset_ids in manifest")
+        return []
 
 
 def record_agent_version(asset_id: int, version: Optional[str]):
@@ -243,12 +278,17 @@ async def upload_upgrade(
     file: UploadFile = File(...),
     version: str = Form(...),
     allow_downgrade: bool = Form(False),
+    target_asset_ids: Optional[str] = Form(None),
 ):
     """上传新版本 Agent 包（admin）。幂等：同版本覆盖。支持 .exe（单文件）与 .zip（onedir 目录包）。"""
     _require_admin(request)
     version = version.strip()
     if not version or not version.replace(".", "").replace("-", "").isalnum():
         raise HTTPException(status_code=422, detail="Invalid version format")
+    try:
+        targets = parse_upgrade_target_asset_ids(target_asset_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     filename_lower = (file.filename or "").lower()
     if filename_lower.endswith(".exe"):
@@ -318,13 +358,23 @@ async def upload_upgrade(
         "filename": stored_name,
         "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "uploaded_by": get_request_username(request, fallback="console"),
+        "target_asset_ids": targets,
     })
     _save_manifest(manifest)
     LATEST_UPGRADE.clear()
     LATEST_UPGRADE.update(manifest)
 
-    safe_console_print(f"[AgentUpgrade] uploaded version={version} size={size} sha256={digest[:16]}...")
-    return {"message": "Upgrade package uploaded", "version": version, "sha256": digest, "size": size}
+    safe_console_print(
+        f"[AgentUpgrade] uploaded version={version} size={size} sha256={digest[:16]}... "
+        f"targets={targets or 'all'}"
+    )
+    return {
+        "message": "Upgrade package uploaded",
+        "version": version,
+        "sha256": digest,
+        "size": size,
+        "target_asset_ids": targets,
+    }
 
 
 @router.get("/status")

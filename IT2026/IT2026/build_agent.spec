@@ -81,7 +81,6 @@ if not backup_candidate.exists():
 for candidate in [
     project_root / "config.json",
     backup_candidate,
-    project_root / "cmdb_agent_consent_ui.legacy.pyc",
 ]:
     if candidate.exists():
         datas.append((str(candidate), "."))
@@ -93,6 +92,10 @@ if drivers_root.exists():
         if driver_file.is_file():
             relative_parent = driver_file.parent.relative_to(project_root)
             datas.append((str(driver_file), str(relative_parent)))
+gpu_media_bridge = project_root / "native" / "gpu_media_bridge" / "bin" / "zview_gpu_media_bridge.dll"
+if gpu_media_bridge.is_file():
+    # Optional signed native path.  The runtime still performs ABI/capability checks.
+    datas.append((str(gpu_media_bridge), "."))
 datas += _safe_collect_data_files("pyautogui")
 datas += _safe_collect_data_files("mouseinfo")
 datas += _safe_collect_data_files("dxcam")

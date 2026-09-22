@@ -6,6 +6,7 @@ import os
 import platform
 import socket
 from datetime import datetime
+from urllib.parse import urlparse
 
 import psutil
 
@@ -51,13 +52,19 @@ def _ip_in_same_subnet(ip: str, gateway: str) -> bool:
 
 
 def get_primary_network_info() -> tuple[str | None, str | None]:
-    """返回 (ip_address, mac_address)，智能排除虚拟网卡。
+    """返回 (ip_address, mac_address)，优先选择可达平台的出站网卡。
 
     P0 修复：注册路径要求 hostname/ip/mac 三字段非空——此前在部分物理机
     （Hyper-V vSwitch / 多 NIC / MAC 缺失）上会返回空值导致注册 400。
     修复策略：虚拟过滤无候选时回退全接口；MAC 兜底取任意非空 AF_LINK；
     最终兜底返回占位值（"0.0.0.0"/"unknown-mac"），不再返回空。
     """
+    routed_ip = _get_platform_route_source_ip()
+    if routed_ip:
+        routed_mac = _get_mac_for_ipv4(routed_ip)
+        if routed_mac:
+            return routed_ip, routed_mac
+
     result = _select_primary_nic(include_virtual=False)
     if result and result[0]:
         ip, mac = result
@@ -81,6 +88,80 @@ def get_primary_network_info() -> tuple[str | None, str | None]:
         pass
     # 最终兜底：不返回空（注册 400 根因）
     return "0.0.0.0", "unknown-mac"
+
+
+def _get_platform_route_source_ip() -> str | None:
+    """Return the local IPv4 Windows would use to reach the configured platform.
+
+    A UDP connect only asks the OS routing table for a source address; it sends
+    no traffic. This avoids mistaking a high-speed VPN/virtual adapter for the
+    Wi-Fi or Ethernet interface that actually reaches the management server.
+    """
+    try:
+        from zvagent.config import CONFIG
+
+        server_url = str(CONFIG.get("server_url") or "").strip()
+        parsed = urlparse(server_url)
+        host = parsed.hostname
+        if not host:
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        for family, socktype, proto, _canonname, sockaddr in addresses:
+            with socket.socket(family, socktype, proto) as probe:
+                probe.connect(sockaddr)
+                source_ip = str(probe.getsockname()[0] or "")
+            if _is_usable_ipv4(source_ip):
+                return source_ip
+    except Exception:
+        pass
+    return None
+
+
+def get_platform_route_interface_name() -> str | None:
+    """返回到管理平台的实际出站网卡名称。
+
+    先由 Windows 路由表确定本机出站 IPv4，再映射回 psutil 的接口名。这样
+    网络状态页不会把标称速率更高、但不承载平台流量的 VPN / 隧道网卡误作主网卡。
+    """
+    source_ip = _get_platform_route_source_ip()
+    if not source_ip:
+        return None
+    try:
+        for name, addrs in psutil.net_if_addrs().items():
+            if any(
+                addr.family == socket.AF_INET and addr.address == source_ip
+                for addr in addrs
+            ):
+                return name
+    except Exception:
+        pass
+    return None
+
+
+def _is_usable_ipv4(ip_address: str) -> bool:
+    try:
+        packed = socket.inet_aton(ip_address)
+    except OSError:
+        return False
+    return bool(packed and ip_address not in {"0.0.0.0", "127.0.0.1"} and not ip_address.startswith("169.254."))
+
+
+def _get_mac_for_ipv4(ip_address: str) -> str | None:
+    try:
+        for addrs in psutil.net_if_addrs().values():
+            matched_ip = any(
+                addr.family == socket.AF_INET and addr.address == ip_address
+                for addr in addrs
+            )
+            if not matched_ip:
+                continue
+            for addr in addrs:
+                if addr.family == psutil.AF_LINK and addr.address:
+                    return addr.address
+    except Exception:
+        pass
+    return None
 
 
 def _select_primary_nic(include_virtual: bool) -> tuple[str, str] | None:
