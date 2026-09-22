@@ -94,12 +94,25 @@ def _save_manifest(manifest: Dict[str, Any]):
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
 
+_MANIFEST_MTIME: float = 0.0
+
+
 def get_latest_upgrade() -> Dict[str, Any]:
-    """供 heartbeat handler 调用：返回最新升级信息（无则空 dict）。"""
-    if not LATEST_UPGRADE:
+    """供 heartbeat handler 调用：返回最新升级信息（无则空 dict）。
+
+    manifest.json 按 mtime 变化自动重载——带外发布（脚本直写 manifest）无需重启后端。
+    """
+    global _MANIFEST_MTIME
+    try:
+        mtime = os.path.getmtime(MANIFEST_PATH)
+    except OSError:
+        mtime = 0.0
+    if not LATEST_UPGRADE or mtime != _MANIFEST_MTIME:
         m = _load_manifest()
         if m.get("version"):
+            LATEST_UPGRADE.clear()
             LATEST_UPGRADE.update(m)
+            _MANIFEST_MTIME = mtime
     return dict(LATEST_UPGRADE)
 
 
