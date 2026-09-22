@@ -12,8 +12,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const assetsTarget = env.VITE_PROXY_ASSETS_TARGET || 'http://127.0.0.1:8080'
-  const softwareTarget = env.VITE_PROXY_SOFTWARE_TARGET || 'http://127.0.0.1:8081'
-  const policyTarget = env.VITE_PROXY_POLICY_TARGET || 'http://127.0.0.1:8082'
+  // #18 批次C：软件管理/策略已并入主服务（8080），8081/8082 独立进程退役；
+  // 保留 VITE_PROXY_* 环境变量覆盖能力以便回滚
+  const softwareTarget = env.VITE_PROXY_SOFTWARE_TARGET || 'http://127.0.0.1:8080'
+  const policyTarget = env.VITE_PROXY_POLICY_TARGET || 'http://127.0.0.1:8080'
   const proxy = {
     '/api/v1/software/all': {
       target: assetsTarget,
