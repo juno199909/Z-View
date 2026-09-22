@@ -5,14 +5,17 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from fnmatch import fnmatch
 from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import HTTPException, Request
+from mysql.connector import Error
 
 from config_utils import get_env, get_or_create_secret
+from zvplatform.db import create_connection  # noqa: E402  (#10 用户账号入库：auth_state.json → platform_users，文件保留为回落快照)
 
 
 DEFAULT_ADMIN_USERNAME = get_env("ZVIEW_ADMIN_USERNAME", "admin") or "admin"
@@ -320,7 +323,8 @@ def _legacy_state_to_users(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_auth_state() -> Dict[str, Any]:
+def _load_auth_state_file() -> Dict[str, Any]:
+    """文件回落存储读取（auth_state.json）。DB 不可用时保证登录韧性。"""
     if not os.path.exists(AUTH_STATE_FILE):
         return _bootstrap_auth_state()
 
@@ -353,7 +357,8 @@ def _load_auth_state() -> Dict[str, Any]:
     return {"users": users}
 
 
-def _save_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
+def _save_auth_state_file(state: Dict[str, Any]) -> Dict[str, Any]:
+    """文件回落存储写入（与 DB 双写，作为 MySQL 闪断时的登录回落快照）。"""
     users = []
     seen = set()
     for raw in state.get("users") or []:
@@ -373,6 +378,187 @@ def _save_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
         json.dump(normalized, fp, ensure_ascii=False, indent=2)
     os.replace(temp_path, AUTH_STATE_FILE)
     return normalized
+
+
+_PLATFORM_USERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS platform_users (
+    username VARCHAR(100) PRIMARY KEY,
+    role VARCHAR(20) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    credential_source VARCHAR(50) NULL,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    token_version INT NOT NULL DEFAULT 1,
+    password_updated_at VARCHAR(40) NULL,
+    created_at VARCHAR(40) NULL,
+    scoped_group_ids JSON NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+_PLATFORM_USER_COLUMNS = (
+    "username", "role", "password_hash", "credential_source", "enabled",
+    "token_version", "password_updated_at", "created_at", "scoped_group_ids",
+)
+
+
+def _user_entry_to_row(user: Dict[str, Any]) -> tuple:
+    groups = user.get("scoped_group_ids")
+    groups_json = json.dumps([int(g) for g in groups]) if isinstance(groups, list) and groups else None
+    return (
+        user.get("username"),
+        normalize_role(user.get("role")),
+        user.get("password_hash"),
+        user.get("credential_source") or "db",
+        1 if user.get("enabled", True) else 0,
+        int(user.get("token_version") or 1),
+        user.get("password_updated_at"),
+        user.get("created_at"),
+        groups_json,
+    )
+
+
+def _row_to_user_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+    groups_raw = row.get("scoped_group_ids")
+    try:
+        groups = json.loads(groups_raw) if isinstance(groups_raw, str) else groups_raw
+    except (TypeError, ValueError):
+        groups = None
+    return {
+        "username": row.get("username"),
+        "role": normalize_role(row.get("role")),
+        "password_hash": row.get("password_hash"),
+        "credential_source": row.get("credential_source") or "db",
+        "enabled": bool(row.get("enabled", True)),
+        "token_version": int(row.get("token_version") or 1),
+        "password_updated_at": row.get("password_updated_at"),
+        "created_at": row.get("created_at"),
+        "scoped_group_ids": groups if isinstance(groups, list) else [],
+    }
+
+
+def _ensure_platform_users_table(conn) -> None:
+    cursor = conn.cursor()
+    try:
+        cursor.execute(_PLATFORM_USERS_TABLE_SQL)
+        conn.commit()
+    finally:
+        cursor.close()
+
+
+def _load_auth_state_db(conn) -> Optional[Dict[str, Any]]:
+    """从 platform_users 读取；表空返回 None（触发文件迁移）。"""
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(f"SELECT {', '.join(_PLATFORM_USER_COLUMNS)} FROM platform_users")
+        rows = cursor.fetchall() or []
+        if not rows:
+            return None
+        users = []
+        seen = set()
+        for row in rows:
+            entry = _row_to_user_entry(row)
+            if not entry["username"] or not entry["password_hash"]:
+                continue
+            if entry["username"] in seen:
+                continue
+            seen.add(entry["username"])
+            users.append(entry)
+        return {"users": users} if users else None
+    finally:
+        cursor.close()
+
+
+def _save_auth_state_db(conn, state: Dict[str, Any]) -> None:
+    """全量同步 state 到 platform_users（INSERT 新用户 / UPDATE 存量 / DELETE 已删）。"""
+    cursor = conn.cursor()
+    try:
+        keep = []
+        for user in state.get("users") or []:
+            username = user.get("username")
+            if not username:
+                continue
+            keep.append(username)
+            row = _user_entry_to_row(user)
+            cursor.execute(
+                f"INSERT INTO platform_users ({', '.join(_PLATFORM_USER_COLUMNS)}) "
+                f"VALUES ({', '.join(['%s'] * len(_PLATFORM_USER_COLUMNS))}) "
+                f"ON DUPLICATE KEY UPDATE "
+                "role=VALUES(role), password_hash=VALUES(password_hash), "
+                "credential_source=VALUES(credential_source), enabled=VALUES(enabled), "
+                "token_version=VALUES(token_version), password_updated_at=VALUES(password_updated_at), "
+                "created_at=VALUES(created_at), scoped_group_ids=VALUES(scoped_group_ids)",
+                row,
+            )
+        if keep:
+            placeholders = ", ".join(["%s"] * len(keep))
+            cursor.execute(
+                f"DELETE FROM platform_users WHERE username NOT IN ({placeholders})",
+                tuple(keep),
+            )
+        conn.commit()
+    except Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+def _load_auth_state() -> Dict[str, Any]:
+    """用户存储读取：DB 优先，MySQL 不可用回落文件（登录韧性）。"""
+    try:
+        conn = create_connection()
+    except Exception:
+        conn = None
+
+    if conn:
+        try:
+            _ensure_platform_users_table(conn)
+            state = _load_auth_state_db(conn)
+            if state is None:
+                # DB 空：从文件自动迁移（文件保留为回落快照）
+                file_state = _load_auth_state_file()
+                if file_state.get("users"):
+                    _save_auth_state_db(conn, file_state)
+                    print("[Auth] auth_state.json 已自动迁移至 platform_users 表",
+                          file=sys.stderr)
+                    return file_state
+                state = _bootstrap_auth_state()
+                _save_auth_state_db(conn, state)
+                print("[Auth] 引导管理员已写入 platform_users 表", file=sys.stderr)
+                return state
+            conn.close()
+            return state
+        except Error as exc:
+            safe_console_print(f"[Auth] platform_users 读取失败，回落 auth_state.json: {exc}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return _load_auth_state_file()
+
+
+def _save_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """用户存储写入：DB 优先（失败回落纯文件），文件双写作为回落快照。"""
+    normalized_file = _save_auth_state_file(state)
+
+    try:
+        conn = create_connection()
+    except Exception:
+        conn = None
+
+    if conn:
+        try:
+            _ensure_platform_users_table(conn)
+            _save_auth_state_db(conn, normalized_file)
+            conn.close()
+        except Error as exc:
+            safe_console_print(f"[Auth] platform_users 写入失败，仅文件生效: {exc}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return normalized_file
 
 
 def _find_user(state: Dict[str, Any], username: str) -> Optional[Dict[str, Any]]:
