@@ -88,6 +88,8 @@ def ensure_root_ca() -> tuple[str, str]:
             .not_valid_before(now - datetime.timedelta(days=2))
             .not_valid_after(now + ROOT_LIFETIME)
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(root_key.public_key()), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()), critical=False)
             .add_extension(x509.KeyUsage(
                 digital_signature=True, key_cert_sign=True, crl_sign=True,
                 key_encipherment=False, content_commitment=False,
@@ -139,6 +141,9 @@ def _generate() -> None:
         .not_valid_after(now + CERT_LIFETIME - datetime.timedelta(hours=1))
         .add_extension(san, critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
+            root_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value), critical=False)
         # Chrome serverCertificateHashes 硬性要求：EKU 必须含 serverAuth（缺失即 CERTIFICATE_VERIFY_FAILED）
         .add_extension(
             x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
