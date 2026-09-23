@@ -3641,5 +3641,12 @@
 - **L3 恢复为原始会话目录**：仅保留 .env、.kilo、config.json、qc、query、README.md 与 IT2026 代码根本体。
 - **验证**：`git status` 归零（0 待处理项）；8080 健康；三终端心跳 1-7s 全绿。敏感文件（auth_state.json/wt_certs 私钥/.env 副本）随隔离移出仓库树，泄露面消除。
 - **回退方式**：如需找回副本内容，从隔离目录移回即可；确认无需后可整目录删除。
+## [2026-09-23] 远程分支清理：摘入两处真实修复后删除 codex 与 fix/codesign 分支
+
+- **核查**：远程 3 分支中，codex（08-20 分叉）与 fix/codesign-cert-selection-20260920（09-20 分叉）均未合并，各含一处 main 缺失的真实修复。
+- **摘入**：① `5111b47e` coordinate_mapper 归一化输入校验与钳制 + 回归测试 6 用例（测试的 import 路径/层级按当前结构修正）；② `77939e92` sign_agent.ps1 支持 ZVIEW_CODESIGN_THUMBPRINT 固定证书与有效证书自动选择（清除过时 93C05132 指纹引用），语法校验通过。
+- **清理**：两修复推送 main（aeecb2bc→77939e92）后，远程分支 codex、fix/codesign-cert-selection-20260920 已删除，远程现仅剩 main。
+- **验证**：坐标测试 6 passed；sign_agent.ps1 Parser 语法 0 错误；推送后 origin/main 同步。
+
 
 
