@@ -11,7 +11,8 @@ $ErrorActionPreference = 'Stop'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppRootCandidates = @(
     (Join-Path $ScriptRoot 'IT2026\IT2026'),
-    (Join-Path $ScriptRoot 'IT2026')
+    (Join-Path $ScriptRoot 'IT2026'),
+    $ScriptRoot
 )
 $AppRoot = $null
 foreach ($candidate in $AppRootCandidates) {

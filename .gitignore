@@ -52,8 +52,8 @@ agent_upgrade/
 *.secret
 
 # Runtime-generated cert directories (re-generated on demand)
-IT2026/IT2026/frontend/certs/
-IT2026/IT2026/wt_certs/
+frontend/certs/
+wt_certs/
 
 # Per-machine environment and config
 .env
@@ -65,10 +65,10 @@ auth_state.json
 agent_secret.txt
 
 # Code signing private key (never commit)
-IT2026/IT2026/signing/
+signing/
 
 # GPO deployment package runtime config
-IT2026/GPO部署包/config.json
+GPO部署包/config.json
 
 # --- Service manager binary (build artifact)
 ZViewServiceManager.exe
