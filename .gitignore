@@ -75,3 +75,7 @@ ZViewServiceManager.exe
 
 # 旧仓库目录残留（.git 句柄被会话占用无法移动，会话结束后删除 D:\IT2026\IT2026）
 /IT2026/
+
+# --- 仓外数据目录（隔离副本/诊断/备份，永不入库）
+/backups/
+/diagnostics/
