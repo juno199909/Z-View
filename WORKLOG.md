@@ -1,4 +1,4 @@
-﻿# WORKLOG
+# WORKLOG
 
 > Newest entry on top. See CLAUDE.md for the ledger rules.
 
@@ -14,6 +14,31 @@
 ---
 
 <!-- log entries below, newest first -->
+
+## [2026-09-23] 策略中心 USB 开关"一刷新就禁用"修复（在并行会话覆盖中丢失，本条为恢复重录）
+
+- **目标**：策略中心 USB 策略启用状态刷新后错误显示"禁用"，修复显示与真实状态不一致。
+- **根因**：后端 enabled 为 TINYINT 返回数字 1/0；Policies.vue:33 el-switch 未设 active-value 按布尔比较，`1 === true` 为 false → 启用中的策略渲染成禁用。用户反复点击还会把真实状态点反。
+- **处置**：loadData 归一化 `enabled:!!p.enabled`（一行）；后端 PUT 实测正常（排除后端）。
+- **运维铁律**：vite preview（sirv）启动即缓存文件清单，**每次 build 后必须重启 preview**，否则前端更新不生效；4173 为 HTTPS（自签证书），探测须用 https。
+- **注意**：本修复及 2026-09-23 其余代码修复已被并行会话 git 操作覆盖，见下方回滚纪要"待用户决策"。
+
+## [2026-09-23] 1.9.72 全量推送：2213/2241 定向升级受阻排查与带外解除（恢复重录）
+
+- **现象**：2213（停 1.9.58）与 2241（停 1.9.57）未跟随升级，心跳正常。
+- **根因**：1.9.61→1.9.72 每次上传 manifest 均带 `target_asset_ids:[2245]`，心跳白名单过滤（agent_heartbeat.py:832-833）跳过名单外终端。
+- **处置**：直写 agent_upgrade/manifest.json 删除定向名单（mtime 热重载，未重启后端未重传 81MB 包），sha256 先行校验一致。
+- **验证**：2213/2241 UPG-1.9.72 COMMITTED（13:32:44），三终端全部 1.9.72。
+- **遗留**：升级回写出现 upgrade_id='UPG-1.9.51' 但 to_version=1.9.72 的重复记录，疑 zvagent/upgrade.py 上报字段取值陈旧，待查。
+
+## [2026-09-23] 结构变更回滚 + 数据恢复纪要（D:\ZView 实验已撤销）
+
+- **背景**：并行会话（big-clavicle，terminal-security-finalize）对主树执行 git 还原/清理，覆盖了本会话当日全部代码修复，并清掉了代码根未跟踪运行时文件（.env、config.json、auth_state.json、wt_certs/、agent_upgrade/、releases/、logs/、frontend/dist、frontend/certs）。用户要求"先还原回去"。
+- **已还原**：① D:\ZView junction 已删除，backups/diagnostics 原样搬回 D:\IT2026\（1+100 文件完好）；② .env/config.json 从 D:\IT2026\IT2026\IT2026\（level-3 副本）恢复到代码根，agent_secret.txt 按已知 token 重写；③ 用户账号无损失——platform_users 表完好（admin v10 + e2e_runner v2），auth_state.json 仅为回落快照；④ frontend/certs 与 wt_certs 重新生成（gen_frontend_cert.py / wt_cert.ensure_wt_cert）；⑤ frontend/dist 重新 build（12.1s）并重启 4173；⑥ start_platform 从原路径 Restart，8080/8443/8081/8082 全 UP，登录链路验证 OK。
+- **2241 心跳中断修复**：新前端证书与终端 runtime\ca-bundle.pem 不匹配 → HTTPS 8443 心跳 CERTIFICATE_VERIFY_FAILED（15:19 agent-error.log 实锤）。修复：用新 zview-cert.pem 覆盖 C:\ProgramData\CMDB-Agent\runtime\ca-bundle.pem + 重启 CMDB-Agent 服务。验证：三终端心跳 2-7s 全绿。
+- **遗留损失（可接受）**：agent_upgrade/1.9.60-72 升级包、releases/ 构建产物、logs/ 历史日志丢失——三终端已在 1.9.72，升级包下次发版重传即可；旧 wt 根 CA 私钥及 .bak 一并消失（安全上反而收益），新根需经 GPO 重分发后终端才恢复 HTTPS 严格校验（当前 2213/2245 走 HTTP 8080 不受影响，2241 已手动更新 bundle）。
+- **教训（重要）**：两个 Kilo 会话同时以主树为工作区时，任一方的 git checkout/clean 会摧毁对方的未提交修复与未跟踪运行时文件。规则：并行会话必须在各自 worktree 工作，禁止对主工作树执行 git restore/clean；代码根运行时文件（.env/auth_state/wt_certs/agent_upgrade）应纳入定期备份（D:\IT2026\backups）。
+- **待用户决策**：本会话当日被覆盖的代码修复（Policies.vue 开关归一化、7 文件冲突标记解决、9 处硬编码路径改相对）是否在并行会话完成后重放——主树当前归并行会话所有，重放需与其协调。
 
 ## [2026-09-07] P1-01 收官：六域迁移完成（assets_api 7447→4847 行，-35%）
 
