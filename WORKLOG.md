@@ -40,6 +40,13 @@
 - **教训（重要）**：两个 Kilo 会话同时以主树为工作区时，任一方的 git checkout/clean 会摧毁对方的未提交修复与未跟踪运行时文件。规则：并行会话必须在各自 worktree 工作，禁止对主工作树执行 git restore/clean；代码根运行时文件（.env/auth_state/wt_certs/agent_upgrade）应纳入定期备份（D:\IT2026\backups）。
 - **待用户决策**：本会话当日被覆盖的代码修复（Policies.vue 开关归一化、7 文件冲突标记解决、9 处硬编码路径改相对）是否在并行会话完成后重放——主树当前归并行会话所有，重放需与其协调。
 
+## [2026-09-23] 回归修复：冲突标记与策略开关修复再次被覆盖后重放
+
+- **发现**：并行会话后续的 git 操作再次覆盖主树——① 7 文件冲突标记回归（Codec/h264_encoder.py、zvagent/__init__.py、collectors/system.py、cmdb_agent_consent_ui.py、remote_desktop_engine_v2.py、2 测试）；② Policies.vue `enabled:!!p.enabled` 开关修复回归（USB 策略显示 bug 回到线上）。
+- **处置**：按 HEAD 侧再次解决全部冲突标记；重新应用 Policies.vue 归一化；`vite build`（12.99s）并重启 4173（新 PID 6284）。
+- **验证**：py_compile 全过；pytest 20 passed；前端构建成功；4173 已服务新 dist。
+- **风险提示**：主树仍有约 375 个未提交改动（两会话全部工作），在整理提交前任何 git clean/checkout 都会再次丢失——待用户决策提交策略。
+
 ## [2026-09-23] 1.9.72 网络状态修复落地验证（接续 Codex 会话中断点）
 
 - **背景**：另一会话（big-clavicle/Codex）完成"网络状态主网卡按实际路由选择"修复并构建 1.9.72，但在上传升级包一步被用量限制打断。经核验：该包实际已于 13:23:45 上传成功（manifest 上传人 admin、定向 [2245]），随后本会话清除定向名单，三台终端均已升级 1.9.72。
