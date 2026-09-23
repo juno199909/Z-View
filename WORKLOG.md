@@ -3648,5 +3648,11 @@
 - **清理**：两修复推送 main（aeecb2bc→77939e92）后，远程分支 codex、fix/codesign-cert-selection-20260920 已删除，远程现仅剩 main。
 - **验证**：坐标测试 6 passed；sign_agent.ps1 Parser 语法 0 错误；推送后 origin/main 同步。
 
+## [2026-09-23] 目录扁平化：四层 IT2026 嵌套消除，代码根上移至仓库根
 
-
+- **新结构**：`D:\IT2026\IT2026\` = 仓库根 + 代码根合一（assets_api.py/zvplatform/frontend/zvagent 等全部直接在此层），`D:\IT2026\IT2026\IT2026\` 已清空移除（仅剩本会话 cwd 占用的空壳，会话结束后可删），顶层 `D:\IT2026\` 仅剩 IT2026/backups/diagnostics。
+- **git 处理**：361 个文件全部以 100% rename 入库（`450893c8`，git log --follow 历史完整）；GPO部署包/config.json（真实 token）借此从 git 追踪中移除并落盘保留（已 gitignore）；.gitignore 路径全面适配新结构。
+- **配套修复**：start_platform.ps1 新增仓库根本身作为 AppRoot 候选；.kilo/worktrees/big-clavicle 并入根 .kilo 并 worktree repair；root README 占位符替换为正式项目 README。
+- **清理**：__pycache__/.pytest_cache/findings.md/frontend-dev.log 等构建缓存与过期文档已删；qc/query（CMDB-Agent 12 字节标记）删除。
+- **验证**：8080/8443/8081/8082 从新结构启动全 UP；三终端心跳 2-10s；pytest 26 passed（含新迁入测试）；4173 前端正常。
+- **注意**：① 环境记忆中的旧路径引用需以本条为准（代码根 = D:\IT2026\IT2026）；② level-3 空目录待会话结束后手动删除；③ 构建产物 build_*_work/kilo_tmp/旧日志在 level3-copy-quarantine 隔离目录中，确认无需后可删。
