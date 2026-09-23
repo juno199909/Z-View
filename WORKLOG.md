@@ -40,6 +40,25 @@
 - **教训（重要）**：两个 Kilo 会话同时以主树为工作区时，任一方的 git checkout/clean 会摧毁对方的未提交修复与未跟踪运行时文件。规则：并行会话必须在各自 worktree 工作，禁止对主工作树执行 git restore/clean；代码根运行时文件（.env/auth_state/wt_certs/agent_upgrade）应纳入定期备份（D:\IT2026\backups）。
 - **待用户决策**：本会话当日被覆盖的代码修复（Policies.vue 开关归一化、7 文件冲突标记解决、9 处硬编码路径改相对）是否在并行会话完成后重放——主树当前归并行会话所有，重放需与其协调。
 
+## [2026-08-24 → 2026-09-22] 历史纪要索引（补录）
+
+> 原始逐日条目随各会话 worktree 删除而丢失，本索引按 Kilo session digest 补录，供回溯定位；细节可查项目记忆与 git log。
+
+- **2026-08-24**：项目全貌梳理（Z-View 资产/监控/软件/远控四大块，端口与分层盘点）。
+- **2026-08-29**：软件中心前后端集成修复——8081 /categories、/stats 路由被参数路由拦截致 404（路由前移 113 行）、vite 代理 /software/all 修正、api/terminal.js 补齐；19/19 端点 200、build 修复。
+- **2026-09-02**：Agent 自动升级机制起步（R13）——新建 agent_upgrade_api.py，心跳响应携带 upgrade 指令，security_api 增加 agent_version 字段。
+- **2026-09-04**：WT 证书方案定版——放弃 serverCertificateHashes（Chrome 14 天限制），改 3 年期自签证书（EC P-256，SAN 全覆盖）；UDP/WT 搁置，WS(TCP) 回落为正式可用方案（H.264 CRF21、输入延迟 62-123ms）。
+- **2026-09-08**：VS Code Git PATH 修复指引（需完全退出重启）；360 信任区加白生效、28 号终端 worker 卡死破案与恢复（服务主进程未真重启教训）、1.7.2 agent-error.log 异常落盘机制立功。
+- **2026-09-09**：Agent 重启循环破案——TLS 探测缓存（agent-tls.json）在 8443 短暂不可达后导致心跳死循环，清缓存回落 HTTP 8080 恢复；资产 GPU/主板/BIOS 采集链路完成（286ffab）。
+- **2026-09-11**：任务通道（jobs）多层隔离调试收官——服务端下发/结果落库/wu_diag 全链路验证通过。
+- **2026-09-15**：P1 收官批次——日志导出 CSV 500 修复（956cd03）、Agent 管理三合一页（d16fb7d）、脚本清理（4aa3c01）、2.8GB 项目清理（5ca58c0）、服务管理器 exe（f776556）、1.9.32 升级卡住恢复（cbe399f）、wu_install 0x80240013 修复（1739a03）、补丁乱码+全库 F821 扫描（770851f/4b6cbdc）、托盘版本显示（39ee21e）与本机信息品牌化（5d629f5）、批量 500 修复（77a87c4）；双终端 1.9.34。
+- **2026-09-15/16**：⭐⭐⭐⭐⭐ Remote Shell 交付（b584dab，受策略门控）；Policy Engine 统一模型 Phase 1（b2654bbd：security_policies 四类型+bindings+versions+exec_results）与 Scoped RBAC（908cca48）；P1 全部完成（ab9e28ad）；软件仓库闭环（b6f86714）；告警中心重做、CAD 预设修复；远程桌面工具栏 UX（cee8655）。
+- **2026-09-16（下午起）**：UDP 远程桌面冲刺——"高清不够清晰"画质修复（c54eb7bb）、传输模式开关（b50fe875）、UDP 部署配套（d4381e40）、**UDP 端到端打通**（ff8228d7）。
+- **2026-09-17**：consent 主路径修复（e2fd0c31）、WT 首帧竞态修复（f01d613e）、WT 回程帧头注入确认与撤销、2213 零帧排查、**按用户决策回退纯 TCP**（0d9de417）、核心六模块审计（63057b85）、RD 修复改进计划（b0ca6a2b）、Phase 1 核心（7de98e28）、WT 分发断链修复（b0ace641）、WT 证书信任+hash pin 定版（e9260d5b）、多网关僵尸进程定位（UDP 时好时坏根因）。
+- **2026-09-18**：2213"零帧"谜团告破（c7d21f96）、远程桌面全部专项完成（2befb0a3）、待办批量执行+升级熔断（218561e5）、Agent 网页自助部署（0e9e7141）、托盘真退出 1.9.54、setup_wizard 图形安装器 1.9.55、**1.9.52 坏版本事故**（__version__ 行粘连致 ImportError，5008f5d2 修复+onefile→完整 zip 分发改版）、updater 第二轮 1.9.51。
+- **2026-09-20/21**：Agent 退出密码策略 1.9.55+；**私钥/证书轮换台账执行**——前端自签证书重生成、WT 叶子重签、代码签名证书换新（旧 93C05132 移除）、**WT 根 CA 轮换完成（09-21 22 点收官）**，泄露旧 key 归档待 GPO 过渡后清除。
+- **2026-09-22**：平台重构全清单闭环（15 项，dc179e5f/e8a81a80）——assets_api 7447→1846 行（-75%），cmdb_agent_core 1198→227 行，zvagent 五模块成型；本机 agent 心跳停更 47h 根治（8443 证书改由 WT 根签发+bundle 切根）；远控传输基准测试落地（remote_transport_benchmark.md）。
+
 ## [2026-09-07] P1-01 收官：六域迁移完成（assets_api 7447→4847 行，-35%）
 
 - **本轮完成**：groups 域（routers/groups.py，4 路由）、agent 策略域（services/agent_policy_service.py + routers/agent_policy.py，3 路由——normalize 校验器含间隔/开关/超时全量校验逻辑）。
