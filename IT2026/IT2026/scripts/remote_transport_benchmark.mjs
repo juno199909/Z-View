@@ -20,7 +20,10 @@ const wsUrl = args.get('ws-url')
 const wtUrl = args.get('wt-url')
 const certHash = args.get('cert-hash')
 const pageUrl = args.get('page-url')
+<<<<<<< HEAD
 const captureBackend = args.get('capture-backend') || 'auto'
+=======
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
 
 if (!['ws', 'wt'].includes(transport)) {
   throw new Error('usage: --transport ws|wt --duration 60 --ws-url URL or --wt-url URL --cert-hash HEX --page-url HTTPS_URL')
@@ -28,9 +31,12 @@ if (!['ws', 'wt'].includes(transport)) {
 if (transport === 'ws' && !wsUrl) throw new Error('--ws-url is required for WebSocket mode')
 if (transport === 'wt' && (!wtUrl || !certHash)) throw new Error('--wt-url and --cert-hash are required for WebTransport mode')
 if (transport === 'wt' && !pageUrl) throw new Error('--page-url is required for WebTransport secure-context mode')
+<<<<<<< HEAD
 if (!['auto', 'dxgi', 'wgc', 'mss'].includes(captureBackend)) {
   throw new Error('--capture-backend must be auto, dxgi, wgc, or mss')
 }
+=======
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
 
 const browser = await chromium.launch({ headless: true })
 const context = await browser.newContext({ ignoreHTTPSErrors: true })
@@ -130,6 +136,7 @@ try {
             sent_fps: Number(message.sent_fps || 0),
             capture_ms: Number(message.capture_ms || 0),
             encode_ms: Number(message.encode_ms || 0),
+<<<<<<< HEAD
             encode_input_ms: Number(message.encode_input_ms || 0),
             encode_convert_ms: Number(message.encode_convert_ms || 0),
             encode_codec_ms: Number(message.encode_codec_ms || 0),
@@ -137,6 +144,8 @@ try {
             encoder_hardware: Boolean(message.encoder_hardware),
             bitrate_bps: Number(message.bitrate_bps || 0),
             native_bridge: message.native_bridge || null,
+=======
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
             queue_depth: Number(message.queue_depth || 0),
             skipped: Number(message.skipped || 0),
             empty: Number(message.empty || 0),
@@ -170,7 +179,10 @@ try {
             scale_percent: 100,
             adaptive: false,
             preset: 'high',
+<<<<<<< HEAD
             capture_backend: options.captureBackend,
+=======
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
           }))
           timer = setInterval(() => {
             if (performance.now() >= timeoutAt) return stop()
@@ -218,7 +230,10 @@ try {
       scale_percent: 100,
       adaptive: false,
       preset: 'high',
+<<<<<<< HEAD
       capture_backend: options.captureBackend,
+=======
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
     }))
 
     const frames = new Map()
@@ -331,8 +346,12 @@ try {
     durationMs: durationSeconds * 1000,
     wsUrl,
     wtUrl,
+<<<<<<< HEAD
     certHash,
     captureBackend,
+=======
+    certHash
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
   })
   console.log(JSON.stringify(result, null, 2))
 } finally {

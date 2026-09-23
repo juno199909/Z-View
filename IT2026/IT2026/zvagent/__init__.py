@@ -10,4 +10,8 @@
 """
 
 # Agent 版本号（与 cmdb_agent_core.AGENT_VERSION 同源，发布时 bump）
+<<<<<<< HEAD
 __version__ = "1.9.72"
+=======
+__version__ = "1.9.61"
+>>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
