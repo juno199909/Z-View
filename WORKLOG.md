@@ -3656,3 +3656,13 @@
 - **清理**：__pycache__/.pytest_cache/findings.md/frontend-dev.log 等构建缓存与过期文档已删；qc/query（CMDB-Agent 12 字节标记）删除。
 - **验证**：8080/8443/8081/8082 从新结构启动全 UP；三终端心跳 2-10s；pytest 26 passed（含新迁入测试）；4173 前端正常。
 - **注意**：① 环境记忆中的旧路径引用需以本条为准（代码根 = D:\IT2026\IT2026）；② level-3 空目录待会话结束后手动删除；③ 构建产物 build_*_work/kilo_tmp/旧日志在 level3-copy-quarantine 隔离目录中，确认无需后可删。
+
+## [2026-09-23] 仓库根最终上移：D:\IT2026\IT2026 → D:\IT2026（迁移完成）
+
+- **最终结构**：`D:\IT2026\` = 仓库根 = 代码根（.git/WORKLOG.md/start_platform.ps1/assets_api.py/zvplatform/frontend/... 全部直接在此层）；顶层仅余 IT2026（旧目录残留）、backups、diagnostics。
+- **迁移方式**：87 个顶层项直接上移；`.git`（914MB）因句柄被会话/编辑器占用无法移动，改为 **robocopy 完整复制 + fsck/log/status 三重验证**，旧 `D:\IT2026\IT2026\.git` 为陈旧副本待删。
+- **worktree 修复**：复制过来的 gitdir 注册指向旧路径，已手工改写 `.git/worktrees/{big-clavicle,carnation-cent}/gitdir` 指向 `D:/IT2026/.kilo/worktrees/...`，两个 worktree 均恢复可用。
+- **git 内容零变更**：本次仅目录位置变化，仓库相对路径不变，无任何 rename/commit 内容差异；origin URL 不变，推送验证通过。
+- **验证**：start_platform 从 D:\IT2026 启动（AppRoot=ScriptRoot 候选生效），8080/8443/8081/8082 全 UP（后端 PID 7696，cwd=D:\IT2026）；三终端心跳 1-9s；pytest 23 passed；4173 前端正常。
+- **待会话结束后清理**：删除 `D:\IT2026\IT2026\`（内含陈旧 .git 副本 914MB + 空 IT2026 壳——两者均被当前会话句柄占用，无法在本会话内删除）。`/IT2026/` 已临时加入 .gitignore 屏蔽残留显示。
+- **路径约定更新**：代码根/仓库根/台账 = `D:\IT2026`；WORKLOG = `D:\IT2026\WORKLOG.md`；VS Code 请改开 `D:\IT2026` 作为工作目录。

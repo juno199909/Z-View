@@ -72,3 +72,6 @@ GPO部署包/config.json
 
 # --- Service manager binary (build artifact)
 ZViewServiceManager.exe
+
+# 旧仓库目录残留（.git 句柄被会话占用无法移动，会话结束后删除 D:\IT2026\IT2026）
+/IT2026/
