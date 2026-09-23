@@ -118,7 +118,6 @@ def _get_platform_route_source_ip() -> str | None:
     return None
 
 
-<<<<<<< HEAD
 def get_platform_route_interface_name() -> str | None:
     """返回到管理平台的实际出站网卡名称。
 
@@ -140,8 +139,6 @@ def get_platform_route_interface_name() -> str | None:
     return None
 
 
-=======
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
 def _is_usable_ipv4(ip_address: str) -> bool:
     try:
         packed = socket.inet_aton(ip_address)

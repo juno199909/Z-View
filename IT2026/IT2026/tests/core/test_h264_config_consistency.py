@@ -31,15 +31,9 @@ def make_session():
 def test_hardware_bitrate_quality_mapping():
     from Codec import h264_encoder as encoder
 
-<<<<<<< HEAD
     assert encoder._hardware_bitrate_for_crf(17) == 28_000_000
     assert encoder._hardware_bitrate_for_crf(19) == 16_000_000
     assert encoder._hardware_bitrate_for_crf(23) == 10_000_000
-=======
-    assert encoder._hardware_bitrate_for_crf(17) == 12_000_000
-    assert encoder._hardware_bitrate_for_crf(19) == 8_000_000
-    assert encoder._hardware_bitrate_for_crf(23) == 6_000_000
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
     assert encoder._hardware_bitrate_for_crf(28) == 2_500_000
     assert encoder._hardware_bitrate_for_crf(36) == 1_500_000
 

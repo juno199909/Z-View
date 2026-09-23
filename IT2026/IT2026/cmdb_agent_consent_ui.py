@@ -735,83 +735,10 @@ def _build_fallback_module():
                 return menu, text_buffers
 
             def show_context_menu(hwnd):
-<<<<<<< HEAD
                 # Juno 的 Windows 11 会话会绘制原生 popup 的边框/分隔线却
                 # 丢失所有标签文字。右键入口改用自绘的 Tk 控制面板；原生菜单
                 # 构造代码仍保留，以便旧系统或诊断时复用。
                 _tray_show_control_panel(self)
-=======
-                menu, text_buffers = build_context_menu(hwnd)
-                if not menu:
-                    return
-                point = POINT()
-                user32.GetCursorPos(ctypes.byref(point))
-                # 前台激活是托盘菜单能正常消失的标准前置步骤。
-                user32.SetForegroundWindow(hwnd)
-                chosen = user32.TrackPopupMenu(
-                    menu,
-                    # 右下角托盘图标：菜单右下角对齐光标，向左上展开，避免被屏幕右/下缘裁剪
-                    TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_RIGHTALIGN,
-                    point.x,
-                    point.y,
-                    0,
-                    hwnd,
-                    None,
-                )
-                user32.PostMessageW(hwnd, WM_NULL, 0, 0)
-                try:
-                    user32.DestroyMenu(menu)
-                except Exception:
-                    pass
-                # Keep explicit Unicode buffers alive until Windows has dismissed
-                # the popup and finished consuming every menu item.
-                del text_buffers
-
-                if chosen == IDM_MACHINE_INFO:
-                    show_machine_info()
-                elif chosen in (IDM_TOGGLE_ALLOW_REQUESTS, IDM_TOGGLE_SKIP_CONSENT,
-                                IDM_TOGGLE_BALLOON, IDM_TOGGLE_UAC_INPUT):
-                    apply_toggle(chosen)
-                elif chosen == IDM_ABOUT:
-                    user32.MessageBoxW(
-                        None,
-                        f"Z-View 终端管理代理 {_tray_agent_version_text()}\n\n远程控制同意助手与托盘常驻程序。\n本图标提供远程控制开关与本机免确认设置。",
-                        "关于 Z-View",
-                        MB_TOPMOST | MB_SETFOREGROUND | 0x40,  # MB_ICONINFORMATION
-                    )
-                elif chosen == IDM_EXIT:
-                    quit_confirm = user32.MessageBoxW(
-                        None,
-                        "退出后本机将停止心跳并在管理台显示离线，远程控制不可用，"
-                        "直到代理重新启动（重启电脑或手动启动服务）。\n"
-                        "如管理台已启用退出密码，接下来需要输入密码验证。\n\n确定退出 Z-View 代理？",
-                        "退出确认",
-                        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL,
-                    )
-                    if quit_confirm == IDYES:
-                        _append_consent_runtime_log("tray exit requested by operator")
-                        allowed, message = _exit_password_flow()
-                        _append_consent_runtime_log(
-                            f"tray exit verify: allowed={allowed} message={message!r}"
-                        )
-                        if allowed:
-                            if _launch_agent_stop_via_uac():
-                                user32.DestroyWindow(hwnd)
-                            else:
-                                user32.MessageBoxW(
-                                    None,
-                                    "未取得管理员授权，代理未退出。",
-                                    "退出代理",
-                                    MB_TOPMOST | MB_SETFOREGROUND | MB_ICONWARNING,
-                                )
-                        elif message:
-                            user32.MessageBoxW(
-                                None,
-                                message,
-                                "退出代理",
-                                MB_TOPMOST | MB_SETFOREGROUND | MB_ICONWARNING,
-                            )
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
 
             def window_proc(hwnd, message, wparam, lparam):
                 if message == WM_APP + 1:

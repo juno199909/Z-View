@@ -3666,10 +3666,7 @@ class RemoteDesktopSession:
                         t0 = time.perf_counter()
                         pkts = self._h264_encode_pil(scaled, keyframe=job["keyframe"])
                         self._note_h264_encode_ms((time.perf_counter() - t0) * 1000)
-<<<<<<< HEAD
                         self._note_h264_stage_metrics()
-=======
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
                         return pkts, int(scaled.width), int(scaled.height)
                     finally:
                         if scaled is not img:

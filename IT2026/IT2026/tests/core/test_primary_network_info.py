@@ -32,7 +32,6 @@ def test_primary_network_falls_back_when_route_source_has_no_matching_mac(monkey
     )
 
     assert system.get_primary_network_info() == ("10.0.0.20", "00-11-22-33-44-55")
-<<<<<<< HEAD
 
 
 def test_platform_route_interface_name_matches_route_source(monkeypatch):
@@ -48,5 +47,3 @@ def test_platform_route_interface_name_matches_route_source(monkeypatch):
     monkeypatch.setattr(system.psutil, "net_if_addrs", lambda: {"WLAN": wireless, "vgate0": tunnel})
 
     assert system.get_platform_route_interface_name() == "WLAN"
-=======
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a

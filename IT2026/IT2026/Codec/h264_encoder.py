@@ -87,7 +87,6 @@ def h264_available() -> bool:
 
 
 def _hardware_bitrate_for_crf(crf: int) -> int:
-<<<<<<< HEAD
     """Map the shared quality scale to hardware-encoder bitrates.
 
     Remote-desktop text has many hard edges and does not tolerate the video
@@ -101,16 +100,6 @@ def _hardware_bitrate_for_crf(crf: int) -> int:
         return 16_000_000
     if crf <= 23:
         return 10_000_000
-=======
-    """Map the shared quality scale to stable hardware-encoder bitrates."""
-    crf = max(16, min(36, int(crf)))
-    if crf <= 17:
-        return 12_000_000
-    if crf <= 20:
-        return 8_000_000
-    if crf <= 23:
-        return 6_000_000
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
     if crf <= 27:
         return 4_000_000
     if crf <= 31:
@@ -187,17 +176,12 @@ class H264StreamEncoder:
             }
         else:
             # 硬编按码率控制（CRF 语义不同）：质量档位映射码率
-<<<<<<< HEAD
             self._target_bitrate_bps = _hardware_bitrate_for_crf(self._crf)
             ctx.bit_rate = self._target_bitrate_bps
             # p1 optimizes throughput above all else.  p4 retains low-latency
             # operation (B-frames stay disabled below) while spending enough
             # RDO on desktop text, icons, and thin UI borders.
             ctx.options = {"preset": "p4", "tune": "ll", "async_depth": "1"}
-=======
-            ctx.bit_rate = _hardware_bitrate_for_crf(self._crf)
-            ctx.options = {"preset": "p1", "async_depth": "1"}
->>>>>>> ab632a1a204ed06fef467d45a60e80c7a951259a
         self._ctx = ctx
         self._codec_name = codec_name
         self._pts = 0
