@@ -3666,3 +3666,10 @@
 - **验证**：start_platform 从 D:\IT2026 启动（AppRoot=ScriptRoot 候选生效），8080/8443/8081/8082 全 UP（后端 PID 7696，cwd=D:\IT2026）；三终端心跳 1-9s；pytest 23 passed；4173 前端正常。
 - **待会话结束后清理**：删除 `D:\IT2026\IT2026\`（内含陈旧 .git 副本 914MB + 空 IT2026 壳——两者均被当前会话句柄占用，无法在本会话内删除）。`/IT2026/` 已临时加入 .gitignore 屏蔽残留显示。
 - **路径约定更新**：代码根/仓库根/台账 = `D:\IT2026`；WORKLOG = `D:\IT2026\WORKLOG.md`；VS Code 请改开 `D:\IT2026` 作为工作目录。
+
+## [2026-09-23] Agent 管理四模块功能验证全通过（恢复被误清的升级仓）
+
+- **验证范围**：`/agent/manage` 四模块全部后端接口实测——① Agent策略（GET/PUT /console/agent-policies + 分组/资产数据源）；② Agent部署（安装包下载 81.4MB、zip 完整性、部署脚本下载）；③ Agent升级（status latest、终端版本一致性）；④ Agent健康度（/agent-fleet/health 聚合：total=3 online=3 anomalies=0）。
+- **发现并修复**：首测 6/9——部署下载 404、升级 status latest=None。根因：下午误清事件曾清空 agent_upgrade/（升级仓），当时仅重建了空目录，服务端升级仓一直为空（与目录迁移无关）。修复：从 level3-copy-quarantine 恢复 manifest.json + 1.9.70/71/72 包（sha256 校验 7d34a225…a20951d 与 manifest 一致；manifest 无定向名单=全局可用），mtime 热重载自动生效；同时恢复 releases/ 完整发布历史（1.9.33→1.9.72 + Setup exe）。
+- **复测**：9/9 全 PASS（初测 3 失败项 + 升级版本一致性共 10 项检查）。
+- **结论**：Agent 管理四模块功能全部正常；升级仓/releases 已从隔离副本完整找回。
