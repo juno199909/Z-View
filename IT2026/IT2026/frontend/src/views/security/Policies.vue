@@ -157,7 +157,7 @@ const createForm = reactive({policy_name:'',policy_type:'agent',priority:0,descr
 const execVisible = ref(false); const execTarget = ref(null); const execResults = ref([]); const execLoading = ref(false)
 const versionVisible = ref(false); const versionTarget = ref(null); const versions = ref([]); const versionLoading = ref(false)
 const { groups, assets, loadOptions } = useAssetGroupOptions()
-const loadData = async () => { loading.value=true; try{const r=await getSecurityPolicies({page:1,page_size:200,policy_type:filters.policy_type||undefined,enabled:filters.enabled===''?undefined:filters.enabled}); policies.value=(r.data||[]).map(p=>({...p,_toggling:false}))}catch(e){ElMessage.error('加载策略失败')}finally{loading.value=false} }
+const loadData = async () => { loading.value=true; try{const r=await getSecurityPolicies({page:1,page_size:200,policy_type:filters.policy_type||undefined,enabled:filters.enabled===''?undefined:filters.enabled}); policies.value=(r.data||[]).map(p=>({...p,enabled:!!p.enabled,_toggling:false}))}catch(e){ElMessage.error('加载策略失败')}finally{loading.value=false} }
 const toggleEnabled = async (row, val) => { row._toggling=true; try{ await updateSecurityPolicy(row.id, {enabled:val}); row.enabled=val; ElMessage.success(val?'已启用':'已禁用') }catch(e){ElMessage.error('操作失败')}finally{row._toggling=false} }
 const showBind = async (row) => { bindTarget.value=row; bindForm.scope_type='global'; bindForm.group_id=null; bindForm.asset_ids=[]; loadOptions(); bindVisible.value=true; await loadBindings(row) }
 const loadBindings = async (row) => { bindingsLoading.value=true; try{ const d=await getSecurityPolicyDetail(row.id); bindings.value=d.bindings||[] }catch(e){ bindings.value=[] }finally{ bindingsLoading.value=false } }
