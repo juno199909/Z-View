@@ -1405,6 +1405,23 @@ def delete_package(package_id: int):
             WHERE id = %s
         """, (package_id,))
 
+        # 立即终止尚未完成的关联任务，避免等到下一次 Agent 轮询才暴露失败。
+        cursor.execute(
+            """UPDATE software_task_results
+               SET status = 'failed', progress = 100,
+                   error_message = 'Software package was deleted', end_time = NOW()
+               WHERE task_id IN (SELECT id FROM software_tasks WHERE package_id = %s)
+                 AND status IN ('pending', 'downloading', 'installing')""",
+            (package_id,),
+        )
+        failed_results = cursor.rowcount
+        cursor.execute(
+            """UPDATE software_tasks
+               SET status = 'failed', progress = 100, end_time = NOW(), updated_at = NOW()
+               WHERE package_id = %s AND status IN ('pending', 'running')""",
+            (package_id,),
+        )
+
         conn.commit()
 
         # 可选：删除物理文件
@@ -1414,7 +1431,7 @@ def delete_package(package_id: int):
         #     except:
         #         pass
 
-        return {"message": "Package deleted successfully"}
+        return {"message": "Package deleted successfully", "failed_task_results": failed_results}
 
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2629,7 +2646,12 @@ def get_compliance_results(
             severity=severity
         )
 
-        cursor.execute(f"SELECT COUNT(*) as total FROM software_compliance_results r WHERE {where_sql}", params)
+        cursor.execute(
+            f"""SELECT COUNT(*) as total FROM software_compliance_results r
+                INNER JOIN software_compliance_checks c ON r.check_id = c.id
+                WHERE {where_sql}""",
+            params,
+        )
         total = cursor.fetchone()['total']
 
         offset = (page - 1) * page_size
@@ -2637,7 +2659,7 @@ def get_compliance_results(
             SELECT r.*, c.check_name, c.check_type, c.software_name as expected_software,
                    a.hostname, a.ip_address
             FROM software_compliance_results r
-            LEFT JOIN software_compliance_checks c ON r.check_id = c.id
+            INNER JOIN software_compliance_checks c ON r.check_id = c.id
             LEFT JOIN assets a ON r.asset_id = a.id
             WHERE {where_sql}
             ORDER BY r.checked_at DESC
@@ -2694,6 +2716,7 @@ def get_compliance_stats(
                    SUM(CASE WHEN r.is_compliant = FALSE THEN 1 ELSE 0 END) AS non_compliant_count,
                    SUM(CASE WHEN r.is_compliant IS NULL THEN 1 ELSE 0 END) AS manual_review_count
             FROM software_compliance_results r
+            INNER JOIN software_compliance_checks c_active ON r.check_id = c_active.id
             WHERE {where_sql}
         """, params)
         overview = cursor.fetchone() or {}
@@ -2707,7 +2730,7 @@ def get_compliance_stats(
         cursor.execute(f"""
             SELECT c.severity, COUNT(*) AS total
             FROM software_compliance_results r
-            LEFT JOIN software_compliance_checks c ON r.check_id = c.id
+            INNER JOIN software_compliance_checks c ON r.check_id = c.id
             WHERE {where_sql}
             GROUP BY c.severity
             ORDER BY total DESC
@@ -2717,7 +2740,7 @@ def get_compliance_stats(
         cursor.execute(f"""
             SELECT c.check_name, c.check_type, COUNT(*) AS total
             FROM software_compliance_results r
-            LEFT JOIN software_compliance_checks c ON r.check_id = c.id
+            INNER JOIN software_compliance_checks c ON r.check_id = c.id
             WHERE {where_sql} AND r.is_compliant = FALSE
             GROUP BY r.check_id, c.check_name, c.check_type
             ORDER BY total DESC, c.check_name ASC
@@ -2728,7 +2751,7 @@ def get_compliance_stats(
         cursor.execute(f"""
             SELECT c.check_type, COUNT(*) AS total
             FROM software_compliance_results r
-            LEFT JOIN software_compliance_checks c ON r.check_id = c.id
+            INNER JOIN software_compliance_checks c ON r.check_id = c.id
             WHERE {where_sql}
             GROUP BY c.check_type
             ORDER BY total DESC

@@ -44,7 +44,7 @@ _DEFAULT_CONFIG = {
 }
 
 _DEFAULT_SOFTWARE_CONFIG = {
-    "server_url": get_env("ZVIEW_SOFTWARE_SERVER_URL", "http://127.0.0.1:8081") or "http://127.0.0.1:8081",
+    "server_url": get_env("ZVIEW_SOFTWARE_SERVER_URL", "http://127.0.0.1:8080") or "http://127.0.0.1:8080",
     "token": get_env("ZVIEW_AGENT_TOKEN", "") or "",
     "intervals": {
         "policy_sync": 300,
@@ -180,7 +180,7 @@ def _apply_env_overrides(config: dict, software_config: dict) -> tuple[dict, dic
     if software_server_url:
         merged_software_config["server_url"] = software_server_url
     elif server_url:
-        merged_software_config["server_url"] = server_url.replace(":8080", ":8081")
+        merged_software_config["server_url"] = server_url
 
     download_dir = get_env("ZVIEW_DOWNLOAD_DIR")
     if download_dir:
@@ -195,9 +195,9 @@ def load_configs() -> tuple[dict, dict]:
     config = _merge_config(_DEFAULT_CONFIG, user_config)
     software_config = _merge_config(_DEFAULT_SOFTWARE_CONFIG, user_config)
 
-    # 统一 server_url 为顶层配置（原 core 行为：user 配置的 server_url 派生 software 端口）
+    # 软件通道已并入主服务，继承顶层 server_url；可用专属环境变量单独覆盖。
     if "server_url" in user_config:
-        software_config["server_url"] = user_config["server_url"].replace(":8080", ":8081")
+        software_config["server_url"] = user_config["server_url"]
 
     # P1-软件仓库修复：软件通道令牌继承顶层 Agent 令牌（config.local.json 的 token）。
     # 此前 SOFTWARE_CONFIG["token"] 仅来自 software 段/环境变量，默认为空，

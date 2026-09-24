@@ -3749,3 +3749,10 @@
 - **Agent 资产隔离**：软件策略同步、任务轮询、受控包下载、任务结果及日志回传均增加设备凭据与请求 `asset_id` 的一致性校验；全局兼容 token 保持既有滚动升级链路。
 - **大包上传**：上传由整文件读入内存改为 1 MiB 分块写临时文件并增量计算 SHA-256；新增 `ZVIEW_PACKAGE_MAX_UPLOAD_BYTES`（默认 2 GiB）服务端硬限制，完成后原子改名，异常自动清理临时文件。
 - **验证**：`python -m py_compile zvplatform/routers/software_management.py`、相关 pytest（11 passed）及 `frontend npm run build` 通过。
+
+## [2026-09-24] 软件管理运行拓扑与数据闭环收敛
+
+- **单服务收敛**：Agent 软件通道默认继承主服务 `server_url`（8080），`ZVIEW_SOFTWARE_SERVER_URL` 仍可单独覆盖；`start_platform.ps1` 与服务管理器不再启动 8081/8082 旧独立软件服务，软件管理和策略均由 8080 的已挂载路由提供。
+- **前端入口**：平台启动器对外文案和打开地址统一为 `https://localhost:5173`，与 Vite Preview 的 TLS 配置一致；重启实测前端监听恢复。
+- **包删除即时收敛**：删除软件包时立刻将关联的 pending/downloading/installing 结果标记失败，并终止关联 pending/running 任务，不等待 Agent 下一次轮询。
+- **合规统计口径**：结果列表和统计汇总改为只关联仍存在的合规规则，历史孤立结果不会再进入合规率、风险级别和规则类型图表。

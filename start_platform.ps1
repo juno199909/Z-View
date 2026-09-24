@@ -17,8 +17,6 @@ $AppRootCandidates = @(
 $AppRoot = $null
 foreach ($candidate in $AppRootCandidates) {
     if ((Test-Path -LiteralPath (Join-Path $candidate 'assets_api.py')) -and
-        (Test-Path -LiteralPath (Join-Path $candidate 'software_management_api_complete_v2.py')) -and
-        (Test-Path -LiteralPath (Join-Path $candidate 'software_policy_api.py')) -and
         (Test-Path -LiteralPath (Join-Path $candidate 'frontend\package.json'))) {
         $AppRoot = (Resolve-Path -LiteralPath $candidate).Path
         break
@@ -283,24 +281,6 @@ $processes += Start-ManagedProcess `
     -StdErrLog (Join-Path $LogDir 'assets-api.err.log')
 
 $processes += Start-ManagedProcess `
-    -Name 'software-api' `
-    -FilePath $PythonExe `
-    -ArgumentList @('software_management_api_complete_v2.py') `
-    -WorkingDirectory $AppRoot `
-    -Port 8081 `
-    -StdOutLog (Join-Path $LogDir 'software-api.out.log') `
-    -StdErrLog (Join-Path $LogDir 'software-api.err.log')
-
-$processes += Start-ManagedProcess `
-    -Name 'policy-api' `
-    -FilePath $PythonExe `
-    -ArgumentList @('software_policy_api.py') `
-    -WorkingDirectory $AppRoot `
-    -Port 8082 `
-    -StdOutLog (Join-Path $LogDir 'policy-api.out.log') `
-    -StdErrLog (Join-Path $LogDir 'policy-api.err.log')
-
-$processes += Start-ManagedProcess `
     -Name 'frontend' `
     -FilePath $NodeExe `
         -ArgumentList @($ViteEntrypoint, 'preview', '--host', '0.0.0.0') `
@@ -335,9 +315,9 @@ foreach ($entry in $processes) {
     Write-Host ("{0}: pid={1} port={2}" -f $entry.name, $entry.pid, $entry.port)
 }
 Write-Host ("Logs: {0}" -f $LogDir)
-Write-Host 'Frontend: http://localhost:5173'
+Write-Host 'Frontend: https://localhost:5173'
 Write-Host 'API: http://localhost:8080/docs'
 
 if ($OpenBrowser) {
-    Start-Process 'http://localhost:5173' | Out-Null
+    Start-Process 'https://localhost:5173' | Out-Null
 }
