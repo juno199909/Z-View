@@ -3689,3 +3689,11 @@
 - **修复**：installCmd 改为 `<服务端实际文件名> /quiet`（文件名经 HEAD 请求读 X-Agent-Package-Filename 响应头，agent_deploy.py:68 已返回；不传 --server-url 时使用构建内嵌默认中心地址 https://172.16.250.120:8443）；下载兜底文件名从日期式改为 Z-View-Setup.exe。
 - **正确用法说明**：双击 = 图形向导；静默 = `Z-View-Setup-1.9.72.exe /quiet`（可选 `--server-url=https://中心:8443` 覆盖）；批量 = 部署脚本 ps1（下载 onedir zip → Agent 自安装器 `Z-View.exe --install --quiet --server-url <center>`，空格形式对 Agent 自安装器合法，已验证 /agent/upgrade/download 返回 onedir zip）。
 - **验证**：vite build 12.07s；4173 重启后 bundle（AgentDeploy-CBt0k2wI.js）含 /quiet 与响应头读取逻辑，旧错误命令已消失。
+
+## [2026-09-24] Agent 策略"数据上报"端到端闭环验证（全局 + 单终端覆盖）
+
+- **背景**：此前对策略模块只做过原值回写（PUT 相同内容），无法证明"修改会生效"。本轮补完整闭环。
+- **注意**：PUT /console/agent-policies 的正确载荷是**扁平结构且需全量字段**（intervals + remote_desktop）——错误包裹 {"policies":...} 会 400；只发 intervals 会抹掉 remote_desktop 设置。
+- **全局策略闭环**：① 基线 software=120 → ② PUT intervals.software=90（200）→ ③ GET 持久化=90 → ④ 以 Juno 身份合成心跳，响应 policies.intervals.software=90（终端消费链路 build_effective_agent_policies → _apply_agent_policies 生效）→ ⑤ 还原 120，GET/心跳双确认 → ⑥ remote_desktop 设置完好未破坏。
+- **单终端覆盖闭环**（统一策略引擎 agent 类型）：创建 asset 范围 agent 策略（intervals.software=60，优先级 50）并绑定 2245 → Juno 心跳视角 software=60（**覆盖优先级生效**）→ 浅合并保全 heartbeat=30/hardware=86400 → 删除策略后回落全局 120。
+- **验证结论**：Agent 策略-数据上报的"修改 → 持久化 → 心跳下发 → 终端生效 → 回退"全链路 10 项检查全 PASS；真实终端（1.9.72）在每次心跳自动应用最新策略，无需重启。
