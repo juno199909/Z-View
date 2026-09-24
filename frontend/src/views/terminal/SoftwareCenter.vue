@@ -28,7 +28,7 @@
                     <el-icon :size="20"><Box /></el-icon>
                   </div>
                   <div>
-                    <div class="zv-pkg-name">{{ row.name }}</div>
+                    <div class="zv-pkg-name">{{ row.display_name || row.name }}</div>
                     <div class="zv-pkg-version">{{ row.version }}</div>
                   </div>
                 </div>
@@ -64,13 +64,13 @@
           <el-table v-loading="taskLoading" :data="taskList">
             <el-table-column label="软件" min-width="180">
               <template #default="{ row }">
-                <span class="zv-mono">{{ row.package_name || row.package_id }}</span>
+                <span class="zv-mono">{{ row.package_display_name || row.software_name || row.package_id }}</span>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="100">
               <template #default="{ row }">
-                <el-tag size="small" effect="light" :type="getActionType(row.action)">
-                  {{ getActionText(row.action) }}
+                <el-tag size="small" effect="light" :type="getActionType(row.task_type)">
+                  {{ getActionText(row.task_type) }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -183,13 +183,13 @@
     <el-dialog v-model="taskDialogVisible" title="分发任务" width="500px" destroy-on-close>
       <el-form :model="taskForm" label-width="100px">
         <el-form-item label="软件">
-          <span class="zv-mono">{{ currentPackage?.name }} {{ currentPackage?.version }}</span>
+          <span class="zv-mono">{{ currentPackage?.display_name || currentPackage?.name }} {{ currentPackage?.version }}</span>
         </el-form-item>
         <el-form-item label="操作">
-          <el-radio-group v-model="taskForm.action">
+          <el-radio-group v-model="taskForm.task_type">
             <el-radio value="install">安装</el-radio>
             <el-radio value="upgrade">升级</el-radio>
-            <el-radio value="uninstall">卸载</el-radio>
+            <el-radio value="uninstall" :disabled="!currentPackage?.uninstall_command">卸载</el-radio>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="目标终端">
@@ -284,7 +284,7 @@ const uploadForm = reactive({ file: null, name: '', version: '', vendor: '', cat
 const taskDialogVisible = ref(false)
 const submitting = ref(false)
 const currentPackage = ref(null)
-const taskForm = reactive({ action: 'install', target_type: 'all', group_ids: [] })
+const taskForm = reactive({ task_type: 'install', target_type: 'all', group_ids: [] })
 
 const taskDetailVisible = ref(false)
 const taskDetailLoading = ref(false)
@@ -424,7 +424,7 @@ const submitUpload = async () => {
 
 const showTaskDialog = (pkg) => {
   currentPackage.value = pkg
-  taskForm.action = 'install'
+  taskForm.task_type = 'install'
   taskForm.target_type = 'all'
   taskForm.group_ids = []
   taskDialogVisible.value = true
@@ -434,10 +434,12 @@ const submitTask = async () => {
   submitting.value = true
   try {
     await createSoftwareTask({
+      task_name: `${getActionText(taskForm.task_type)} ${currentPackage.value.display_name || currentPackage.value.name} ${currentPackage.value.version || ''}`.trim(),
+      task_type: taskForm.task_type,
       package_id: currentPackage.value.id,
-      action: taskForm.action,
       target_type: taskForm.target_type,
-      group_ids: taskForm.group_ids
+      target_ids: taskForm.target_type === 'group' ? taskForm.group_ids : [],
+      schedule_type: 'immediate'
     })
     ElMessage.success('任务已下发')
     taskDialogVisible.value = false

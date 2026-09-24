@@ -20,6 +20,7 @@ import io
 
 from auth_utils import (
     extract_bearer_token,
+    get_request_agent_auth,
     get_request_username,
     is_exempt_path,
     require_agent_request,
@@ -33,6 +34,11 @@ from console_utils import safe_console_print
 
 # 软件包存储路径
 PACKAGE_STORAGE_PATH = get_env("ZVIEW_PACKAGE_STORAGE_PATH", "C:\\CMDB-Packages") or "C:\\CMDB-Packages"
+PACKAGE_UPLOAD_CHUNK_SIZE = 1024 * 1024
+try:
+    PACKAGE_MAX_UPLOAD_BYTES = max(1, int(get_env("ZVIEW_PACKAGE_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))))
+except (TypeError, ValueError):
+    PACKAGE_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 if not os.path.exists(PACKAGE_STORAGE_PATH):
     os.makedirs(PACKAGE_STORAGE_PATH)
 
@@ -48,6 +54,15 @@ def normalize_agent_asset_id(value: Any) -> int:
     if asset_id <= 0:
         raise HTTPException(status_code=400, detail="Invalid asset_id")
     return asset_id
+
+
+def enforce_agent_asset_binding(request: Request, asset_id: Any) -> int:
+    """Bind device credentials to their own asset; global tokens retain rollout compatibility."""
+    normalized_asset_id = normalize_agent_asset_id(asset_id)
+    auth_info = get_request_agent_auth(request)
+    if auth_info and auth_info.get("agent_auth_type") == "device" and auth_info.get("agent_id") != normalized_asset_id:
+        raise HTTPException(status_code=403, detail="Agent credential does not match this asset")
+    return normalized_asset_id
 
 
 def get_agent_asset_info(cursor, asset_id: Any) -> Dict[str, Any]:
@@ -185,7 +200,7 @@ def get_packages(
         offset = (page - 1) * page_size
         cursor.execute(f"""
             SELECT id, package_name, display_name, version, category, vendor,
-                   file_name, file_size, architecture, status, download_count, install_count,
+                   file_name, file_size, uninstall_command, architecture, status, download_count, install_count,
                    upload_by, created_at
             FROM software_packages
             WHERE {where_sql}
@@ -251,26 +266,43 @@ async def upload_package(
         raise HTTPException(status_code=500, detail="Database connection failed")
 
     file_path = None
+    temp_path = None
+    cursor = None
     try:
         info = json.loads(package_info)
 
-        file_content = await file.read()
-        file_hash = hashlib.sha256(file_content).hexdigest()
-        file_size = len(file_content)
+        package_name = str(info.get("package_name") or "").strip()
+        display_name = str(info.get("display_name") or "").strip()
+        version = str(info.get("version") or "").strip()
+        category = str(info.get("category") or "other").strip() or "other"
+        source_name = os.path.basename(str(file.filename or "")).strip()
+        if not package_name or not display_name or not version or not source_name:
+            raise HTTPException(status_code=400, detail="软件包名称、显示名称、版本和文件不能为空")
 
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT id FROM software_packages
             WHERE package_name = %s AND version = %s AND deleted_at IS NULL
-        """, (info['package_name'], info['version']))
+        """, (package_name, version))
 
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="此版本的软件包已存在")
 
-        file_path = os.path.join(PACKAGE_STORAGE_PATH, f"{info['package_name']}_{info['version']}_{file.filename}")
-
-        with open(file_path, 'wb') as f:
-            f.write(file_content)
+        safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{package_name}_{version}").strip("._") or "package"
+        file_path = os.path.join(PACKAGE_STORAGE_PATH, f"{safe_prefix}_{source_name}")
+        temp_path = f"{file_path}.uploading"
+        file_size = 0
+        file_hasher = hashlib.sha256()
+        with open(temp_path, "wb") as output:
+            while chunk := await file.read(PACKAGE_UPLOAD_CHUNK_SIZE):
+                file_size += len(chunk)
+                if file_size > PACKAGE_MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="软件包超过允许的最大大小")
+                file_hasher.update(chunk)
+                output.write(chunk)
+        file_hash = file_hasher.hexdigest()
+        os.replace(temp_path, file_path)
+        temp_path = None
 
         uploader = get_request_username(request, fallback=info.get("upload_by") or "system")
 
@@ -282,8 +314,8 @@ async def upload_package(
                 architecture, status, upload_by
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            info['package_name'], info['display_name'], info['version'], info['category'],
-            info.get('vendor'), info.get('description'), file.filename, file_size,
+            package_name, display_name, version, category,
+            info.get('vendor'), info.get('description'), source_name, file_size,
             file_path, file_hash, info.get('install_command'), info.get('uninstall_command'),
             info.get('requires_reboot', False), info.get('architecture', 'all'),
             'available', uploader
@@ -295,15 +327,26 @@ async def upload_package(
         return {"message": "软件包上传成功", "package_id": package_id, "file_hash": file_hash}
 
     except json.JSONDecodeError:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=400, detail="无效的软件包信息格式")
+    except HTTPException:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        raise
     except Error as e:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
         conn.close()
 
 
@@ -661,6 +704,28 @@ def resolve_task_target_asset_ids(cursor, target_type: str, target_ids: List[int
     return [int(row[0]) for row in cursor.fetchall()]
 
 
+def validate_task_package(cursor, task: SoftwareTask) -> None:
+    if task.task_type not in {"install", "upgrade", "uninstall"}:
+        raise HTTPException(status_code=400, detail="Unsupported task type")
+    if task.schedule_type not in {"immediate", "scheduled"}:
+        raise HTTPException(status_code=400, detail="Unsupported schedule type")
+    if task.schedule_type == "scheduled" and not task.scheduled_time:
+        raise HTTPException(status_code=400, detail="Scheduled tasks require scheduled_time")
+    if not task.package_id:
+        raise HTTPException(status_code=400, detail="Software tasks require an available package")
+
+    cursor.execute(
+        """SELECT id, uninstall_command FROM software_packages
+           WHERE id = %s AND status = 'available' AND deleted_at IS NULL LIMIT 1""",
+        (task.package_id,),
+    )
+    package = cursor.fetchone()
+    if not package:
+        raise HTTPException(status_code=400, detail="Software package is unavailable")
+    if task.task_type == "uninstall" and not str(package.get("uninstall_command") or "").strip():
+        raise HTTPException(status_code=400, detail="The package does not define an uninstall command")
+
+
 @router.post("/api/v1/software/tasks")
 def create_task(task: SoftwareTask, request: Request):
     """创建软件任务"""
@@ -669,8 +734,9 @@ def create_task(task: SoftwareTask, request: Request):
         raise HTTPException(status_code=500, detail="Database connection failed")
 
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
 
+        validate_task_package(cursor, task)
         target_asset_ids = resolve_task_target_asset_ids(cursor, task.target_type, task.target_ids)
         if not target_asset_ids:
             raise HTTPException(status_code=400, detail="No active assets matched the selected targets")
@@ -1123,6 +1189,7 @@ def retry_task(task_id: int):
 def get_agent_policies(data: dict, request: Request):
     """Agent获取策略"""
     require_agent_request(request)
+    enforce_agent_asset_binding(request, data.get("asset_id"))
 
     conn = get_db_connection()
     if not conn:
@@ -1202,6 +1269,7 @@ def get_agent_policies(data: dict, request: Request):
 def poll_tasks(data: dict, request: Request):
     """Agent轮询任务"""
     require_agent_request(request)
+    enforce_agent_asset_binding(request, data.get("asset_id"))
 
     conn = get_db_connection()
     if not conn:
@@ -1262,6 +1330,42 @@ def poll_tasks(data: dict, request: Request):
                 if package:
                     task_info['package_info'] = dict(package)
                     result_tasks.append(task_info)
+                else:
+                    # 历史任务可能在包被删除或废弃后才轮询到；显式失败而非永久 pending。
+                    cursor.execute(
+                        """UPDATE software_task_results
+                           SET status = 'failed', progress = 100,
+                               error_message = 'Software package is unavailable', end_time = NOW()
+                           WHERE id = %s AND status = 'pending'""",
+                        (task['result_id'],),
+                    )
+                    cursor.execute(
+                        """SELECT
+                               SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+                               SUM(CASE WHEN status IN ('downloading', 'installing') THEN 1 ELSE 0 END) AS running_count,
+                               SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+                               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                               AVG(progress) AS avg_progress
+                           FROM software_task_results WHERE task_id = %s""",
+                        (task['task_id'],),
+                    )
+                    summary = cursor.fetchone() or {}
+                    if not int(summary.get('pending_count') or 0) and not int(summary.get('running_count') or 0):
+                        cursor.execute(
+                            """UPDATE software_tasks
+                               SET status = CASE WHEN %s > 0 THEN 'failed' ELSE 'completed' END,
+                                   progress = %s, success_count = %s, failed_count = %s,
+                                   running_count = 0, end_time = NOW(), updated_at = NOW()
+                               WHERE id = %s""",
+                            (
+                                int(summary.get('failed_count') or 0),
+                                int(summary.get('avg_progress') or 0),
+                                int(summary.get('success_count') or 0),
+                                int(summary.get('failed_count') or 0),
+                                task['task_id'],
+                            ),
+                        )
+                    conn.commit()
             else:
                 result_tasks.append(task_info)
 
@@ -1322,6 +1426,7 @@ def delete_package(package_id: int):
 def download_package(package_id: int, request: Request, asset_id: int = Query(..., ge=1)):
     """Agent下载软件包"""
     require_agent_request(request)
+    enforce_agent_asset_binding(request, asset_id)
 
     conn = get_db_connection()
     if not conn:
@@ -1363,6 +1468,7 @@ def download_package(package_id: int, request: Request, asset_id: int = Query(..
 def update_task_result(result_id: int, data: dict, request: Request):
     """Agent更新任务执行结果"""
     require_agent_request(request)
+    enforce_agent_asset_binding(request, data.get("asset_id"))
 
     conn = get_db_connection()
     if not conn:
@@ -1474,6 +1580,7 @@ def update_task_result(result_id: int, data: dict, request: Request):
 def upload_task_result_logs(result_id: int, data: dict, request: Request):
     """上传任务执行日志"""
     require_agent_request(request)
+    enforce_agent_asset_binding(request, data.get("asset_id"))
 
     conn = get_db_connection()
     if not conn:

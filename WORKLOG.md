@@ -3741,3 +3741,11 @@
 - **生效范围**：Agent 策略页新增“终端状态判定”输入框；分组/终端覆盖策略同样可配置。终端详情的当前状态、心跳历史状态、当前在线时长及在线率计算均读取该终端的最终生效策略（终端覆盖 > 分组覆盖 > 全局默认）。
 - **终端兼容**：新策略会随心跳下发并写入 Agent 本地策略缓存，供诊断与后续终端侧状态消费者使用；平台端判定即时生效，无需等待 Agent 升级。
 - **验证与部署**：策略/在线时长单测 11 passed，前端 Vite build 通过；重启平台后 `GET /console/agent-policies` 实测返回 `status.offline_threshold_seconds: 90`，Juno 当前状态仍为 online。
+
+## [2026-09-24] 软件管理功能与安全链路修复
+
+- **软件中心任务契约**：活跃的 `SoftwareCenter.vue` 已由旧的 `action/group_ids` 请求结构切换到当前任务 API 所需的 `task_name/task_type/target_ids/schedule_type`；任务列表同步使用 `task_type` 与 `package_display_name`，软件仓库分发不再触发 422。
+- **卸载保护与历史收敛**：仓库列表返回卸载命令可用性，未配置卸载命令的软件包不能在分发窗口选择卸载；服务端创建任务时校验任务类型、调度类型、软件包可用状态及卸载命令，拒绝创建 Agent 无法执行的挂起任务。历史任务若在轮询前引用的软件包已删除或废弃，会回写明确失败原因并在全部目标结束后收敛任务状态。
+- **Agent 资产隔离**：软件策略同步、任务轮询、受控包下载、任务结果及日志回传均增加设备凭据与请求 `asset_id` 的一致性校验；全局兼容 token 保持既有滚动升级链路。
+- **大包上传**：上传由整文件读入内存改为 1 MiB 分块写临时文件并增量计算 SHA-256；新增 `ZVIEW_PACKAGE_MAX_UPLOAD_BYTES`（默认 2 GiB）服务端硬限制，完成后原子改名，异常自动清理临时文件。
+- **验证**：`python -m py_compile zvplatform/routers/software_management.py`、相关 pytest（11 passed）及 `frontend npm run build` 通过。
