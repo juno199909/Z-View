@@ -16,7 +16,7 @@ import threading
 import time
 import tkinter as tk
 
-APP_DIR = r"D:\IT2026\IT2026\IT2026\IT2026"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = APP_DIR + r"\frontend"
 PY_EXE = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"
 NODE_EXE = r"C:\Program Files\nodejs\node.exe"

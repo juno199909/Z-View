@@ -13,11 +13,6 @@
 
 ---
 
-## [2026-09-24] 修正终端详情在线时长与在线率计算
-
-- **目标**：在线时长应表示最近一次连续在线段，而不是“当前时间减最后心跳时间”；近 7 天在线率应按心跳间隔计算，超过 90 秒的间隔视为离线。
-- **状态与验证**：`zvplatform/routers/assets.py` 新增连续在线段、心跳间隔封顶和时长格式化逻辑；新增 `tests/test_asset_uptime.py`。`python -m py_compile zvplatform/routers/assets.py tests/test_asset_uptime.py`、`python -m pytest tests/test_asset_uptime.py -q`（4 passed）、`python tests/test_assets_crud.py`（15/15 passed）。下一步：部署后打开终端详情确认实时显示。
-
 
 ## [2026-09-15] P1+P2 功能开发计划（用户指令：先做P1和P2）
 
@@ -3718,3 +3713,16 @@
 - **修复**：Juno 机器级环境变量 `ZVIEW_DISABLE_VIRTUAL_DISPLAY=1`（provider 设计内的禁用开关，skipped_by_env）+ 重启 CMDB-Agent。验证：12:11:02 后 pnputil 事件归零；基底状态 persistent_ready=True physical_display=True attached_displays=1（物理屏满足）。
 - **权衡**：Juno 上虚拟显示子系统禁用（Oray IDD 无法被 agent 挂载、重试只产闪烁）；基底依赖物理屏 + 屏幕常亮策略（powercfg monitor-timeout-ac 0 已设）。合盖/息屏时远控将无基底（黑屏无帧）——物理限制，彻底无头方案 = Parsec VDD 需 nefconw.exe 设备创建（载荷缺失，待办）。mm.inf 驱动包（oem116.inf）保留未删，未来补 nefconw 后可直接启用。
 - **验证请求**：请用户确认闪烁已停止。
+
+## [2026-09-24] 修正终端详情在线时长与在线率计算
+
+- **目标**：在线时长应表示最近一次连续在线段，而不是“当前时间减最后心跳时间”；近 7 天在线率应按心跳间隔计算，超过 90 秒的间隔视为离线。
+- **状态与验证**：`zvplatform/routers/assets.py` 新增连续在线段、心跳间隔封顶和时长格式化逻辑；新增 `tests/test_asset_uptime.py`。`python -m py_compile zvplatform/routers/assets.py tests/test_asset_uptime.py`、`python -m pytest tests/test_asset_uptime.py -q`（4 passed）、`python tests/test_assets_crud.py`（15/15 passed）。下一步：部署后打开终端详情确认实时显示。
+
+## [2026-09-24] 修复 ZViewServiceManager 启动平台报 WinError 267（旧路径硬编码）
+
+- **现象**：用户经 ZViewServiceManager.exe 启动平台，五个服务全部报 `[WinError 267] 目录名称无效`（12:27），旧服务被先停止、新服务未启动，平台短时中断。
+- **根因**：`zview_service_manager.py:19` 仍硬编码 `APP_DIR = r"D:\IT2026\IT2026\IT2026\IT2026"`（该目录在目录扁平化后已不存在）+ `ZViewServiceManager.spec` 内嵌同款旧路径；且磁盘上的 exe 为 9/16 旧构建。此前"相对路径改造"的这一处被并行会话 git 操作覆盖后未重放。
+- **修复**：① `APP_DIR = os.path.dirname(os.path.abspath(__file__))`（导入验证 = D:\IT2026）；② spec 改用 `SPECPATH + '/zview_service_manager.py'`；③ PyInstaller 重建 + sign_agent 签名 Valid（CN=Z-View Enterprise）+ 替换根目录 exe（旧实例占用，强杀后替换）；④ 字符串扫描确认新 exe 无旧路径残留。
+- **验证**：启动新 GUI（PID 904/8628）——python 进程数不变（4）、8080 归属仍为原后端 PID 5728，**无重复拉起服务**；平台服务全程在线，三终端心跳正常。
+- **提醒**：exe 已 gitignore 不入库；源码/spec 修复已提交，后续重建请用 `python -m PyInstaller ZViewServiceManager.spec`。

@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['D:/IT2026/IT2026/IT2026/IT2026/zview_service_manager.py'],
+    [SPECPATH + '/zview_service_manager.py'],
     pathex=[],
     binaries=[],
     datas=[],
