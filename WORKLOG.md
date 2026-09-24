@@ -13,6 +13,11 @@
 
 ---
 
+## [2026-09-24] 修正终端详情在线时长与在线率计算
+
+- **目标**：在线时长应表示最近一次连续在线段，而不是“当前时间减最后心跳时间”；近 7 天在线率应按心跳间隔计算，超过 90 秒的间隔视为离线。
+- **状态与验证**：`zvplatform/routers/assets.py` 新增连续在线段、心跳间隔封顶和时长格式化逻辑；新增 `tests/test_asset_uptime.py`。`python -m py_compile zvplatform/routers/assets.py tests/test_asset_uptime.py`、`python -m pytest tests/test_asset_uptime.py -q`（4 passed）、`python tests/test_assets_crud.py`（15/15 passed）。下一步：部署后打开终端详情确认实时显示。
+
 
 ## [2026-09-15] P1+P2 功能开发计划（用户指令：先做P1和P2）
 
@@ -3705,3 +3710,11 @@
 - **已修复**：① 驱动载荷（mm.inf/mm.dll/mm.cat/driver_manifest.json）robocopy 同步至 Program Files 与 ProgramData 两个目标（此前 driver_package_missing）→ 服务重启后状态推进为 installed_detached；② 电源策略：接通电源时屏幕/待机永不超时（powercfg monitor/standby-timeout-ac 0）——屏幕亮着时物理基底即恢复（昨日 41 FPS 即此状态）。
 - **发现的工程缺口（待办）**：载荷中的 mm.* 实为 Parsec VDD 0.45（manifest: ROOT\Parsec\VDA），创建设备节点需 nefconw.exe（devcon 类），**载荷中缺失该工具**→ pnputil 仅能导入驱动无法创建设备；且向日葵 OrayIddDriver 的监视器仅在向日葵推流时挂载，agent 的 restart-device 重试无法使其挂载。=> 彻底无头方案：补 nefconw.exe/vddinstall.bat 或内置设备创建逻辑（记入待办）；短期：Juno 合盖远控仍会丢基底，屏幕保持开启即可。
 - **验证**：载荷双目标同步 ✓（6 文件含 manifest/inf/cat/dll）；服务重启后 provider 主动 pnputil 扫描+restart 重试 ✓；电源策略已生效。请重新连接 Juno 远控确认（屏幕开启状态下应恢复正常出帧）。
+
+## [2026-09-24] Juno 屏幕周期性闪烁：根因为虚拟显示 attach 重试循环，已禁用修复
+
+- **现象**：Juno 间隔约 30s 屏幕闪烁一次（用户物理观察）。
+- **根因**：昨日为修复"缺少持续显示基底"做的驱动载荷同步 + 服务重启，使 agent 虚拟显示 provider 进入 **约每 26-30s 一次的 pnputil /scan-devices + /restart-device ROOT\DISPLAY\0000 重试循环**（试图挂载向日葵 OrayIddDriver 的监视器）——对显示适配器周期性重启即屏幕闪烁。该 Oray IDD 的监视器仅在向日葵推流时挂载，agent 的 restart 重试无法使其挂载，循环永不收敛。
+- **修复**：Juno 机器级环境变量 `ZVIEW_DISABLE_VIRTUAL_DISPLAY=1`（provider 设计内的禁用开关，skipped_by_env）+ 重启 CMDB-Agent。验证：12:11:02 后 pnputil 事件归零；基底状态 persistent_ready=True physical_display=True attached_displays=1（物理屏满足）。
+- **权衡**：Juno 上虚拟显示子系统禁用（Oray IDD 无法被 agent 挂载、重试只产闪烁）；基底依赖物理屏 + 屏幕常亮策略（powercfg monitor-timeout-ac 0 已设）。合盖/息屏时远控将无基底（黑屏无帧）——物理限制，彻底无头方案 = Parsec VDD 需 nefconw.exe 设备创建（载荷缺失，待办）。mm.inf 驱动包（oem116.inf）保留未删，未来补 nefconw 后可直接启用。
+- **验证请求**：请用户确认闪烁已停止。
