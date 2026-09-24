@@ -3697,3 +3697,11 @@
 - **全局策略闭环**：① 基线 software=120 → ② PUT intervals.software=90（200）→ ③ GET 持久化=90 → ④ 以 Juno 身份合成心跳，响应 policies.intervals.software=90（终端消费链路 build_effective_agent_policies → _apply_agent_policies 生效）→ ⑤ 还原 120，GET/心跳双确认 → ⑥ remote_desktop 设置完好未破坏。
 - **单终端覆盖闭环**（统一策略引擎 agent 类型）：创建 asset 范围 agent 策略（intervals.software=60，优先级 50）并绑定 2245 → Juno 心跳视角 software=60（**覆盖优先级生效**）→ 浅合并保全 heartbeat=30/hardware=86400 → 删除策略后回落全局 120。
 - **验证结论**：Agent 策略-数据上报的"修改 → 持久化 → 心跳下发 → 终端生效 → 回退"全链路 10 项检查全 PASS；真实终端（1.9.72）在每次心跳自动应用最新策略，无需重启。
+
+## [2026-09-24] Juno"缺少持续显示基底"告警排查与处置
+
+- **定位**：告警来自 10:34-10:36 连接 Juno 的远控会话（wt-udp×2/ws-tcp，DB remote_sessions 实证）。三终端日志扫描：2213/2245 无近期命中、本机无；为会话实时横幅不落盘。
+- **根因链**：Juno 笔记本屏幕关闭/合盖 → Windows 停止产出桌面像素 → capture_empty ≥3 → substrate 恢复失败 → 发出 missing_persistent_display_substrate。深查发现 Juno 基底状态 `blocked_missing_persistent_surface:driver_package_missing`（provisioning_state）——**Juno 经 updater 原地升级，从未跑过 GPO 包的 sync_virtual_display_payload 载荷同步步骤**。
+- **已修复**：① 驱动载荷（mm.inf/mm.dll/mm.cat/driver_manifest.json）robocopy 同步至 Program Files 与 ProgramData 两个目标（此前 driver_package_missing）→ 服务重启后状态推进为 installed_detached；② 电源策略：接通电源时屏幕/待机永不超时（powercfg monitor/standby-timeout-ac 0）——屏幕亮着时物理基底即恢复（昨日 41 FPS 即此状态）。
+- **发现的工程缺口（待办）**：载荷中的 mm.* 实为 Parsec VDD 0.45（manifest: ROOT\Parsec\VDA），创建设备节点需 nefconw.exe（devcon 类），**载荷中缺失该工具**→ pnputil 仅能导入驱动无法创建设备；且向日葵 OrayIddDriver 的监视器仅在向日葵推流时挂载，agent 的 restart-device 重试无法使其挂载。=> 彻底无头方案：补 nefconw.exe/vddinstall.bat 或内置设备创建逻辑（记入待办）；短期：Juno 合盖远控仍会丢基底，屏幕保持开启即可。
+- **验证**：载荷双目标同步 ✓（6 文件含 manifest/inf/cat/dll）；服务重启后 provider 主动 pnputil 扫描+restart 重试 ✓；电源策略已生效。请重新连接 Juno 远控确认（屏幕开启状态下应恢复正常出帧）。
