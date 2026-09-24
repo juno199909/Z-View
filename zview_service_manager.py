@@ -16,12 +16,21 @@ import threading
 import time
 import tkinter as tk
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = APP_DIR + r"\frontend"
 PY_EXE = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"
 NODE_EXE = r"C:\Program Files\nodejs\node.exe"
 VITE_JS = FRONTEND_DIR + r"\node_modules\vite\bin\vite.js"
 LOG_DIR = os.environ.get("TEMP", r"C:\Windows\Temp") + r"\ZView\logs"
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, "servicemanager.log"), "a", encoding="utf-8") as _lf:
+        _lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] APP_DIR={APP_DIR} frozen={bool(getattr(sys, 'frozen', False))}\n")
+except Exception:
+    pass
 
 SERVICES = [
     {"key": "assets", "label": "平台 API", "ports": (8080, 8443),
