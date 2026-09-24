@@ -139,9 +139,12 @@ const summary = computed(() => {
   return { enrolled, pending: rows.value.length - enrolled }
 })
 
-// 中心地址以浏览器当前访问地址为准（与部署脚本生成的默认值一致）
+// 静默命令：setup exe 支持 /quiet 与 --server-url=<中心地址>（等号形式）；
+// 不传 --server-url 时使用构建时内嵌的默认管理中心地址。文件名取自服务端响应头。
+const setupFilename = ref('')
 const installCmd = computed(() => {
-  return `Z-View.exe --install --quiet --server-url ${window.location.origin}`
+  const exe = setupFilename.value || 'Z-View-Setup-<版本>.exe'
+  return `${exe} /quiet`
 })
 
 const loadAll = async () => {
@@ -207,7 +210,7 @@ const downloadPackage = async () => {
       headers: getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}
     })
     const filename = resp.headers?.['x-agent-package-filename']
-      || `Z-View-Setup-${dayjs().format('YYYYMMDD')}.exe`
+      || 'Z-View-Setup.exe'
     triggerDownload(resp.data, filename)
     ElMessage.success('安装包已开始下载')
   } catch (e) {
@@ -252,9 +255,18 @@ const formatTime = (v) => {
   return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(v)
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadAll()
   loadExitPolicy()
+  try {
+    // 读取服务端实际提供的安装器文件名（X-Agent-Package-Filename），用于静默命令展示
+    const head = await axios.head('/api/v1/console/agent-deploy/package', {
+      headers: getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}
+    })
+    setupFilename.value = head.headers?.['x-agent-package-filename'] || ''
+  } catch (e) {
+    // 拿不到文件名时展示占位命令，不影响下载
+  }
 })
 </script>
 

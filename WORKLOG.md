@@ -3682,3 +3682,10 @@
 - **部署页验证**：GET /console/agent-deploy/package 现返回 `Z-View-Setup-1.9.72.exe`（Content-Disposition 确认，MZ 头），`_resolve_latest_agent_package` 优先返回 Setup exe 的设计恢复生效；upgrade status latest=1.9.72。
 - **向导 GUI 实测**：启动 exe → "Z-View Agent 安装向导" 窗口 576x399 正常弹出 → 直接关闭未执行安装（0 副作用）。向导流程：欢迎页(下一步) → 进度页(解压 payload → Z-View.exe --install → 服务轮询) → 完成页。
 - **状态**：部署页现在提供"双击式向导安装"体验；终端已装 1.9.72 的升级链路不受影响（updater 走 onedir zip）。
+
+## [2026-09-24] 修正 Agent 部署页静默命令文案（与 Setup exe 真实参数对齐）
+
+- **核查**：部署页文字主体已与 setup exe 流程一致，但「安装包」卡片展示的静默命令 `Z-View.exe --install --quiet --server-url <origin>` 有三处错误：① 文件名与实际下载的 `Z-View-Setup-*.exe` 不符；② 向导 CLI 无 `--install` 参数（setup_wizard.main 只认 /quiet、--server-url=）；③ `--server-url` 空格形式不被解析（须等号形式），且用 UI 端口 origin 覆盖会指向错误端口（Agent 应连 8080/8443，而非前端端口）。
+- **修复**：installCmd 改为 `<服务端实际文件名> /quiet`（文件名经 HEAD 请求读 X-Agent-Package-Filename 响应头，agent_deploy.py:68 已返回；不传 --server-url 时使用构建内嵌默认中心地址 https://172.16.250.120:8443）；下载兜底文件名从日期式改为 Z-View-Setup.exe。
+- **正确用法说明**：双击 = 图形向导；静默 = `Z-View-Setup-1.9.72.exe /quiet`（可选 `--server-url=https://中心:8443` 覆盖）；批量 = 部署脚本 ps1（下载 onedir zip → Agent 自安装器 `Z-View.exe --install --quiet --server-url <center>`，空格形式对 Agent 自安装器合法，已验证 /agent/upgrade/download 返回 onedir zip）。
+- **验证**：vite build 12.07s；4173 重启后 bundle（AgentDeploy-CBt0k2wI.js）含 /quiet 与响应头读取逻辑，旧错误命令已消失。
