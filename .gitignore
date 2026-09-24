@@ -79,3 +79,9 @@ ZViewServiceManager.exe
 # --- 仓外数据目录（隔离副本/诊断/备份，永不入库）
 /backups/
 /diagnostics/
+
+# GPO 包载荷（部署前填充，约 300MB 不入库）
+GPO部署包/Z-View.exe
+GPO部署包/_internal/
+GPO部署包/updater/
+GPO部署包/version.txt
