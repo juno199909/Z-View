@@ -9,7 +9,7 @@ import io
 import json
 import re
 import ipaddress
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -36,6 +36,60 @@ from zvplatform.models import SystemActivityLogCreate
 router = APIRouter()
 
 _injected = {}
+
+
+def _format_uptime_duration(seconds: int) -> str:
+    """Format a non-negative duration for the asset detail view."""
+    total_seconds = max(0, int(seconds or 0))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}\u5929 {hours}\u65f6 {minutes}\u5206 {secs}\u79d2"
+    return f"{hours}\u65f6 {minutes}\u5206 {secs}\u79d2"
+
+
+def _estimate_online_seconds(
+    heartbeat_times: List[datetime],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    max_gap_seconds: int = ALERT_ONLINE_SECONDS,
+) -> int:
+    """Estimate online time from heartbeat samples, capping each gap."""
+    if window_end <= window_start:
+        return 0
+
+    online_seconds = 0
+    sorted_times = sorted(t for t in heartbeat_times if isinstance(t, datetime))
+    for index, current_time in enumerate(sorted_times):
+        next_time = sorted_times[index + 1] if index + 1 < len(sorted_times) else window_end
+        interval_start = max(current_time, window_start)
+        interval_end = min(next_time, current_time + timedelta(seconds=max_gap_seconds), window_end)
+        if interval_end > interval_start:
+            online_seconds += int((interval_end - interval_start).total_seconds())
+    return max(0, online_seconds)
+
+
+def _find_current_online_start(
+    heartbeat_times: List[datetime],
+    *,
+    now: datetime,
+    max_gap_seconds: int = ALERT_ONLINE_SECONDS,
+) -> Optional[datetime]:
+    """Return the start of the current contiguous online heartbeat segment."""
+    sorted_times = sorted(t for t in heartbeat_times if isinstance(t, datetime))
+    if not sorted_times:
+        return None
+    if (now - sorted_times[-1]).total_seconds() > max_gap_seconds:
+        return None
+
+    segment_start = sorted_times[-1]
+    for index in range(len(sorted_times) - 1, 0, -1):
+        if (sorted_times[index] - sorted_times[index - 1]).total_seconds() > max_gap_seconds:
+            break
+        segment_start = sorted_times[index - 1]
+    return segment_start
 
 
 def bind_helpers(**kwargs):
@@ -1475,7 +1529,8 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
         )
         row = cursor.fetchone()
         last_seen = row.get('last_seen') if row else None
-        is_online = bool(last_seen and (datetime.now() - last_seen).total_seconds() <= 90)
+        now = datetime.now()
+        is_online = bool(last_seen and (now - last_seen).total_seconds() <= ALERT_ONLINE_SECONDS)
         # Query recent heartbeats for the period (used as "online windows" basis)
         cursor.execute("""
             SELECT heartbeat_time
@@ -1485,23 +1540,32 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
             ORDER BY heartbeat_time ASC
         """, (asset_id, days))
         rows = cursor.fetchall()
-        total_windows = len(rows)
-        # assume all heartbeat samples mean online; fallback to "no data" when none
-        online_windows = total_windows
-        availability_percent = 100.0 if total_windows else 0.0
-        # current uptime text
+        heartbeat_times = [r.get('heartbeat_time') for r in rows]
+        window_start = now - timedelta(days=days)
+        window_seconds = max(1, int((now - window_start).total_seconds()))
+        online_seconds = _estimate_online_seconds(
+            heartbeat_times,
+            window_start=window_start,
+            window_end=now,
+        )
+        availability_percent = round(min(100.0, online_seconds * 100.0 / window_seconds), 2)
+
+        # Current uptime is the duration of the latest contiguous online segment,
+        # not the age of the most recent heartbeat (which resets every heartbeat).
         current_uptime_text = "-"
-        if is_online and last_seen:
-            delta = datetime.now() - last_seen
-            secs = int(delta.total_seconds())
-            if secs < 86400:
-                h, rem = divmod(secs, 3600)
-                m, s = divmod(rem, 60)
-                current_uptime_text = f"{h}时 {m}分 {s}秒"
+        current_online_start = _find_current_online_start(
+            heartbeat_times,
+            now=now,
+        ) if is_online else None
+        if current_online_start:
+            current_uptime_text = _format_uptime_duration(
+                int((now - current_online_start).total_seconds())
+            )
         return {
             "days": days,
-            "total_windows": total_windows,
-            "online_windows": online_windows,
+            "total_windows": len(heartbeat_times),
+            "online_windows": len(heartbeat_times),
+            "online_seconds": online_seconds,
             "availability_percent": availability_percent,
             "current_uptime_text": current_uptime_text
         }
