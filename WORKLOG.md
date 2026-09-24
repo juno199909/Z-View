@@ -3673,3 +3673,12 @@
 - **发现并修复**：首测 6/9——部署下载 404、升级 status latest=None。根因：下午误清事件曾清空 agent_upgrade/（升级仓），当时仅重建了空目录，服务端升级仓一直为空（与目录迁移无关）。修复：从 level3-copy-quarantine 恢复 manifest.json + 1.9.70/71/72 包（sha256 校验 7d34a225…a20951d 与 manifest 一致；manifest 无定向名单=全局可用），mtime 热重载自动生效；同时恢复 releases/ 完整发布历史（1.9.33→1.9.72 + Setup exe）。
 - **复测**：9/9 全 PASS（初测 3 失败项 + 升级版本一致性共 10 项检查）。
 - **结论**：Agent 管理四模块功能全部正常；升级仓/releases 已从隔离副本完整找回。
+
+## [2026-09-24] 恢复 Agent 双击式图形安装向导（Z-View-Setup-1.9.72.exe）
+
+- **背景**：用户此前要求 Agent 安装提供"双击 exe → 安装向导 → 下一步 → 安装"的日常软件体验（1.9.55 起的 setup_wizard.py Tk 向导）。但 1.9.58 起部署页改发 onedir zip，Setup exe 停更在 1.9.57，且今日误清事件后 dist_setup/releases 的 Setup 产物全部丢失。
+- **重建**：从 1.9.72 zip 提取 Z-View.exe 满足 build 守卫 → `build_setup_exe.py 1.9.72 --publish` 重建单文件向导（87.1MB，payload.zip 内嵌 1.9.72 onedir + setup_meta 默认管理中心 https://172.16.250.120:8443）→ 发布至 agent_upgrade/1.9.72/。
+- **签名**：sign_agent.ps1（昨日 cherry-pick 的证书自动选择逻辑）对 releases 与 agent_upgrade 两份副本签名，均为 Valid（CN=Z-View Enterprise, 2EE71F46）。注：`-File` 模式下逗号数组不解析，需分两次调用。
+- **部署页验证**：GET /console/agent-deploy/package 现返回 `Z-View-Setup-1.9.72.exe`（Content-Disposition 确认，MZ 头），`_resolve_latest_agent_package` 优先返回 Setup exe 的设计恢复生效；upgrade status latest=1.9.72。
+- **向导 GUI 实测**：启动 exe → "Z-View Agent 安装向导" 窗口 576x399 正常弹出 → 直接关闭未执行安装（0 副作用）。向导流程：欢迎页(下一步) → 进度页(解压 payload → Z-View.exe --install → 服务轮询) → 完成页。
+- **状态**：部署页现在提供"双击式向导安装"体验；终端已装 1.9.72 的升级链路不受影响（updater 走 onedir zip）。
