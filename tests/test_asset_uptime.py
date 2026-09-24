@@ -29,6 +29,27 @@ def test_current_online_segment_restarts_after_offline_gap():
     assert start == times[-1]
 
 
+def test_gap_threshold_adapts_to_platform_heartbeat_policy():
+    now = datetime(2026, 9, 24, 12, 0, 0)
+    times = [
+        now - timedelta(minutes=15),
+        now - timedelta(minutes=10),
+        now - timedelta(minutes=10, seconds=-1),
+        now - timedelta(minutes=10, seconds=-2),
+        now - timedelta(minutes=4, seconds=58),
+    ]
+
+    gap_seconds = assets_router._resolve_heartbeat_gap_seconds(times)
+    start = assets_router._find_current_online_start(
+        times,
+        now=now,
+        max_gap_seconds=gap_seconds,
+    )
+
+    assert gap_seconds == 540
+    assert start == times[0]
+
+
 def test_online_seconds_caps_heartbeat_gaps_and_clips_window():
     now = datetime(2026, 9, 24, 12, 0, 0)
     window_start = now - timedelta(minutes=10)

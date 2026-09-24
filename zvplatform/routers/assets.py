@@ -10,6 +10,7 @@ import json
 import re
 import ipaddress
 from datetime import datetime, timedelta
+from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -69,6 +70,37 @@ def _estimate_online_seconds(
         if interval_end > interval_start:
             online_seconds += int((interval_end - interval_start).total_seconds())
     return max(0, online_seconds)
+
+
+def _resolve_heartbeat_gap_seconds(
+    heartbeat_times: List[datetime],
+    *,
+    minimum_gap_seconds: int = ALERT_ONLINE_SECONDS,
+) -> int:
+    """Derive a continuity threshold from the recent heartbeat cadence.
+
+    The platform can apply a heartbeat policy slower than the 90-second online
+    alert threshold. Treating a healthy five-minute heartbeat as an offline gap
+    makes the uptime card show "-" while the asset is demonstrably online.
+    """
+    sorted_times = sorted(t for t in heartbeat_times if isinstance(t, datetime))
+    intervals = [
+        (current - previous).total_seconds()
+        for previous, current in zip(sorted_times, sorted_times[1:])
+        if (current - previous).total_seconds() > 0
+    ]
+    if not intervals:
+        return minimum_gap_seconds
+
+    # A system-status heartbeat can be accompanied by several one-off reports
+    # in the same second. Prefer the stable, longer cadence when it exists;
+    # otherwise a regular 30/60-second heartbeat falls back to all intervals.
+    cadence_samples = [interval for interval in intervals if interval >= minimum_gap_seconds]
+    expected_interval = median(cadence_samples or intervals)
+    return max(
+        minimum_gap_seconds,
+        min(1800, int(round(expected_interval * 1.8))),
+    )
 
 
 def _find_current_online_start(
@@ -1541,12 +1573,14 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
         """, (asset_id, days))
         rows = cursor.fetchall()
         heartbeat_times = [r.get('heartbeat_time') for r in rows]
+        heartbeat_gap_seconds = _resolve_heartbeat_gap_seconds(heartbeat_times)
         window_start = now - timedelta(days=days)
         window_seconds = max(1, int((now - window_start).total_seconds()))
         online_seconds = _estimate_online_seconds(
             heartbeat_times,
             window_start=window_start,
             window_end=now,
+            max_gap_seconds=heartbeat_gap_seconds,
         )
         availability_percent = round(min(100.0, online_seconds * 100.0 / window_seconds), 2)
 
@@ -1555,7 +1589,8 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
         current_uptime_text = "-"
         current_online_start = _find_current_online_start(
             heartbeat_times,
-            now=now,
+            now=min(now, last_seen) if isinstance(last_seen, datetime) else now,
+            max_gap_seconds=heartbeat_gap_seconds,
         ) if is_online else None
         if current_online_start:
             current_uptime_text = _format_uptime_duration(

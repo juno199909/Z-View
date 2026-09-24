@@ -3726,3 +3726,11 @@
 - **修复**：① `APP_DIR = os.path.dirname(os.path.abspath(__file__))`（导入验证 = D:\IT2026）；② spec 改用 `SPECPATH + '/zview_service_manager.py'`；③ PyInstaller 重建 + sign_agent 签名 Valid（CN=Z-View Enterprise）+ 替换根目录 exe（旧实例占用，强杀后替换）；④ 字符串扫描确认新 exe 无旧路径残留。
 - **验证**：启动新 GUI（PID 904/8628）——python 进程数不变（4）、8080 归属仍为原后端 PID 5728，**无重复拉起服务**；平台服务全程在线，三终端心跳正常。
 - **提醒**：exe 已 gitignore 不入库；源码/spec 修复已提交，后续重建请用 `python -m PyInstaller ZViewServiceManager.spec`。
+
+## [2026-09-24] 终端详情“当前在线时长”二次修复与 Juno 实测
+
+- **现场现象**：Juno（2245）资产状态为 online、`last_seen` 持续刷新，但终端详情接口此前返回 `current_uptime_text: "-"`；近 7 天在线率也被低估。
+- **根因**：首次实现固定以 90 秒作为相邻 `agent_heartbeat` 连续阈值。Juno 当前策略存在约 5 分钟的系统指标心跳，且同批硬件/触发上报还会产生 1-7 秒短间隔记录；固定阈值把健康的 5 分钟周期切成离线段，而对全部间隔直接取中位数又会被同批短记录错误拉低。
+- **修复**：`zvplatform/routers/assets.py` 新增 `_resolve_heartbeat_gap_seconds`：优先从不少于在线告警阈值的稳定长周期样本推导心跳节奏，允许 1.8 倍调度抖动（上限 30 分钟）；在线率与连续在线段均使用该阈值；当前是否在线仍严格使用 `assets.last_seen <= 90s`。
+- **测试与部署**：新增同批短间隔 + 五分钟策略回归用例；`pytest tests/test_asset_uptime.py -q` 为 5 passed，`py_compile` 和 `git diff --check` 通过。使用 `start_platform.ps1 -Action Restart` 重启平台后实测 Juno：状态 online，`current_uptime_text` 由 `-` 恢复为连续时长（约 53 分钟）。
+- **说明**：近 7 天在线率保留历史长间隔的真实影响，与“当前在线”显示问题分离；若需追溯长期连续在线超过查询窗口的精确起点，应另行引入在线会话/状态变更持久化，而不应从单一 `last_seen` 时间戳推断。
