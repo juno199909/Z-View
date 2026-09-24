@@ -162,6 +162,24 @@ def _handle_remote_desktop(policies: dict, applied: dict) -> None:
             pass
 
 
+@policy_handler("status")
+def _handle_status(policies: dict, applied: dict) -> None:
+    """Persist status policy for diagnostics and future agent-side consumers."""
+    status_in = policies.get("status")
+    if not isinstance(status_in, dict):
+        return
+    raw = status_in.get("offline_threshold_seconds")
+    if isinstance(raw, bool) or raw is None:
+        return
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return
+    value = max(30, min(86400, value))
+    CONFIG.setdefault("status", {})["offline_threshold_seconds"] = value
+    applied["status"] = {"offline_threshold_seconds": value}
+
+
 def _persist_applied(applied: dict) -> None:
     try:
         _AGENT_POLICIES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +198,11 @@ def _persist_applied(applied: dict) -> None:
             merged["remote_desktop"] = {
                 **(merged.get("remote_desktop") or {}),
                 **applied["remote_desktop"],
+            }
+        if isinstance(applied.get("status"), dict):
+            merged["status"] = {
+                **(merged.get("status") or {}),
+                **applied["status"],
             }
         _AGENT_POLICIES_CACHE_PATH.write_text(
             json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"

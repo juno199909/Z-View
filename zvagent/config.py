@@ -36,6 +36,9 @@ _DEFAULT_CONFIG = {
         "consent_timeout_seconds": 30,
         "allow_if_no_user": False,
     },
+    "status": {
+        "offline_threshold_seconds": 90,
+    },
     "control_port": int(get_env("ZVIEW_AGENT_CONTROL_PORT", "9001") or "9001"),
     "log_level": "INFO",
 }

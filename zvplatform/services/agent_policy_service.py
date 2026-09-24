@@ -26,12 +26,19 @@ AGENT_POLICIES_DEFAULT = {
         "allow_shell": False,
         "shell_timeout_seconds": 60,
     },
+    "status": {
+        "offline_threshold_seconds": 90,
+    },
 }
 
 AGENT_POLICY_INTERVAL_BOUNDS = {
     "heartbeat": (5, 3600),
     "software": (10, 86400),
     "hardware": (300, 604800),
+}
+
+AGENT_POLICY_STATUS_BOUNDS = {
+    "offline_threshold_seconds": (30, 86400),
 }
 
 
@@ -204,7 +211,34 @@ def normalize_agent_policy_config(payload: dict) -> tuple[dict, list]:
             if remote_clean:
                 clean["remote_desktop"] = remote_clean
 
-    unknown_sections = set((payload or {}).keys()) - {"intervals", "remote_desktop"}
+    status_in = (payload or {}).get("status")
+    if status_in is not None:
+        if not isinstance(status_in, dict):
+            errors.append("status must be an object")
+        else:
+            status_clean: dict = {}
+            for key, (low, high) in AGENT_POLICY_STATUS_BOUNDS.items():
+                if key not in status_in or status_in.get(key) is None:
+                    continue
+                raw = status_in.get(key)
+                if isinstance(raw, bool):
+                    errors.append(f"status.{key} must be an integer")
+                    continue
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    errors.append(f"status.{key} must be an integer")
+                    continue
+                if value < low or value > high:
+                    errors.append(
+                        f"status.{key} must be between {low} and {high} seconds"
+                    )
+                    continue
+                status_clean[key] = value
+            if status_clean:
+                clean["status"] = status_clean
+
+    unknown_sections = set((payload or {}).keys()) - {"intervals", "remote_desktop", "status"}
     if unknown_sections:
         errors.append(f"unknown policy sections: {', '.join(sorted(unknown_sections))}")
     return clean, errors

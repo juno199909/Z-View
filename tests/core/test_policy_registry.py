@@ -20,11 +20,13 @@ def test_validate_agent_config_clean():
     clean, errors = validate_policy_config("agent", {
         "intervals": {"heartbeat": 15},
         "remote_desktop": {"allow_shell": True, "shell_timeout_seconds": 120},
+        "status": {"offline_threshold_seconds": 600},
     })
     assert errors == []
     assert clean == {
         "intervals": {"heartbeat": 15},
         "remote_desktop": {"allow_shell": True, "shell_timeout_seconds": 120},
+        "status": {"offline_threshold_seconds": 600},
     }
 
 
@@ -32,12 +34,14 @@ def test_validate_agent_config_rejects_bad_values():
     clean, errors = validate_policy_config("agent", {
         "intervals": {"heartbeat": 1},
         "remote_desktop": {"allow_shell": "maybe", "shell_timeout_seconds": 9999},
+        "status": {"offline_threshold_seconds": 10},
         "unknown_section": {},
     })
     assert clean == {}
     assert any("intervals.heartbeat" in e for e in errors)
     assert any("allow_shell" in e for e in errors)
     assert any("shell_timeout_seconds" in e for e in errors)
+    assert any("offline_threshold_seconds" in e for e in errors)
     assert any("unknown policy sections" in e for e in errors)
 
 
@@ -56,15 +60,18 @@ def test_merge_agent_policies_override_wins():
             "allow_if_no_user": False, "disable_uac_secure_desktop": True,
             "allow_shell": False, "shell_timeout_seconds": 60,
         },
+        "status": {"offline_threshold_seconds": 90},
     }
     merged = merge_agent_policies(base, {
         "intervals": {"heartbeat": 15},
         "remote_desktop": {"allow_shell": True},
+        "status": {"offline_threshold_seconds": 600},
     })
     assert merged["intervals"]["heartbeat"] == 15
     assert merged["intervals"]["software"] == 120  # 未覆盖字段保留兜底
     assert merged["remote_desktop"]["allow_shell"] is True
     assert merged["remote_desktop"]["require_consent"] is True
+    assert merged["status"]["offline_threshold_seconds"] == 600
     # 纯函数：不污染 base
     assert base["intervals"]["heartbeat"] == 30
 

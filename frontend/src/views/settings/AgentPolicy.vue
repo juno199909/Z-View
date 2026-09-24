@@ -61,6 +61,28 @@
         </div>
       </div>
 
+      <!-- 在线状态策略 -->
+      <div class="zv-card zv-card-pad">
+        <div class="zv-policy-head">
+          <div class="zv-policy-icon" style="background: linear-gradient(135deg, #10b981, #059669);">
+            <el-icon :size="20"><Operation /></el-icon>
+          </div>
+          <div>
+            <div class="zv-policy-title">终端状态判定</div>
+            <div class="zv-policy-subtitle">控制多久未上报的终端显示为离线</div>
+          </div>
+        </div>
+
+        <div class="zv-policy-item">
+          <div class="zv-policy-label">离线判定阈值</div>
+          <div class="zv-policy-control">
+            <el-input-number v-model="form.offline_threshold_seconds" :min="30" :max="86400" :step="30" controls-position="right" style="width: 180px" />
+            <span class="zv-unit">秒</span>
+          </div>
+          <div class="zv-policy-hint">最后一次上报超过此时长即显示离线（30 - 86400 秒，建议不小于心跳间隔的 2 倍）</div>
+        </div>
+      </div>
+
       <!-- 远程桌面策略 -->
       <div class="zv-card zv-card-pad">
         <div class="zv-policy-head">
@@ -187,6 +209,10 @@
           <el-input-number v-model="overrideForm.heartbeat" :min="5" :max="3600" :step="5" controls-position="right" style="width: 160px" />
           <span class="zv-unit">秒</span>
         </el-form-item>
+        <el-form-item label="离线判定阈值">
+          <el-input-number v-model="overrideForm.offline_threshold_seconds" :min="30" :max="86400" :step="30" controls-position="right" style="width: 160px" />
+          <span class="zv-unit">秒</span>
+        </el-form-item>
         <el-form-item label="远控需用户确认">
           <el-switch v-model="overrideForm.require_consent" />
         </el-form-item>
@@ -262,6 +288,7 @@ const DEFAULTS = {
   heartbeat: 30,
   software: 30,
   hardware: 86400,
+  offline_threshold_seconds: 90,
   require_consent: true,
   consent_timeout_seconds: 90,
   allow_if_no_user: false,
@@ -275,9 +302,11 @@ const form = reactive({ ...DEFAULTS })
 const applyPolicies = policies => {
   const intervals = policies?.intervals || {}
   const remote = policies?.remote_desktop || {}
+  const status = policies?.status || {}
   form.heartbeat = Number(intervals.heartbeat ?? DEFAULTS.heartbeat)
   form.software = Number(intervals.software ?? DEFAULTS.software)
   form.hardware = Number(intervals.hardware ?? DEFAULTS.hardware)
+  form.offline_threshold_seconds = Number(status.offline_threshold_seconds ?? DEFAULTS.offline_threshold_seconds)
   form.require_consent = Boolean(remote.require_consent)
   form.consent_timeout_seconds = Number(remote.consent_timeout_seconds ?? DEFAULTS.consent_timeout_seconds)
   form.allow_if_no_user = Boolean(remote.allow_if_no_user)
@@ -304,6 +333,7 @@ const savePolicies = async () => {
   try {
     const data = await updateAgentPolicies({
       intervals: { heartbeat: form.heartbeat, software: form.software, hardware: form.hardware },
+      status: { offline_threshold_seconds: form.offline_threshold_seconds },
       remote_desktop: {
         require_consent: form.require_consent,
         consent_timeout_seconds: form.consent_timeout_seconds,
@@ -334,7 +364,7 @@ const overrideDialogVisible = ref(false)
 const overrideSaving = ref(false)
 const overrideForm = reactive({
   policy_name: '', scope_type: 'group', scope_id: null, priority: 10,
-  heartbeat: 30, require_consent: true, allow_shell: false, shell_timeout_seconds: 60
+  heartbeat: 30, offline_threshold_seconds: 90, require_consent: true, allow_shell: false, shell_timeout_seconds: 60
 })
 const groups = ref([])
 const assets = ref([])
@@ -379,7 +409,7 @@ const loadOverridePolicies = async () => {
 const openOverrideDialog = async () => {
   Object.assign(overrideForm, {
     policy_name: '', scope_type: 'group', scope_id: null, priority: 10,
-    heartbeat: form.heartbeat, require_consent: form.require_consent,
+    heartbeat: form.heartbeat, offline_threshold_seconds: form.offline_threshold_seconds, require_consent: form.require_consent,
     allow_shell: form.allow_shell, shell_timeout_seconds: form.shell_timeout_seconds
   })
   await loadScopeOptions()
@@ -403,6 +433,7 @@ const submitOverride = async () => {
   try {
     const config = {
       intervals: { heartbeat: overrideForm.heartbeat },
+      status: { offline_threshold_seconds: overrideForm.offline_threshold_seconds },
       remote_desktop: {
         require_consent: overrideForm.require_consent,
         allow_shell: overrideForm.allow_shell,

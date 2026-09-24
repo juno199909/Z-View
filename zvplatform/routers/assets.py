@@ -39,6 +39,18 @@ router = APIRouter()
 _injected = {}
 
 
+def _resolve_asset_offline_threshold(conn, asset_id: int) -> int:
+    """Read the effective Agent policy without letting policy errors block details."""
+    try:
+        from zvplatform.services.policy_registry import build_effective_agent_policies
+
+        status_policy = (build_effective_agent_policies(conn, asset_id) or {}).get("status") or {}
+        value = int(status_policy.get("offline_threshold_seconds", ALERT_ONLINE_SECONDS))
+        return max(30, min(86400, value))
+    except Exception:
+        return ALERT_ONLINE_SECONDS
+
+
 def _format_uptime_duration(seconds: int) -> str:
     """Format a non-negative duration for the asset detail view."""
     total_seconds = max(0, int(seconds or 0))
@@ -1423,17 +1435,18 @@ def get_asset_status(asset_id: int):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         cursor = conn.cursor(dictionary=True)
+        offline_threshold_seconds = _resolve_asset_offline_threshold(conn, asset_id)
         cursor.execute("""
             SELECT a.id, a.status, a.last_seen,
                    CASE
                        WHEN a.last_seen IS NULL THEN 'offline'
-                       WHEN TIMESTAMPDIFF(SECOND, a.last_seen, NOW()) <= 90 THEN 'online'
+                       WHEN TIMESTAMPDIFF(SECOND, a.last_seen, NOW()) <= %s THEN 'online'
                        ELSE 'offline'
                    END as current_status,
                    a.agent_install_status
             FROM assets a
             WHERE a.id = %s AND a.deleted_at IS NULL
-        """, (asset_id,))
+        """, (offline_threshold_seconds, asset_id))
         status = cursor.fetchone()
         if not status:
             raise HTTPException(status_code=404, detail="Asset not found")
@@ -1466,6 +1479,7 @@ def get_asset_status_history(asset_id: int, limit: int = 20):
 
     try:
         cursor = conn.cursor(dictionary=True)
+        offline_threshold_seconds = _resolve_asset_offline_threshold(conn, asset_id)
         # 多取一行用于计算相邻心跳间隔（判断离线段），返回时剔除
         cursor.execute("""
             SELECT cpu_usage, memory_usage, disk_usage, process_count,
@@ -1495,7 +1509,7 @@ def get_asset_status_history(asset_id: int, limit: int = 20):
                         gap = (h_dt - prev_dt).total_seconds()
                 else:
                     gap = (now_dt - h_dt).total_seconds()
-                if gap is not None and gap > 90:
+                if gap is not None and gap > offline_threshold_seconds:
                     h['status'] = 'offline'
                 else:
                     h['status'] = 'online'
@@ -1561,8 +1575,9 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
         )
         row = cursor.fetchone()
         last_seen = row.get('last_seen') if row else None
+        offline_threshold_seconds = _resolve_asset_offline_threshold(conn, asset_id)
         now = datetime.now()
-        is_online = bool(last_seen and (now - last_seen).total_seconds() <= ALERT_ONLINE_SECONDS)
+        is_online = bool(last_seen and (now - last_seen).total_seconds() <= offline_threshold_seconds)
         # Query recent heartbeats for the period (used as "online windows" basis)
         cursor.execute("""
             SELECT heartbeat_time
@@ -1573,7 +1588,10 @@ def get_asset_uptime_route(asset_id: int, days: int = 7):
         """, (asset_id, days))
         rows = cursor.fetchall()
         heartbeat_times = [r.get('heartbeat_time') for r in rows]
-        heartbeat_gap_seconds = _resolve_heartbeat_gap_seconds(heartbeat_times)
+        heartbeat_gap_seconds = _resolve_heartbeat_gap_seconds(
+            heartbeat_times,
+            minimum_gap_seconds=offline_threshold_seconds,
+        )
         window_start = now - timedelta(days=days)
         window_seconds = max(1, int((now - window_start).total_seconds()))
         online_seconds = _estimate_online_seconds(

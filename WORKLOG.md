@@ -3734,3 +3734,10 @@
 - **修复**：`zvplatform/routers/assets.py` 新增 `_resolve_heartbeat_gap_seconds`：优先从不少于在线告警阈值的稳定长周期样本推导心跳节奏，允许 1.8 倍调度抖动（上限 30 分钟）；在线率与连续在线段均使用该阈值；当前是否在线仍严格使用 `assets.last_seen <= 90s`。
 - **测试与部署**：新增同批短间隔 + 五分钟策略回归用例；`pytest tests/test_asset_uptime.py -q` 为 5 passed，`py_compile` 和 `git diff --check` 通过。使用 `start_platform.ps1 -Action Restart` 重启平台后实测 Juno：状态 online，`current_uptime_text` 由 `-` 恢复为连续时长（约 53 分钟）。
 - **说明**：近 7 天在线率保留历史长间隔的真实影响，与“当前在线”显示问题分离；若需追溯长期连续在线超过查询窗口的精确起点，应另行引入在线会话/状态变更持久化，而不应从单一 `last_seen` 时间戳推断。
+
+## [2026-09-24] Agent 策略纳入终端离线判定阈值
+
+- **新增策略段**：`status.offline_threshold_seconds`，默认 90 秒，允许 30–86400 秒；兼容既有已存策略（缺失字段自动回退默认值）。
+- **生效范围**：Agent 策略页新增“终端状态判定”输入框；分组/终端覆盖策略同样可配置。终端详情的当前状态、心跳历史状态、当前在线时长及在线率计算均读取该终端的最终生效策略（终端覆盖 > 分组覆盖 > 全局默认）。
+- **终端兼容**：新策略会随心跳下发并写入 Agent 本地策略缓存，供诊断与后续终端侧状态消费者使用；平台端判定即时生效，无需等待 Agent 升级。
+- **验证与部署**：策略/在线时长单测 11 passed，前端 Vite build 通过；重启平台后 `GET /console/agent-policies` 实测返回 `status.offline_threshold_seconds: 90`，Juno 当前状态仍为 online。
