@@ -36,7 +36,19 @@ def get_all_software(asset_id: Optional[int] = Query(default=None)):
                 s.size_mb,
                 a.id as asset_id,
                 a.hostname,
-                a.ip_address
+                a.ip_address,
+                (
+                    SELECT p.id
+                    FROM software_packages p
+                    WHERE p.deleted_at IS NULL
+                      AND p.status = 'available'
+                      AND p.uninstall_command IS NOT NULL
+                      AND TRIM(p.uninstall_command) <> ''
+                      AND p.version = s.version
+                      AND (p.package_name = s.software_name OR p.display_name = s.software_name)
+                    ORDER BY p.id DESC
+                    LIMIT 1
+                ) AS uninstall_package_id
             FROM asset_software s
             LEFT JOIN assets a ON s.asset_id = a.id
             WHERE a.deleted_at IS NULL

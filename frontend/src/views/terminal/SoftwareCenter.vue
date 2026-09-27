@@ -92,6 +92,7 @@
             <el-table-column label="操作" width="120" align="right">
               <template #default="{ row }">
                 <el-button v-if="row.status === 'pending'" text type="warning" size="small" @click="handleCancelTask(row)">取消</el-button>
+                <el-button v-if="row.status === 'failed'" text type="warning" size="small" @click="handleRetryTask(row)">重试</el-button>
                 <el-button text type="primary" size="small" @click="viewTaskResult(row)">详情</el-button>
               </template>
             </el-table-column>
@@ -246,7 +247,7 @@ import {
 import {
   getSoftwarePackages, getSoftwarePackageStats,
   getSoftwareTasks, getSoftwareTaskStats, getSoftwareTaskDetail,
-  createSoftwareTask, cancelSoftwareTask as cancelTaskApi,
+  createSoftwareTask, cancelSoftwareTask as cancelTaskApi, retrySoftwareTask,
   uploadSoftwarePackage, deleteSoftwarePackage as deletePackageApi
 } from '@/api/software'
 import { getGroups } from '@/api/group'
@@ -458,6 +459,18 @@ const handleCancelTask = async (row) => {
     ElMessage.success('已取消')
     loadTasks()
   } catch (e) { if (e !== 'cancel') ElMessage.error('取消失败') }
+}
+
+const handleRetryTask = async (row) => {
+  try {
+    await ElMessageBox.confirm('仅会重新下发失败、超时或已取消的终端结果，已成功终端不会重复执行。', '重试任务', { type: 'warning' })
+    await retrySoftwareTask(row.id)
+    ElMessage.success('任务已重新下发')
+    loadTasks()
+    loadStats()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error('重试失败')
+  }
 }
 
 const viewTaskResult = async (row) => {

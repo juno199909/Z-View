@@ -26,7 +26,13 @@
         <el-table-column prop="install_date" label="安装日期" width="120" />
         <el-table-column label="操作" width="120">
           <template #default="{ row }">
-            <el-button size="small" type="danger" @click="uninstallSoftware(row)">
+            <el-button
+              size="small"
+              type="danger"
+              :disabled="!row.uninstall_package_id"
+              :title="row.uninstall_package_id ? '创建受控卸载任务' : '仓库中没有同版本且已配置卸载命令的软件包'"
+              @click="uninstallSoftware(row)"
+            >
               卸载
             </el-button>
           </template>
@@ -72,6 +78,10 @@ const loadSoftwareList = async () => {
 }
 
 const uninstallSoftware = async (row) => {
+  if (!row.uninstall_package_id) {
+    ElMessage.warning('该软件未关联可执行的仓库卸载包')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `确定要在终端 "${row.hostname}" 上卸载软件 "${row.software_name}" 吗？`,
@@ -87,6 +97,7 @@ const uninstallSoftware = async (row) => {
     const taskData = {
       task_name: `卸载 ${row.software_name}`,
       task_type: 'uninstall',
+      package_id: row.uninstall_package_id,
       software_name: row.software_name,
       target_type: 'asset',
       target_ids: [row.asset_id],
