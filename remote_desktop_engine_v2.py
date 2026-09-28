@@ -589,6 +589,7 @@ class RemoteFileTransferManager:
     def __init__(self):
         self.base_dir = self._resolve_base_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.desktop_dir = self._resolve_desktop_dir()
         self.MAX_FILE_SIZE = self._load_max_file_size()
         self._lock = threading.Lock()
         self._incoming_transfers: dict[str, dict] = {}
@@ -632,6 +633,7 @@ class RemoteFileTransferManager:
         file_name: str,
         file_size: int,
         relative_path: str | None = None,
+        destination: str = "transfer",
     ) -> tuple[bool, dict | None, str]:
         if not transfer_id:
             return False, None, "缺少传输标识"
@@ -646,7 +648,8 @@ class RemoteFileTransferManager:
             )
         except ValueError as exc:
             return False, None, str(exc)
-        target_path = self._allocate_target_path(safe_relative_path)
+        target_root = self.desktop_dir if destination == "desktop" and self.desktop_dir else self.base_dir
+        target_path = self._allocate_target_path(safe_relative_path, target_root)
 
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -658,6 +661,7 @@ class RemoteFileTransferManager:
             "transfer_id": transfer_id,
             "name": target_path.name,
             "path": target_path,
+            "root": target_root,
             "handle": handle,
             "expected_size": file_size,
             "bytes_received": 0,
@@ -670,7 +674,7 @@ class RemoteFileTransferManager:
                 self._dispose_transfer(previous, delete_partial=True)
             self._incoming_transfers[transfer_id] = state
 
-        return True, self._build_file_metadata(target_path), "已开始接收文件"
+        return True, self._build_file_metadata(target_path, target_root), "已开始接收文件"
 
     def append_upload_chunk(self, transfer_id: str, chunk_index: int, chunk_data: str) -> tuple[bool, dict, str]:
         with self._lock:
@@ -730,7 +734,7 @@ class RemoteFileTransferManager:
                 state["path"].unlink(missing_ok=True)
             return False, None, f"文件大小校验失败，期望 {expected_size} 字节，实际 {actual_size} 字节"
 
-        return True, self._build_file_metadata(state["path"]), "文件上传完成"
+        return True, self._build_file_metadata(state["path"], state.get("root") or self.base_dir), "文件上传完成"
 
     def cancel_upload(self, transfer_id: str):
         with self._lock:
@@ -776,6 +780,26 @@ class RemoteFileTransferManager:
                 continue
         return Path.cwd() / "RemoteDesktopTransfers"
 
+    def _resolve_desktop_dir(self) -> Path | None:
+        override = str(os.getenv("CMDB_REMOTE_DESKTOP_DIR", "") or "").strip()
+        candidates = [Path(override)] if override else []
+        try:
+            import win32ts
+            session_id = int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
+            username = str(win32ts.WTSQuerySessionInformation(None, session_id, win32ts.WTSUserName) or "").strip()
+            if username:
+                candidates.extend([Path("C:/Users") / username / "Desktop", Path("C:/Users") / username / "OneDrive" / "Desktop"])
+        except Exception:
+            pass
+        candidates.append(Path.home() / "Desktop")
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                return candidate
+            except Exception:
+                continue
+        return None
+
     def _sanitize_filename(self, file_name: str) -> str:
         cleaned = "".join(
             character if character not in '<>:"/\\|?*\r\n\t' else "_"
@@ -812,8 +836,8 @@ class RemoteFileTransferManager:
 
         return Path(*safe_segments)
 
-    def _allocate_target_path(self, relative_path: Path) -> Path:
-        target_path = self.base_dir / relative_path
+    def _allocate_target_path(self, relative_path: Path, root: Path | None = None) -> Path:
+        target_path = (root or self.base_dir) / relative_path
         if not target_path.exists():
             return target_path
 
@@ -836,11 +860,11 @@ class RemoteFileTransferManager:
             raise ValueError("非法的文件路径") from exc
         return candidate
 
-    def _build_file_metadata(self, path: Path) -> dict:
+    def _build_file_metadata(self, path: Path, root: Path | None = None) -> dict:
         stat = path.stat()
         return {
             "name": path.name,
-            "relative_path": path.relative_to(self.base_dir).as_posix(),
+            "relative_path": path.relative_to(root or self.base_dir).as_posix(),
             "size": int(stat.st_size),
             "modified_at": int(stat.st_mtime),
         }
@@ -4417,6 +4441,7 @@ class RemoteDesktopSession:
         transfer_id = str(message.get('transfer_id') or '').strip()
         file_name = str(message.get('file_name') or '').strip()
         relative_path = str(message.get('relative_path') or '').strip()
+        destination = str(message.get('destination') or 'transfer').strip().lower()
         try:
             file_size = max(0, int(message.get('file_size') or 0))
         except (TypeError, ValueError):
@@ -4429,6 +4454,7 @@ class RemoteDesktopSession:
             file_name,
             file_size,
             relative_path,
+            destination,
         )
         await self._send_file_transfer_status(
             direction='upload',

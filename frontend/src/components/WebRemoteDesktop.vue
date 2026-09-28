@@ -68,8 +68,12 @@
         <!-- 远程桌面画布 -->
         <div
           class="desktop-container"
-          :class="{ 'is-fullscreen': isFullscreen }"
+          :class="{ 'is-fullscreen': isFullscreen, 'is-file-drop-active': desktopFileDropActive }"
           ref="desktopContainer"
+          @dragenter.prevent="handleDesktopDragEnter"
+          @dragover.prevent="handleDesktopDragOver"
+          @dragleave.prevent="handleDesktopDragLeave"
+          @drop.prevent="handleDesktopDrop"
         >
           <el-button
             v-if="isFullscreen && !fullscreenToolbarVisible"
@@ -745,6 +749,7 @@ const fileTransferState = ref({
 })
 const transferRecords = ref([])
 const fileDropActive = ref(false)
+const desktopFileDropActive = ref(false)
 const transferRecordMap = new Map()
 const pendingDownloads = new Map()
 const activeUploadControllers = new Map()
@@ -753,6 +758,7 @@ const uploadQueue = []
 const activeTransferStatuses = new Set(['queued', 'started', 'progress', 'canceling'])
 let processingUploadQueue = false
 let dragCounter = 0
+let desktopDragCounter = 0
 let fullscreenToolbarTimer = null
 const transferHistory = computed(() => transferRecords.value.slice(0, 20))
 const activeTransfers = computed(() => (
@@ -2651,7 +2657,21 @@ const handleTransferDrop = async (event) => {
   await enqueueUploads(descriptors)
 }
 
-const enqueueUploads = async (descriptors) => {
+const handleDesktopDragEnter = () => { desktopDragCounter += 1; desktopFileDropActive.value = true }
+const handleDesktopDragOver = () => { desktopFileDropActive.value = true }
+const handleDesktopDragLeave = () => {
+  desktopDragCounter = Math.max(0, desktopDragCounter - 1)
+  if (desktopDragCounter === 0) desktopFileDropActive.value = false
+}
+const handleDesktopDrop = async (event) => {
+  desktopDragCounter = 0
+  desktopFileDropActive.value = false
+  const descriptors = await collectDroppedDescriptors(event.dataTransfer)
+  if (!descriptors.length) return ElMessage.warning('未检测到可上传的文件')
+  await enqueueUploads(descriptors, { destination: 'desktop' })
+}
+
+const enqueueUploads = async (descriptors, { destination = 'transfer' } = {}) => {
   if (!isSocketOpen()) {
     ElMessage.warning('远程桌面未连接，无法上传文件')
     return
@@ -2688,6 +2708,7 @@ const enqueueUploads = async (descriptors) => {
       relativePath,
       fileName: file.name,
       displayName,
+      destination,
       controller
     })
     upsertTransferRecord(transferId, {
@@ -2743,7 +2764,7 @@ const processUploadQueue = async () => {
 }
 
 const uploadFileToRemote = async (task) => {
-  const { file, relativePath, transferId, fileName, displayName, controller } = task
+  const { file, relativePath, transferId, fileName, displayName, controller, destination } = task
   fileTransferState.value.uploadProgress = 0
   fileTransferState.value.uploadStatus = `正在初始化上传: ${displayName}`
   upsertTransferRecord(transferId, {
@@ -2762,7 +2783,8 @@ const uploadFileToRemote = async (task) => {
     transfer_id: transferId,
     file_name: fileName,
     relative_path: relativePath,
-    file_size: file.size
+    file_size: file.size,
+    destination
   })) {
     upsertTransferRecord(transferId, {
       status: 'failed',
@@ -4615,6 +4637,8 @@ const normalizeNumber = (value, fallback) => {
   font-size: 12px;
   color: #909399;
 }
+
+.desktop-container.is-file-drop-active { outline: 3px solid #409eff; outline-offset: -3px; }
 
 .warning-text {
   color: #e67e22;
