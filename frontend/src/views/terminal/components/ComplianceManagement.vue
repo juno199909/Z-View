@@ -10,6 +10,7 @@
           <el-button @click="refreshAll">刷新</el-button>
           <el-button :loading="exporting" @click="handleExport">导出结果</el-button>
           <el-button type="success" @click="openScanDialog()">立即扫描</el-button>
+          <el-button @click="openScheduleDialog()">周期扫描</el-button>
           <el-button type="primary" @click="openCreateDialog">新建规则</el-button>
         </div>
       </div>
@@ -53,6 +54,25 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <el-card class="table-card">
+      <template #header>
+        <div class="card-header"><span>周期扫描计划</span><el-button text type="primary" @click="loadSchedules">刷新计划</el-button></div>
+      </template>
+      <el-table :data="schedules" v-loading="schedulesLoading" style="width: 100%">
+        <el-table-column prop="schedule_name" label="计划名称" min-width="200" />
+        <el-table-column label="频率" width="140"><template #default="{ row }">每 {{ row.interval_minutes }} 分钟</template></el-table-column>
+        <el-table-column label="范围" min-width="180"><template #default="{ row }">{{ formatScheduleScope(row) }}</template></el-table-column>
+        <el-table-column prop="next_run_at" label="下次执行" width="180" />
+        <el-table-column prop="last_run_at" label="上次执行" width="180"><template #default="{ row }">{{ row.last_run_at || '-' }}</template></el-table-column>
+        <el-table-column label="状态" width="120"><template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column>
+        <el-table-column label="操作" width="210" fixed="right"><template #default="{ row }">
+          <el-button text type="primary" size="small" @click="openScheduleDialog(row)">编辑</el-button>
+          <el-button text size="small" @click="toggleSchedule(row)">{{ row.enabled ? '停用' : '启用' }}</el-button>
+          <el-button text type="danger" size="small" @click="removeSchedule(row)">删除</el-button>
+        </template></el-table-column>
+      </el-table>
+    </el-card>
 
     <el-row :gutter="16" class="charts-row">
       <el-col :xs="24" :lg="8">
@@ -431,6 +451,18 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="showScheduleDialog" :title="editingScheduleId ? '编辑周期扫描' : '新建周期扫描'" width="680px" destroy-on-close>
+      <el-form :model="scheduleForm" label-width="110px">
+        <el-form-item label="计划名称" required><el-input v-model="scheduleForm.schedule_name" /></el-form-item>
+        <el-form-item label="扫描间隔" required><el-input-number v-model="scheduleForm.interval_minutes" :min="5" :max="10080" :step="5" /><span class="form-suffix">分钟</span></el-form-item>
+        <el-form-item label="扫描规则"><el-select v-model="scheduleForm.check_ids" multiple filterable clearable placeholder="不选则扫描全部启用规则" style="width: 100%"><el-option v-for="check in checks" :key="check.id" :label="check.check_name" :value="check.id" /></el-select></el-form-item>
+        <el-form-item label="目标范围"><el-radio-group v-model="scheduleForm.asset_scope"><el-radio value="all">全部终端</el-radio><el-radio value="selected">指定终端</el-radio></el-radio-group></el-form-item>
+        <el-form-item v-if="scheduleForm.asset_scope === 'selected'" label="目标终端"><el-select v-model="scheduleForm.asset_ids" multiple filterable collapse-tags style="width: 100%"><el-option v-for="asset in assets" :key="asset.id" :label="`${asset.hostname || '未命名终端'} (${asset.ip_address || '-'})`" :value="asset.id" /></el-select></el-form-item>
+        <el-form-item label="计划状态"><el-switch v-model="scheduleForm.enabled" active-text="启用" inactive-text="停用" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="showScheduleDialog = false">取消</el-button><el-button type="primary" :loading="scheduleSubmitting" @click="submitSchedule">保存</el-button></template>
+    </el-dialog>
+
     <el-dialog
       v-model="showTaskDetailDialog"
       title="扫描任务详情"
@@ -504,6 +536,10 @@ import {
   getSoftwareTasks,
   getComplianceResults,
   getComplianceStats,
+  getComplianceScanSchedules,
+  createComplianceScanSchedule,
+  updateComplianceScanSchedule,
+  deleteComplianceScanSchedule,
   triggerComplianceScan,
   updateComplianceCheck
 } from '@/api/software'
@@ -515,6 +551,7 @@ const results = ref([])
 const groups = ref([])
 const assets = ref([])
 const scanTasks = ref([])
+const schedules = ref([])
 const selectedTask = ref(null)
 const selectedTaskResults = ref([])
 
@@ -522,6 +559,7 @@ const checksLoading = ref(false)
 const resultsLoading = ref(false)
 const statsLoading = ref(false)
 const scanTasksLoading = ref(false)
+const schedulesLoading = ref(false)
 const ruleSubmitting = ref(false)
 const scanLoading = ref(false)
 const exporting = ref(false)
@@ -529,9 +567,12 @@ const taskDetailLoading = ref(false)
 
 const showRuleDialog = ref(false)
 const showScanDialog = ref(false)
+const showScheduleDialog = ref(false)
 const showTaskDetailDialog = ref(false)
 const ruleDialogMode = ref('create')
 const editingCheckId = ref(null)
+const editingScheduleId = ref(null)
+const scheduleSubmitting = ref(false)
 
 const ruleFormRef = ref(null)
 const remediationLoadingMap = reactive({})
@@ -595,6 +636,10 @@ const scanForm = reactive({
   asset_scope: 'all',
   asset_ids: [],
   check_ids: []
+})
+
+const scheduleForm = reactive({
+  schedule_name: '', interval_minutes: 1440, asset_scope: 'all', asset_ids: [], check_ids: [], enabled: true
 })
 
 const ruleRules = {
@@ -762,6 +807,16 @@ const loadScanTasks = async () => {
   }
 }
 
+const loadSchedules = async () => {
+  schedulesLoading.value = true
+  try {
+    const res = await getComplianceScanSchedules()
+    schedules.value = res.data || []
+  } finally {
+    schedulesLoading.value = false
+  }
+}
+
 const loadGroups = async () => {
   const res = await getGroups()
   groups.value = res.data || []
@@ -796,7 +851,7 @@ const loadAssets = async () => {
 }
 
 const refreshAll = async () => {
-  await Promise.all([loadChecks(), loadResults(), loadStats(), loadScanTasks()])
+  await Promise.all([loadChecks(), loadResults(), loadStats(), loadScanTasks(), loadSchedules()])
 }
 
 const refreshResultSection = async () => {
@@ -821,6 +876,16 @@ const resetScanForm = () => {
   scanForm.asset_scope = 'all'
   scanForm.asset_ids = []
   scanForm.check_ids = []
+}
+
+const resetScheduleForm = () => {
+  editingScheduleId.value = null
+  scheduleForm.schedule_name = ''
+  scheduleForm.interval_minutes = 1440
+  scheduleForm.asset_scope = 'all'
+  scheduleForm.asset_ids = []
+  scheduleForm.check_ids = []
+  scheduleForm.enabled = true
 }
 
 const openCreateDialog = () => {
@@ -937,6 +1002,69 @@ const openScanDialog = async (check = null) => {
   } catch (error) {
     console.error('打开扫描弹窗失败', error)
   }
+}
+
+const openScheduleDialog = async (schedule = null) => {
+  try {
+    if (!assets.value.length) await loadAssets()
+    if (schedule) {
+      editingScheduleId.value = schedule.id
+      scheduleForm.schedule_name = schedule.schedule_name || ''
+      scheduleForm.interval_minutes = Number(schedule.interval_minutes || 1440)
+      scheduleForm.asset_ids = Array.isArray(schedule.asset_ids) ? [...schedule.asset_ids] : []
+      scheduleForm.check_ids = Array.isArray(schedule.check_ids) ? [...schedule.check_ids] : []
+      scheduleForm.asset_scope = scheduleForm.asset_ids.length ? 'selected' : 'all'
+      scheduleForm.enabled = Boolean(schedule.enabled)
+    } else {
+      resetScheduleForm()
+    }
+    showScheduleDialog.value = true
+  } catch (error) {
+    console.error('打开周期扫描计划失败', error)
+  }
+}
+
+const submitSchedule = async () => {
+  if (!scheduleForm.schedule_name.trim()) return ElMessage.warning('请输入计划名称')
+  if (scheduleForm.asset_scope === 'selected' && !scheduleForm.asset_ids.length) return ElMessage.warning('请选择至少一个终端')
+  scheduleSubmitting.value = true
+  try {
+    const payload = {
+      schedule_name: scheduleForm.schedule_name.trim(), interval_minutes: scheduleForm.interval_minutes,
+      asset_ids: scheduleForm.asset_scope === 'selected' ? scheduleForm.asset_ids : [],
+      check_ids: scheduleForm.check_ids, enabled: scheduleForm.enabled
+    }
+    if (editingScheduleId.value) await updateComplianceScanSchedule(editingScheduleId.value, payload)
+    else await createComplianceScanSchedule(payload)
+    ElMessage.success(editingScheduleId.value ? '周期扫描计划已更新' : '周期扫描计划已创建')
+    showScheduleDialog.value = false
+    await loadSchedules()
+  } finally {
+    scheduleSubmitting.value = false
+  }
+}
+
+const toggleSchedule = async (schedule) => {
+  await updateComplianceScanSchedule(schedule.id, { enabled: !schedule.enabled })
+  ElMessage.success(schedule.enabled ? '周期扫描已停用' : '周期扫描已启用')
+  await loadSchedules()
+}
+
+const removeSchedule = async (schedule) => {
+  try {
+    await ElMessageBox.confirm(`确定删除周期扫描计划“${schedule.schedule_name}”吗？`, '删除确认', { type: 'warning' })
+    await deleteComplianceScanSchedule(schedule.id)
+    ElMessage.success('周期扫描计划已删除')
+    await loadSchedules()
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') console.error('删除周期扫描计划失败', error)
+  }
+}
+
+const formatScheduleScope = (schedule) => {
+  const assetText = schedule.asset_ids?.length ? `${schedule.asset_ids.length} 台终端` : '全部终端'
+  const checkText = schedule.check_ids?.length ? `${schedule.check_ids.length} 条规则` : '全部启用规则'
+  return `${assetText} · ${checkText}`
 }
 
 const submitScan = async () => {
@@ -1218,7 +1346,7 @@ const openTaskDetail = async (task) => {
 }
 
 onMounted(async () => {
-  await Promise.all([loadGroups(), loadChecks(), loadResults(), loadStats(), loadScanTasks()])
+  await Promise.all([loadGroups(), loadChecks(), loadResults(), loadStats(), loadScanTasks(), loadSchedules()])
 })
 </script>
 

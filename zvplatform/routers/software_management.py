@@ -17,6 +17,8 @@ import re
 import shutil
 import csv
 import io
+import threading
+import time
 
 from auth_utils import (
     extract_bearer_token,
@@ -1828,7 +1830,26 @@ class ComplianceScanRequest(BaseModel):
     created_by: str = "system"
 
 
+class ComplianceScanSchedule(BaseModel):
+    schedule_name: str = Field(min_length=1, max_length=255)
+    interval_minutes: int = Field(default=1440, ge=5, le=10080)
+    asset_ids: List[int] = Field(default_factory=list)
+    check_ids: List[int] = Field(default_factory=list)
+    enabled: bool = True
+
+
+class ComplianceScanScheduleUpdate(BaseModel):
+    schedule_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    interval_minutes: Optional[int] = Field(default=None, ge=5, le=10080)
+    asset_ids: Optional[List[int]] = None
+    check_ids: Optional[List[int]] = None
+    enabled: Optional[bool] = None
+
+
 SUPPORTED_COMPLIANCE_CHECK_TYPES = {"required", "forbidden", "version"}
+COMPLIANCE_SCHEDULER_POLL_SECONDS = 30
+_compliance_scheduler_lock = threading.Lock()
+_compliance_scheduler_started = False
 
 
 def normalize_compliance_check_type(check_type: str) -> str:
@@ -2939,6 +2960,163 @@ def export_compliance_results(
         cursor.close()
         conn.close()
 
+def ensure_compliance_scan_schedule_table(conn) -> None:
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS software_compliance_scan_schedules (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                schedule_name VARCHAR(255) NOT NULL,
+                interval_minutes INT NOT NULL,
+                asset_ids TEXT NULL,
+                check_ids TEXT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                next_run_at DATETIME NOT NULL,
+                last_run_at DATETIME NULL,
+                last_task_id BIGINT NULL,
+                last_status ENUM('success', 'failed') NULL,
+                last_error TEXT NULL,
+                created_by VARCHAR(100) NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_compliance_schedule_due (enabled, next_run_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+    finally:
+        cursor.close()
+
+
+def serialize_compliance_schedule(row: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(row)
+    result["asset_ids"] = parse_json_int_list(result.get("asset_ids"))
+    result["check_ids"] = parse_json_int_list(result.get("check_ids"))
+    result["enabled"] = bool(result.get("enabled"))
+    for field in ("next_run_at", "last_run_at", "created_at", "updated_at"):
+        if result.get(field):
+            result[field] = result[field].strftime("%Y-%m-%d %H:%M:%S")
+    return result
+
+
+@router.get("/api/v1/software/compliance/schedules")
+def get_compliance_scan_schedules():
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        ensure_compliance_scan_schedule_table(conn)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, schedule_name, interval_minutes, asset_ids, check_ids, enabled,
+                   next_run_at, last_run_at, last_task_id, last_status, last_error,
+                   created_by, created_at, updated_at
+            FROM software_compliance_scan_schedules
+            ORDER BY enabled DESC, next_run_at ASC, id DESC
+        """)
+        return {"data": [serialize_compliance_schedule(row) for row in cursor.fetchall()]}
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.post("/api/v1/software/compliance/schedules")
+def create_compliance_scan_schedule(payload: ComplianceScanSchedule, request: Request):
+    schedule_name = payload.schedule_name.strip()
+    if not schedule_name:
+        raise HTTPException(status_code=400, detail="Schedule name is required")
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        ensure_compliance_scan_schedule_table(conn)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            INSERT INTO software_compliance_scan_schedules (
+                schedule_name, interval_minutes, asset_ids, check_ids, enabled,
+                next_run_at, created_by
+            ) VALUES (%s, %s, %s, %s, %s, NOW(), %s)
+        """, (
+            schedule_name, payload.interval_minutes,
+            json.dumps(payload.asset_ids), json.dumps(payload.check_ids), payload.enabled,
+            get_request_username(request),
+        ))
+        schedule_id = cursor.lastrowid
+        conn.commit()
+        cursor.execute("SELECT * FROM software_compliance_scan_schedules WHERE id = %s", (schedule_id,))
+        return {"message": "合规周期扫描计划已创建", "data": serialize_compliance_schedule(cursor.fetchone())}
+    except Error as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.put("/api/v1/software/compliance/schedules/{schedule_id}")
+def update_compliance_scan_schedule(schedule_id: int, payload: ComplianceScanScheduleUpdate):
+    update_data = payload.dict(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    if "schedule_name" in update_data and not update_data["schedule_name"].strip():
+        raise HTTPException(status_code=400, detail="Schedule name is required")
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        ensure_compliance_scan_schedule_table(conn)
+        cursor = conn.cursor(dictionary=True)
+        fields, params = [], []
+        for field in ("schedule_name", "interval_minutes", "enabled"):
+            if field in update_data:
+                fields.append(f"{field} = %s")
+                params.append(update_data[field].strip() if field == "schedule_name" else update_data[field])
+        for field in ("asset_ids", "check_ids"):
+            if field in update_data:
+                fields.append(f"{field} = %s")
+                params.append(json.dumps(update_data[field]))
+        if "interval_minutes" in update_data or "enabled" in update_data:
+            fields.append("next_run_at = NOW()")
+        params.append(schedule_id)
+        cursor.execute(f"UPDATE software_compliance_scan_schedules SET {', '.join(fields)} WHERE id = %s", params)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        conn.commit()
+        cursor.execute("SELECT * FROM software_compliance_scan_schedules WHERE id = %s", (schedule_id,))
+        return {"message": "合规周期扫描计划已更新", "data": serialize_compliance_schedule(cursor.fetchone())}
+    except Error as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.delete("/api/v1/software/compliance/schedules/{schedule_id}")
+def delete_compliance_scan_schedule(schedule_id: int):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    cursor = None
+    try:
+        ensure_compliance_scan_schedule_table(conn)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM software_compliance_scan_schedules WHERE id = %s", (schedule_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        conn.commit()
+        return {"message": "合规周期扫描计划已删除"}
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
 @router.post("/api/v1/software/compliance/scan")
 def trigger_compliance_scan(payload: ComplianceScanRequest, request: Request):
     """触发并立即执行服务端合规扫描"""
@@ -3187,6 +3365,92 @@ def trigger_compliance_scan(payload: ComplianceScanRequest, request: Request):
         if cursor:
             cursor.close()
         conn.close()
+
+
+def _run_due_compliance_schedules_once() -> None:
+    """Claim and execute due schedules serially so a slow scan cannot overlap itself."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = None
+    schedule = None
+    try:
+        ensure_compliance_scan_schedule_table(conn)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT * FROM software_compliance_scan_schedules
+            WHERE enabled = TRUE AND next_run_at <= NOW()
+            ORDER BY next_run_at ASC, id ASC
+            LIMIT 1
+            FOR UPDATE
+        """)
+        schedule = cursor.fetchone()
+        if not schedule:
+            return
+        cursor.execute("""
+            UPDATE software_compliance_scan_schedules
+            SET next_run_at = DATE_ADD(NOW(), INTERVAL interval_minutes MINUTE),
+                last_run_at = NOW(), last_error = NULL
+            WHERE id = %s
+        """, (schedule["id"],))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        safe_console_print(f"[ComplianceScheduler] claim failed: {exc}")
+        return
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+    try:
+        result = trigger_compliance_scan(ComplianceScanRequest(
+            task_name=f"周期合规扫描：{schedule['schedule_name']}",
+            asset_ids=parse_json_int_list(schedule.get("asset_ids")) or None,
+            check_ids=parse_json_int_list(schedule.get("check_ids")) or None,
+            created_by=str(schedule.get("created_by") or "system"),
+        ), None)
+        status = "success" if result.get("status") == "completed" else "failed"
+        error = None if status == "success" else "扫描任务未完成"
+        task_id = result.get("task_id")
+    except Exception as exc:
+        status, task_id, error = "failed", None, str(getattr(exc, "detail", exc))[:1000]
+        safe_console_print(f"[ComplianceScheduler] schedule={schedule['id']} failed: {error}")
+
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE software_compliance_scan_schedules
+            SET last_status = %s, last_task_id = %s, last_error = %s
+            WHERE id = %s
+        """, (status, task_id, error, schedule["id"]))
+        conn.commit()
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+def ensure_compliance_scheduler_started() -> None:
+    global _compliance_scheduler_started
+    with _compliance_scheduler_lock:
+        if _compliance_scheduler_started:
+            return
+        _compliance_scheduler_started = True
+
+    def worker() -> None:
+        while True:
+            try:
+                _run_due_compliance_schedules_once()
+            except Exception as exc:
+                safe_console_print(f"[ComplianceScheduler] worker error: {exc}")
+            time.sleep(COMPLIANCE_SCHEDULER_POLL_SECONDS)
+
+    threading.Thread(target=worker, name="compliance-scheduler", daemon=True).start()
 
 # 注意：需要将这些API添加到 software_management_api_complete.py 中
 

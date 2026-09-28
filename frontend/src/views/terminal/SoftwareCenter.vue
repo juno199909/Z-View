@@ -42,7 +42,7 @@
               </template>
             </el-table-column>
             <el-table-column label="大小" width="100">
-              <template #default="{ row }">{{ formatSize(row.size) }}</template>
+              <template #default="{ row }">{{ row.file_size_readable || formatSize(row.file_size) }}</template>
             </el-table-column>
             <el-table-column label="安装数" width="100" align="center">
               <template #default="{ row }">
@@ -56,9 +56,10 @@
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="270" align="right">
+            <el-table-column label="操作" width="310" align="right">
               <template #default="{ row }">
                 <el-button text type="primary" size="small" @click="showTaskDialog(row)">分发</el-button>
+                <el-button text size="small" @click="showEditPackageDialog(row)">编辑</el-button>
                 <el-button text size="small" @click="handleDownloadPackage(row)">下载</el-button>
                 <el-button text size="small" @click="togglePackageStatus(row)">{{ row.status === 'available' ? '废弃' : '恢复' }}</el-button>
                 <el-button text type="danger" size="small" @click="handleDeletePackage(row)">删除</el-button>
@@ -196,6 +197,29 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="editPackageDialogVisible" title="编辑软件包" width="560px" destroy-on-close>
+      <el-form :model="editPackageForm" label-width="100px">
+        <el-form-item label="软件名" required><el-input v-model="editPackageForm.display_name" /></el-form-item>
+        <el-form-item label="包标识"><el-input v-model="editPackageForm.package_name" /></el-form-item>
+        <el-form-item label="版本" required><el-input v-model="editPackageForm.version" /></el-form-item>
+        <el-form-item label="厂商"><el-input v-model="editPackageForm.vendor" /></el-form-item>
+        <el-form-item label="分类"><el-input v-model="editPackageForm.category" /></el-form-item>
+        <el-form-item label="适用架构">
+          <el-select v-model="editPackageForm.architecture" style="width: 100%">
+            <el-option label="不限" value="any" /><el-option label="x64" value="x64" /><el-option label="x86" value="x86" /><el-option label="ARM64" value="arm64" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="安装命令"><el-input v-model="editPackageForm.install_command" placeholder="例如：{file_path} /S" /></el-form-item>
+        <el-form-item label="卸载命令"><el-input v-model="editPackageForm.uninstall_command" placeholder="留空将禁用受控卸载" /></el-form-item>
+        <el-form-item label="描述"><el-input v-model="editPackageForm.description" type="textarea" :rows="3" /></el-form-item>
+        <el-form-item label="需要重启"><el-switch v-model="editPackageForm.requires_reboot" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editPackageDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="editingPackage" @click="submitPackageEdit">保存</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 分发对话框 -->
     <el-dialog v-model="taskDialogVisible" title="分发任务" width="500px" destroy-on-close>
       <el-form :model="taskForm" label-width="100px">
@@ -263,7 +287,7 @@ import {
   Plus, Search, Box, Select, CloseBold, Upload
 } from '@element-plus/icons-vue'
 import {
-  getSoftwarePackages, getSoftwarePackageStats,
+  getSoftwarePackages, getSoftwarePackageDetail, getSoftwarePackageStats,
   getSoftwareTasks, getSoftwareTaskStats, getSoftwareTaskDetail,
   createSoftwareTask, cancelSoftwareTask as cancelTaskApi, retrySoftwareTask,
   uploadSoftwarePackage, deleteSoftwarePackage as deletePackageApi,
@@ -300,6 +324,10 @@ const bwRules = reactive({ whitelist: [], blacklist: [] })
 const uploadDialogVisible = ref(false)
 const uploading = ref(false)
 const uploadForm = reactive({ file: null, name: '', version: '', vendor: '', category: '', install_command: '', uninstall_command: '' })
+const editPackageDialogVisible = ref(false)
+const editingPackage = ref(false)
+const editingPackageId = ref(null)
+const editPackageForm = reactive({ package_name: '', display_name: '', version: '', vendor: '', category: '', architecture: 'any', install_command: '', uninstall_command: '', description: '', requires_reboot: false })
 
 const taskDialogVisible = ref(false)
 const submitting = ref(false)
@@ -315,7 +343,7 @@ const filteredRepo = computed(() => {
   if (repoCategory.value) result = result.filter(p => p.category === repoCategory.value)
   if (repoSearch.value) {
     const q = repoSearch.value.toLowerCase()
-    result = result.filter(p => p.name.toLowerCase().includes(q) || (p.vendor || '').toLowerCase().includes(q))
+    result = result.filter(p => (p.display_name || p.package_name || p.name || '').toLowerCase().includes(q) || (p.vendor || '').toLowerCase().includes(q))
   }
   return result
 })
@@ -452,6 +480,53 @@ const showTaskDialog = (pkg) => {
   taskForm.target_type = 'all'
   taskForm.group_ids = []
   taskDialogVisible.value = true
+}
+
+const showEditPackageDialog = async (pkg) => {
+  editingPackageId.value = pkg.id
+  editPackageForm.package_name = pkg.package_name || ''
+  editPackageForm.display_name = pkg.display_name || pkg.name || ''
+  editPackageForm.version = pkg.version || ''
+  editPackageForm.vendor = pkg.vendor || ''
+  editPackageForm.category = pkg.category || ''
+  editPackageForm.architecture = pkg.architecture || 'any'
+  editPackageForm.install_command = pkg.install_command || ''
+  editPackageForm.uninstall_command = pkg.uninstall_command || ''
+  editPackageForm.description = ''
+  editPackageForm.requires_reboot = false
+  try {
+    const response = await getSoftwarePackageDetail(pkg.id)
+    const detail = response.data || response
+    Object.assign(editPackageForm, {
+      package_name: detail.package_name || '', display_name: detail.display_name || '', version: detail.version || '',
+      vendor: detail.vendor || '', category: detail.category || '', architecture: detail.architecture || 'any',
+      install_command: detail.install_command || '', uninstall_command: detail.uninstall_command || '',
+      description: detail.description || '', requires_reboot: Boolean(detail.requires_reboot)
+    })
+    editPackageDialogVisible.value = true
+  } catch (error) {
+    ElMessage.error('加载软件包详情失败')
+  }
+}
+
+const submitPackageEdit = async () => {
+  if (!editPackageForm.display_name.trim() || !editPackageForm.version.trim()) return ElMessage.warning('请填写软件名和版本')
+  editingPackage.value = true
+  try {
+    await updateSoftwarePackage(editingPackageId.value, {
+      ...editPackageForm,
+      package_name: editPackageForm.package_name.trim() || editPackageForm.display_name.trim(),
+      display_name: editPackageForm.display_name.trim(), version: editPackageForm.version.trim(),
+      vendor: editPackageForm.vendor.trim() || null, category: editPackageForm.category.trim() || null,
+      install_command: editPackageForm.install_command.trim() || null, uninstall_command: editPackageForm.uninstall_command.trim() || null,
+      description: editPackageForm.description.trim() || null
+    })
+    ElMessage.success('软件包已更新')
+    editPackageDialogVisible.value = false
+    await loadRepo()
+  } finally {
+    editingPackage.value = false
+  }
 }
 
 const submitTask = async () => {

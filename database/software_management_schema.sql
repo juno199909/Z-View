@@ -249,6 +249,26 @@ CREATE TABLE IF NOT EXISTS software_compliance_results (
     FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='合规检查结果表';
 
+-- 合规周期扫描计划表。扫描任务本身仍写入 software_tasks，便于统一追踪。
+CREATE TABLE IF NOT EXISTS software_compliance_scan_schedules (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    schedule_name VARCHAR(255) NOT NULL,
+    interval_minutes INT NOT NULL COMMENT '扫描间隔（分钟）',
+    asset_ids TEXT NULL COMMENT '指定资产（JSON数组，为空表示全部）',
+    check_ids TEXT NULL COMMENT '指定规则（JSON数组，为空表示全部启用规则）',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    next_run_at DATETIME NOT NULL,
+    last_run_at DATETIME NULL,
+    last_task_id BIGINT NULL,
+    last_status ENUM('success', 'failed') NULL,
+    last_error TEXT NULL,
+    created_by VARCHAR(100) NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_compliance_schedule_due (enabled, next_run_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='软件合规周期扫描计划表';
+
 -- ============================================================
 -- 5. 审计日志表
 -- ============================================================

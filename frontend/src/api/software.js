@@ -195,3 +195,19 @@ export function triggerComplianceScan(data) {
     data
   })
 }
+
+export function getComplianceScanSchedules() {
+  return softwareRequest({ url: '/software/compliance/schedules', method: 'get' })
+}
+
+export function createComplianceScanSchedule(data) {
+  return softwareRequest({ url: '/software/compliance/schedules', method: 'post', data })
+}
+
+export function updateComplianceScanSchedule(scheduleId, data) {
+  return softwareRequest({ url: `/software/compliance/schedules/${scheduleId}`, method: 'put', data })
+}
+
+export function deleteComplianceScanSchedule(scheduleId) {
+  return softwareRequest({ url: `/software/compliance/schedules/${scheduleId}`, method: 'delete' })
+}

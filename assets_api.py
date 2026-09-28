@@ -1585,12 +1585,24 @@ def start_background_workers():
                 ensure_security_tables(conn)
             except Exception as exc:
                 safe_console_print(f"[Startup] security tables ensure warn: {exc}")
+            try:
+                from zvplatform.routers.software_management import (
+                    ensure_compliance_scan_schedule_table,
+                )
+                ensure_compliance_scan_schedule_table(conn)
+            except Exception as exc:
+                safe_console_print(f"[Startup] compliance schedule tables ensure warn: {exc}")
         finally:
             conn.close()
     ensure_status_reconcile_worker_started()
     ensure_data_retention_worker_started()
     ensure_alert_sync_worker_started()
     ensure_disk_guard_worker_started()
+    try:
+        from zvplatform.routers.software_management import ensure_compliance_scheduler_started
+        ensure_compliance_scheduler_started()
+    except Exception as exc:
+        safe_console_print(f"[Startup] compliance scheduler start warn: {exc}")
 
 
 # ============================================================
