@@ -19,6 +19,7 @@ import csv
 import io
 import threading
 import time
+import uuid
 
 from auth_utils import (
     extract_bearer_token,
@@ -235,6 +236,7 @@ def get_packages_legacy(
     name: Optional[str] = None
 ):
     """兼容旧版 Agent 的软件包查询接口"""
+    require_agent_request(request)
     effective_keyword = keyword or name
     response = get_packages(
         page=page,
@@ -2976,12 +2978,26 @@ def ensure_compliance_scan_schedule_table(conn) -> None:
                 last_task_id BIGINT NULL,
                 last_status ENUM('success', 'failed') NULL,
                 last_error TEXT NULL,
+                lease_token VARCHAR(64) NULL,
+                lease_expires_at DATETIME NULL,
                 created_by VARCHAR(100) NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_compliance_schedule_due (enabled, next_run_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+        # Existing installations created before leases need an additive migration.
+        for statement in (
+            "ALTER TABLE software_compliance_scan_schedules ADD COLUMN lease_token VARCHAR(64) NULL",
+            "ALTER TABLE software_compliance_scan_schedules ADD COLUMN lease_expires_at DATETIME NULL",
+            "ALTER TABLE software_compliance_scan_schedules ADD INDEX idx_compliance_schedule_lease (lease_expires_at)",
+        ):
+            try:
+                cursor.execute(statement)
+            except Error as exc:
+                # MySQL reports duplicate column/index with errno 1060/1061.
+                if getattr(exc, "errno", None) not in (1060, 1061):
+                    raise
         conn.commit()
     finally:
         cursor.close()
@@ -3368,40 +3384,52 @@ def trigger_compliance_scan(payload: ComplianceScanRequest, request: Request):
 
 
 def _run_due_compliance_schedules_once() -> None:
-    """Claim and execute due schedules serially so a slow scan cannot overlap itself."""
-    conn = get_db_connection()
-    if not conn:
+    """Claim one due schedule with a cross-process lock and an expiring lease."""
+    claim_conn = get_db_connection()
+    if not claim_conn:
         return
     cursor = None
     schedule = None
+    lease_token = uuid.uuid4().hex
+    global_lock_held = False
+    claim_failed = False
     try:
-        ensure_compliance_scan_schedule_table(conn)
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT * FROM software_compliance_scan_schedules
-            WHERE enabled = TRUE AND next_run_at <= NOW()
-            ORDER BY next_run_at ASC, id ASC
-            LIMIT 1
-            FOR UPDATE
-        """)
-        schedule = cursor.fetchone()
-        if not schedule:
-            return
-        cursor.execute("""
-            UPDATE software_compliance_scan_schedules
-            SET next_run_at = DATE_ADD(NOW(), INTERVAL interval_minutes MINUTE),
-                last_run_at = NOW(), last_error = NULL
-            WHERE id = %s
-        """, (schedule["id"],))
-        conn.commit()
+        ensure_compliance_scan_schedule_table(claim_conn)
+        cursor = claim_conn.cursor(dictionary=True)
+        cursor.execute("SELECT GET_LOCK('zview_compliance_scheduler', 0) AS acquired")
+        lock_row = cursor.fetchone() or {}
+        global_lock_held = bool(lock_row.get("acquired"))
+        if global_lock_held:
+            cursor.execute("""
+                SELECT * FROM software_compliance_scan_schedules
+                WHERE enabled = TRUE
+                  AND next_run_at <= NOW()
+                  AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                ORDER BY next_run_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE
+            """)
+            schedule = cursor.fetchone()
+            if schedule:
+                cursor.execute("""
+                    UPDATE software_compliance_scan_schedules
+                    SET lease_token = %s,
+                        lease_expires_at = DATE_ADD(NOW(), INTERVAL 2 HOUR),
+                        last_run_at = NOW(), last_error = NULL
+                    WHERE id = %s
+                """, (lease_token, schedule["id"]))
+                claim_conn.commit()
     except Exception as exc:
-        conn.rollback()
+        claim_conn.rollback()
         safe_console_print(f"[ComplianceScheduler] claim failed: {exc}")
-        return
+        claim_failed = True
     finally:
         if cursor:
             cursor.close()
-        conn.close()
+
+    if claim_failed or not schedule:
+        _release_compliance_scheduler_lock(claim_conn, global_lock_held)
+        return
 
     try:
         result = trigger_compliance_scan(ComplianceScanRequest(
@@ -3417,21 +3445,36 @@ def _run_due_compliance_schedules_once() -> None:
         status, task_id, error = "failed", None, str(getattr(exc, "detail", exc))[:1000]
         safe_console_print(f"[ComplianceScheduler] schedule={schedule['id']} failed: {error}")
 
-    conn = get_db_connection()
-    if not conn:
-        return
-    cursor = None
+    result_conn = get_db_connection()
+    result_cursor = None
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE software_compliance_scan_schedules
-            SET last_status = %s, last_task_id = %s, last_error = %s
-            WHERE id = %s
-        """, (status, task_id, error, schedule["id"]))
-        conn.commit()
+        if result_conn:
+            result_cursor = result_conn.cursor()
+            next_run_sql = "DATE_ADD(NOW(), INTERVAL interval_minutes MINUTE)" if status == "success" else "DATE_ADD(NOW(), INTERVAL 5 MINUTE)"
+            result_cursor.execute(f"""
+                UPDATE software_compliance_scan_schedules
+                SET last_status = %s, last_task_id = %s, last_error = %s,
+                    next_run_at = {next_run_sql}, lease_token = NULL, lease_expires_at = NULL
+                WHERE id = %s AND lease_token = %s
+            """, (status, task_id, error, schedule["id"], lease_token))
+            result_conn.commit()
     finally:
-        if cursor:
-            cursor.close()
+        if result_cursor:
+            result_cursor.close()
+        if result_conn:
+            result_conn.close()
+        _release_compliance_scheduler_lock(claim_conn, global_lock_held)
+
+
+def _release_compliance_scheduler_lock(conn, held: bool) -> None:
+    try:
+        if held:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT RELEASE_LOCK('zview_compliance_scheduler')")
+            finally:
+                cursor.close()
+    finally:
         conn.close()
 
 

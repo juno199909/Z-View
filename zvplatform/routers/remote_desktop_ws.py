@@ -20,6 +20,8 @@ from zvplatform.db import create_connection as get_db_connection
 
 router = APIRouter()
 
+MAX_REMOTE_MEDIA_MESSAGE_BYTES = 8 * 1024 * 1024
+
 _injected = {}
 
 
@@ -95,7 +97,7 @@ async def proxy_remote_desktop_websocket(asset_id: int, websocket: WebSocket):
             open_timeout=10,
             close_timeout=5,
             ping_interval=None,
-            max_size=None,
+            max_size=MAX_REMOTE_MEDIA_MESSAGE_BYTES,
         ) as upstream_socket:
             safe_console_print(f"[RemoteDesktopProxy] asset={asset_id} upstream connected")
             await websocket.accept()
@@ -296,7 +298,8 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
         async with websockets.connect(
             upstream_url,
             additional_headers=build_agent_auth_headers({"X-Remote-Requester": requester}),
-            open_timeout=10, close_timeout=5, ping_interval=None, max_size=None,
+            open_timeout=10, close_timeout=5, ping_interval=None,
+            max_size=MAX_REMOTE_MEDIA_MESSAGE_BYTES,
         ) as upstream_socket:
             await websocket.accept()
             await websocket.send_text(json.dumps({"type": "session_start", "fps": fps_limit}))
@@ -354,6 +357,3 @@ async def proxy_remote_session_ws(session_id: int, websocket: WebSocket):
                 cur.close()
             if conn:
                 conn.close()
-
-
-

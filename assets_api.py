@@ -109,7 +109,7 @@ AUTH_EXEMPTIONS = (
     {"path": "/api/v1/logs", "methods": ["POST"]},
     # Agent 软件通道（1.9.55 #18 批次A：端点已迁入本服务，Agent 端点自带 require_agent_request）
     {"prefix": "/api/v1/software/agent/"},
-    {"path": "/api/v1/packages", "methods": ["GET"]},
+    {"path": "/api/v1/packages", "methods": ["GET"]},  # legacy Agent endpoint validates its own credential
     {"path": "/api/v1/software/health", "methods": ["GET"]},
     {"pattern": "/api/v1/software/task-results/*", "methods": ["PUT"]},
     {"pattern": "/api/v1/software/task-results/*/logs", "methods": ["POST"]},
@@ -887,6 +887,13 @@ async def relay_browser_to_agent(
 
             text_data = message.get("text")
             if text_data is not None:
+                if len(text_data.encode("utf-8")) > 256 * 1024:
+                    safe_console_print(
+                        f"[RemoteDesktopProxy] asset={asset_id} rejected oversized control message"
+                    )
+                    await websocket.close(code=1009, reason="remote_control_message_too_large")
+                    should_close_upstream = True
+                    return "browser_control_message_too_large"
                 if shell_audit_hook is not None:
                     shell_msg = _sniff_shell_message(text_data)
                     if shell_msg:
@@ -900,6 +907,13 @@ async def relay_browser_to_agent(
 
             binary_data = message.get("bytes")
             if binary_data is not None:
+                if len(binary_data) > 8 * 1024 * 1024:
+                    safe_console_print(
+                        f"[RemoteDesktopProxy] asset={asset_id} rejected oversized binary message"
+                    )
+                    await websocket.close(code=1009, reason="remote_binary_message_too_large")
+                    should_close_upstream = True
+                    return "browser_binary_message_too_large"
                 await upstream_socket.send(binary_data)
     except WebSocketDisconnect:
         should_close_upstream = True

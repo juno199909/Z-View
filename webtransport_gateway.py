@@ -48,6 +48,12 @@ MEDIA_DATAGRAM_MAGIC = b"ZVMD"
 MEDIA_DATAGRAM_HEADER = struct.Struct("!4sIHH")
 MEDIA_DATAGRAM_PAYLOAD_BYTES = 1100
 MAX_MEDIA_DATAGRAM_FRAGMENTS = 512
+MAX_REMOTE_MEDIA_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_REMOTE_CONTROL_MESSAGE_BYTES = 256 * 1024
+MAX_PENDING_FRAMES = 32
+MAX_PENDING_BYTES = 1024 * 1024
+MAX_PRE_STREAM_CONTROL_FRAMES = 32
+MAX_PRE_STREAM_CONTROL_BYTES = 1024 * 1024
 
 
 def split_media_datagrams(payload: bytes, frame_id: int) -> list[bytes]:
@@ -105,14 +111,28 @@ class AgentBridge:
         self._last_stats_sent_at = 0.0
         self._session_close_recorded = False
 
-    def _buffer_agent_frame(self, frame_type: int, payload: bytes) -> None:
-        """数据流未打开时缓冲 Agent 帧；防膨胀：视频帧只保留最近 2 帧。"""
+    def _buffer_agent_frame(self, frame_type: int, payload: bytes) -> bool:
+        """Buffer only a bounded control set and the two most recent media frames."""
+        if frame_type == 0:
+            control_frames = [frame for frame in self._pre_stream_frames if frame[0] == 0]
+            control_bytes = sum(len(frame[1]) for frame in control_frames)
+            if (len(control_frames) >= MAX_PRE_STREAM_CONTROL_FRAMES or
+                    control_bytes + len(payload) > MAX_PRE_STREAM_CONTROL_BYTES):
+                return False
         self._pre_stream_frames.append((frame_type, payload))
         if frame_type == 1:
             bin_positions = [i for i, (t, _) in enumerate(self._pre_stream_frames) if t == 1]
             while len(bin_positions) > 2:
                 del self._pre_stream_frames[bin_positions[0]]
                 bin_positions = bin_positions[1:]
+        return True
+
+    def _buffer_pending_frame(self, frame_type: int, payload: bytes) -> bool:
+        if (len(self._pending_frames) >= MAX_PENDING_FRAMES or
+                sum(len(frame[1]) for frame in self._pending_frames) + len(payload) > MAX_PENDING_BYTES):
+            return False
+        self._pending_frames.append((frame_type, payload))
+        return True
 
     def set_data_stream(self, stream_id: int) -> None:
         if self.data_stream_id is None:
@@ -132,9 +152,18 @@ class AgentBridge:
         """观看端发来的单帧（已由长度前缀解析）→ 转发给 Agent WS（text/binary）。"""
         if self._closed:
             return
+        max_bytes = MAX_REMOTE_CONTROL_MESSAGE_BYTES if frame_type == 0 else MAX_REMOTE_MEDIA_MESSAGE_BYTES
+        if frame_type not in (0, 1) or len(payload) > max_bytes:
+            logger.warning("[%s] rejected oversized or invalid browser frame: type=%s len=%s",
+                           self.asset_ip, frame_type, len(payload))
+            self.close()
+            return
         if self.upstream_ws is None:
             # 上游未就绪：缓存早期消息（如 capabilities），连接建立后按序补发
-            self._pending_frames.append((frame_type, payload))
+            if not self._buffer_pending_frame(frame_type, payload):
+                logger.warning("[%s] closing session after pending frame buffer limit", self.asset_ip)
+                self.close()
+                return
             logger.info(f"wt→agent buffered (upstream pending): type={frame_type} len={len(payload)}")
             return
         await self._send_to_upstream(frame_type, payload)
@@ -202,7 +231,7 @@ class AgentBridge:
         forwarded = 0
         try:
             async with websockets.connect(
-                upstream_url, open_timeout=UPSTREAM_TIMEOUT, max_size=None,
+                upstream_url, open_timeout=UPSTREAM_TIMEOUT, max_size=MAX_REMOTE_MEDIA_MESSAGE_BYTES,
                 ping_interval=None,
                 additional_headers=build_agent_auth_headers({
                     "X-Remote-Requester": f"session-{self.session_id}",
@@ -224,7 +253,10 @@ class AgentBridge:
                     stream_id = self.data_stream_id
                     if stream_id is None:
                         # 数据流未打开：缓冲（控制帧全留，视频帧留最近2帧），打开时按序冲刷
-                        self._buffer_agent_frame(_ftype, payload)
+                        if not self._buffer_agent_frame(_ftype, payload):
+                            logger.warning("[%s] closing session after pre-stream frame buffer limit", self.asset_ip)
+                            self.close()
+                            break
                         continue
                     forwarded += 1
                     if forwarded <= 5:
