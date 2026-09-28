@@ -6,6 +6,7 @@
         <div class="zv-page-subtitle">仓库 {{ repoTotal }} 个 · 任务 {{ taskStats.total || 0 }} 个 · 策略 {{ whiteList.length + blackList.length }} 项</div>
       </div>
       <div class="zv-page-actions">
+        <el-button @click="handleCleanupPackages">清理已删除包</el-button>
         <el-button type="primary" :icon="Plus" @click="showUploadDialog">上传软件</el-button>
       </div>
     </div>
@@ -48,9 +49,18 @@
                 <span class="zv-mono">{{ row.install_count || 0 }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="160" align="right">
+            <el-table-column label="状态" width="100">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.status === 'available' ? 'success' : 'info'">
+                  {{ row.status === 'available' ? '可用' : '已废弃' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="270" align="right">
               <template #default="{ row }">
                 <el-button text type="primary" size="small" @click="showTaskDialog(row)">分发</el-button>
+                <el-button text size="small" @click="handleDownloadPackage(row)">下载</el-button>
+                <el-button text size="small" @click="togglePackageStatus(row)">{{ row.status === 'available' ? '废弃' : '恢复' }}</el-button>
                 <el-button text type="danger" size="small" @click="handleDeletePackage(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -256,7 +266,8 @@ import {
   getSoftwarePackages, getSoftwarePackageStats,
   getSoftwareTasks, getSoftwareTaskStats, getSoftwareTaskDetail,
   createSoftwareTask, cancelSoftwareTask as cancelTaskApi, retrySoftwareTask,
-  uploadSoftwarePackage, deleteSoftwarePackage as deletePackageApi
+  uploadSoftwarePackage, deleteSoftwarePackage as deletePackageApi,
+  updateSoftwarePackage, downloadSoftwarePackage, cleanupDeletedSoftwarePackages
 } from '@/api/software'
 import { getGroups } from '@/api/group'
 import { getPolicies, createPolicy, updatePolicy, deletePolicy } from '@/api/policy'
@@ -504,6 +515,43 @@ const handleDeletePackage = async (row) => {
     ElMessage.success('已删除')
     loadRepo()
   } catch (e) { if (e !== 'cancel') ElMessage.error('删除失败') }
+}
+
+const togglePackageStatus = async (row) => {
+  const nextStatus = row.status === 'available' ? 'deprecated' : 'available'
+  try {
+    await ElMessageBox.confirm(
+      nextStatus === 'deprecated' ? '废弃后不能再创建新的分发任务，确定继续吗？' : '确定恢复该软件包为可用状态吗？',
+      nextStatus === 'deprecated' ? '废弃软件包' : '恢复软件包',
+      { type: 'warning' }
+    )
+    await updateSoftwarePackage(row.id, { status: nextStatus })
+    ElMessage.success(nextStatus === 'deprecated' ? '软件包已废弃' : '软件包已恢复')
+    loadRepo()
+    loadStats()
+  } catch (e) { if (e !== 'cancel') ElMessage.error('更新状态失败') }
+}
+
+const handleDownloadPackage = async (row) => {
+  try {
+    const blob = await downloadSoftwarePackage(row.id)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = row.file_name || `${row.display_name || row.name}-${row.version}`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    ElMessage.error('下载失败')
+  }
+}
+
+const handleCleanupPackages = async () => {
+  try {
+    await ElMessageBox.confirm('将永久删除已软删除超过 7 天的软件包文件，数据库审计记录会保留。', '清理已删除包', { type: 'warning' })
+    const result = await cleanupDeletedSoftwarePackages(7)
+    ElMessage.success(`已清理 ${result.removed_count || 0} 个文件`)
+  } catch (e) { if (e !== 'cancel') ElMessage.error('清理失败') }
 }
 
 const addPolicy = async (type) => {

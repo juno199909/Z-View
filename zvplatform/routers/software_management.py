@@ -1444,6 +1444,53 @@ def delete_package(package_id: int):
         cursor.close()
         conn.close()
 
+
+@router.post("/api/v1/software/packages/cleanup")
+def cleanup_deleted_package_files(retention_days: int = Query(7, ge=0, le=3650)):
+    """Purge files for soft-deleted packages after an explicit retention period."""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """SELECT id, file_path FROM software_packages
+               WHERE deleted_at IS NOT NULL AND file_path IS NOT NULL
+                 AND deleted_at <= DATE_SUB(NOW(), INTERVAL %s DAY)""",
+            (retention_days,),
+        )
+        candidates = cursor.fetchall()
+        storage_root = os.path.abspath(PACKAGE_STORAGE_PATH)
+        removed_count = 0
+        skipped_count = 0
+        for package in candidates:
+            file_path = os.path.abspath(str(package.get("file_path") or ""))
+            try:
+                is_managed_path = os.path.commonpath([storage_root, file_path]) == storage_root
+            except ValueError:
+                is_managed_path = False
+            if not is_managed_path:
+                skipped_count += 1
+                continue
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                removed_count += 1
+            cursor.execute("UPDATE software_packages SET file_path = NULL WHERE id = %s", (package["id"],))
+        conn.commit()
+        return {"removed_count": removed_count, "skipped_count": skipped_count, "retention_days": retention_days}
+    except OSError as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Package cleanup failed: {exc}") from exc
+    except Error as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
 @router.get("/api/v1/software/agent/packages/{package_id}/download")
 def download_package(package_id: int, request: Request, asset_id: int = Query(..., ge=1)):
     """Agent下载软件包"""
@@ -1502,7 +1549,7 @@ def update_task_result(result_id: int, data: dict, request: Request):
 
         cursor.execute(
             """
-            SELECT r.task_id, r.status, t.status AS task_status
+            SELECT r.task_id, r.status AS result_status, t.status AS task_status, t.package_id
             FROM software_task_results r
             INNER JOIN software_tasks t ON t.id = r.task_id
             WHERE r.id = %s AND r.asset_id = %s
@@ -1528,7 +1575,7 @@ def update_task_result(result_id: int, data: dict, request: Request):
                 update_fields.append(f"{field} = %s")
                 params.append(data[field])
 
-        if data.get('status') in ['downloading', 'installing'] and result['status'] == 'pending':
+        if data.get('status') in ['downloading', 'installing'] and result['result_status'] == 'pending':
             update_fields.append("start_time = NOW()")
 
         if data.get('status') in ['success', 'failed', 'timeout', 'cancelled']:
@@ -1538,6 +1585,17 @@ def update_task_result(result_id: int, data: dict, request: Request):
         if update_fields:
             params.append(result_id)
             cursor.execute(f"UPDATE software_task_results SET {', '.join(update_fields)} WHERE id = %s", params)
+
+        # 仅在结果首次成功时计入安装次数，Agent 的幂等回传不会重复累计。
+        if (
+            data.get('status') == 'success'
+            and result['result_status'] != 'success'
+            and result.get('package_id')
+        ):
+            cursor.execute(
+                "UPDATE software_packages SET install_count = install_count + 1 WHERE id = %s",
+                (result['package_id'],),
+            )
 
         # 更新任务的汇总状态
         cursor.execute("""

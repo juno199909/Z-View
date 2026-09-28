@@ -50,6 +50,14 @@ export function deleteSoftwarePackage(packageId) {
   })
 }
 
+export function cleanupDeletedSoftwarePackages(retentionDays = 7) {
+  return softwareRequest({
+    url: '/software/packages/cleanup',
+    method: 'post',
+    params: { retention_days: retentionDays }
+  })
+}
+
 export function downloadSoftwarePackage(packageId) {
   return softwareRequest({
     url: `/software/packages/download/${packageId}`,
