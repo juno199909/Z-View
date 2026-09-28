@@ -278,6 +278,11 @@ async def upload_package(
         source_name = os.path.basename(str(file.filename or "")).strip()
         if not package_name or not display_name or not version or not source_name:
             raise HTTPException(status_code=400, detail="软件包名称、显示名称、版本和文件不能为空")
+        extension = os.path.splitext(source_name)[1].lower()
+        if extension not in {".exe", ".msi", ".bat", ".cmd", ".zip"}:
+            raise HTTPException(status_code=400, detail="仅支持 EXE、MSI、BAT、CMD 或 ZIP 软件包")
+        if extension == ".zip" and not str(info.get("install_command") or "").strip():
+            raise HTTPException(status_code=400, detail="ZIP 软件包必须提供安装命令")
 
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""

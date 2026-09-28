@@ -162,7 +162,7 @@
     <el-dialog v-model="uploadDialogVisible" title="上传软件" width="500px" destroy-on-close>
       <el-form :model="uploadForm" label-width="100px">
         <el-form-item label="软件包">
-          <el-upload :auto-upload="false" :limit="1" :on-change="(f) => uploadForm.file = f">
+          <el-upload :auto-upload="false" :limit="1" accept=".exe,.msi,.bat,.cmd,.zip" :on-change="(f) => uploadForm.file = f">
             <el-button :icon="Upload">选择文件</el-button>
             <span v-if="uploadForm.file" class="zv-upload-name">{{ uploadForm.file.name }}</span>
           </el-upload>
@@ -172,6 +172,12 @@
         <el-form-item label="厂商"><el-input v-model="uploadForm.vendor" /></el-form-item>
         <el-form-item label="分类">
           <el-input v-model="uploadForm.category" placeholder="例如：办公、开发、安全" />
+        </el-form-item>
+        <el-form-item label="安装命令">
+          <el-input v-model="uploadForm.install_command" placeholder="例如：{file_path} /S；ZIP 包必填" />
+        </el-form-item>
+        <el-form-item label="卸载命令">
+          <el-input v-model="uploadForm.uninstall_command" placeholder="可选；配置后才可创建受控卸载任务" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -228,7 +234,9 @@
                   <el-tag size="small" :type="getTaskStatusType(row.status)">{{ getTaskStatusText(row.status) }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column prop="message" label="消息" min-width="180" show-overflow-tooltip />
+              <el-table-column label="消息" min-width="180" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.error_message || row.stdout_log || row.stderr_log || '-' }}</template>
+              </el-table-column>
               <template #empty><el-empty description="暂无执行记录" :image-size="60" /></template>
             </el-table>
           </div>
@@ -280,7 +288,7 @@ const bwRules = reactive({ whitelist: [], blacklist: [] })
 
 const uploadDialogVisible = ref(false)
 const uploading = ref(false)
-const uploadForm = reactive({ file: null, name: '', version: '', vendor: '', category: '' })
+const uploadForm = reactive({ file: null, name: '', version: '', vendor: '', category: '', install_command: '', uninstall_command: '' })
 
 const taskDialogVisible = ref(false)
 const submitting = ref(false)
@@ -394,6 +402,8 @@ const showUploadDialog = () => {
   uploadForm.version = ''
   uploadForm.vendor = ''
   uploadForm.category = ''
+  uploadForm.install_command = ''
+  uploadForm.uninstall_command = ''
   uploadDialogVisible.value = true
 }
 
@@ -410,7 +420,9 @@ const submitUpload = async () => {
       display_name: uploadForm.name,
       version: uploadForm.version,
       vendor: uploadForm.vendor || null,
-      category: uploadForm.category || null
+      category: uploadForm.category || null,
+      install_command: uploadForm.install_command || null,
+      uninstall_command: uploadForm.uninstall_command || null
     }))
     await uploadSoftwarePackage(formData)
     ElMessage.success('上传成功')
