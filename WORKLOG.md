@@ -3795,3 +3795,5 @@
 
 - **构建产物**：已生成并校验 `Z-View-1.9.73-onedir.zip`（77.6 MiB）；Agent 主程序 Authenticode 签名为 `CN=Z-View Enterprise`，压缩包包含 `version.txt`、主程序和 Updater。
 - **构建副作用修复**：发现发布脚本为读取版本导入 `cmdb_agent_core`，会在构建机恢复本地 Agent 缓存策略，意外触发 UAC 安全桌面设置。脚本已改为仅导入 `zvagent.__version__`，并恢复本机构建前的安全桌面值；后续封包不再加载 Agent 运行时。
+
+- **全网发布**：`agent_upgrade/manifest.json` 已切换至 `1.9.73` onedir ZIP，目标终端列表为空（全部在线 Agent）；部署包 SHA-256 与清单已复核一致。在线终端会在下一次心跳获取升级指令，平台按既有升级状态机进行下载、验签、安装、健康检查和回传。
