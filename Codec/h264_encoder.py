@@ -90,12 +90,32 @@ def get_h264_capabilities() -> dict[str, Any]:
     """Return a small, cache-backed capability report safe for Agent heartbeats."""
     backend = get_h264_backend_name()
     hardware = bool(backend and backend != "libx264")
+    memory_total_mb = 0
+    try:
+        import psutil
+        memory_total_mb = int(psutil.virtual_memory().total / (1024 * 1024))
+    except Exception:
+        pass
+    memory_gb = memory_total_mb / 1024 if memory_total_mb else 0
+    if hardware and memory_gb >= 12:
+        profile = (60, 1920, 1080, 16_000_000, 2, "hardware_16g")
+    elif hardware:
+        profile = (45, 1600, 900, 8_000_000, 1, "hardware_8g")
+    elif backend:
+        profile = (30, 1280, 720, 4_000_000, 1, "software_8g")
+    else:
+        profile = (15, 1024, 768, 2_000_000, 1, "jpeg_fallback")
     return {
         "h264_available": bool(backend),
         "encoder_backend": backend or None,
         "hardware_encoder": hardware,
-        # CPU encoding is intentionally capped by the Agent session engine.
-        "recommended_max_fps": 60 if hardware else (30 if backend else 15),
+        "recommended_max_fps": profile[0],
+        "recommended_max_width": profile[1],
+        "recommended_max_height": profile[2],
+        "recommended_max_bitrate_bps": profile[3],
+        "max_concurrent_sessions": profile[4],
+        "performance_tier": profile[5],
+        "memory_total_mb": memory_total_mb,
     }
 
 
@@ -149,7 +169,8 @@ class H264StreamEncoder:
     encode(pil_image) 返回 [{"data": bytes, "keyframe": bool}, ...]（Annex-B）。
     """
 
-    def __init__(self, width: int, height: int, fps: int = 30, *, crf: int = 26):
+    def __init__(self, width: int, height: int, fps: int = 30, *, crf: int = 26,
+                 max_bitrate_bps: int | None = None):
         self.width = int(width)
         self.height = int(height)
         self.fps = max(1, int(fps))
@@ -160,6 +181,7 @@ class H264StreamEncoder:
         self._lock = threading.Lock()
         self._last_metrics: dict[str, float | str | bool] = {}
         self._target_bitrate_bps = 0
+        self._max_bitrate_bps = max(0, int(max_bitrate_bps or 0))
         self._open()
 
     # ---------- 内部 ----------
@@ -187,9 +209,16 @@ class H264StreamEncoder:
                 "crf": str(self._crf),
                 "threads": "4",
             }
+            if self._max_bitrate_bps:
+                self._target_bitrate_bps = self._max_bitrate_bps
+                ctx.bit_rate = self._target_bitrate_bps
+                ctx.options["maxrate"] = str(self._target_bitrate_bps)
+                ctx.options["bufsize"] = str(self._target_bitrate_bps)
         else:
             # 硬编按码率控制（CRF 语义不同）：质量档位映射码率
             self._target_bitrate_bps = _hardware_bitrate_for_crf(self._crf)
+            if self._max_bitrate_bps:
+                self._target_bitrate_bps = min(self._target_bitrate_bps, self._max_bitrate_bps)
             ctx.bit_rate = self._target_bitrate_bps
             # p1 optimizes throughput above all else.  p4 retains low-latency
             # operation (B-frames stay disabled below) while spending enough

@@ -100,6 +100,20 @@ def resolve_remote_fps_limit(requested_fps: int, capability: Optional[dict]) -> 
     return min(requested_fps, reported_limit, 30), "software_encoder"
 
 
+def resolve_remote_media_profile(requested_fps: int, capability: Optional[dict]) -> dict:
+    """Normalize the Agent-advertised profile for the console without trusting it blindly."""
+    fps, tier = resolve_remote_fps_limit(requested_fps, capability)
+    source = capability or {}
+    return {
+        "tier": str(source.get("performance_tier") or tier),
+        "effective_fps": fps,
+        "max_width": max(640, min(3840, int(source.get("recommended_max_width") or 1280))),
+        "max_height": max(480, min(2160, int(source.get("recommended_max_height") or 720))),
+        "max_bitrate_bps": max(500_000, min(30_000_000, int(source.get("recommended_max_bitrate_bps") or 4_000_000))),
+        "max_concurrent_sessions": max(1, min(2, int(source.get("max_concurrent_sessions") or 1))),
+    }
+
+
 class CreateSessionRequest(BaseModel):
     asset_id: int
     fps_limit: int = Field(default=60, ge=1, le=60)
@@ -133,7 +147,7 @@ def create_session(payload: CreateSessionRequest, request: Request):
         cur.execute("""
             SELECT a.id, a.hostname, a.ip_address, a.agent_install_status, a.group_id,
                    c.h264_available, c.encoder_backend, c.hardware_encoder,
-                   c.recommended_max_fps, c.reported_at
+                   c.recommended_max_fps, c.details, c.reported_at
             FROM assets a
             LEFT JOIN agent_remote_capabilities c ON c.asset_id = a.id
             WHERE a.id=%s AND a.deleted_at IS NULL
@@ -147,17 +161,24 @@ def create_session(payload: CreateSessionRequest, request: Request):
             raise HTTPException(status_code=400, detail="Asset has no IP address")
         # Scoped RBAC：受限用户只能对自己分组范围内的终端发起远控
         _require_session_scope(auth_user, asset.get("group_id"))
-        capability = (
-            {
+        capability = None
+        if asset.get("reported_at"):
+            raw_details = asset.get("details") or {}
+            if isinstance(raw_details, str):
+                try:
+                    raw_details = json.loads(raw_details)
+                except ValueError:
+                    raw_details = {}
+            capability = {
                 "h264_available": bool(asset.get("h264_available")),
                 "encoder_backend": asset.get("encoder_backend"),
                 "hardware_encoder": bool(asset.get("hardware_encoder")),
                 "recommended_max_fps": asset.get("recommended_max_fps"),
                 "reported_at": fmt_dt(asset.get("reported_at")),
+                **(raw_details if isinstance(raw_details, dict) else {}),
             }
-            if asset.get("reported_at") else None
-        )
-        effective_fps, performance_tier = resolve_remote_fps_limit(payload.fps_limit, capability)
+        media_profile = resolve_remote_media_profile(payload.fps_limit, capability)
+        effective_fps = media_profile["effective_fps"]
 
         operator = get_request_username(request, fallback="console")
         token = secrets.token_urlsafe(32)
@@ -208,9 +229,8 @@ def create_session(payload: CreateSessionRequest, request: Request):
             "hostname": asset.get("hostname"),
             "fps_limit": effective_fps,
             "media_profile": {
-                "tier": performance_tier,
                 "requested_fps": payload.fps_limit,
-                "effective_fps": effective_fps,
+                **media_profile,
                 "capability": capability,
             },
             "ws_url": f"/api/v1/remote/sessions/{session_id}/ws?token={token}",

@@ -2136,18 +2136,20 @@ class RemoteDesktopSession:
             'media_capabilities': media_capabilities,
         })
 
-    def _media_performance_limits(self) -> tuple[int, int]:
-        """Keep CPU-only office endpoints out of unsustainable 1080p60 streams."""
+    def _media_performance_limits(self) -> tuple[int, int, int, int]:
+        """Return Agent-owned limits for FPS, output resolution and bitrate."""
         try:
             from Codec.h264_encoder import get_h264_capabilities
             capabilities = get_h264_capabilities()
-            if capabilities.get("hardware_encoder"):
-                return 60, 100
-            if capabilities.get("h264_available"):
-                return 30, 75
+            return (
+                int(capabilities.get("recommended_max_fps") or 15),
+                int(capabilities.get("recommended_max_width") or 1024),
+                int(capabilities.get("recommended_max_height") or 768),
+                int(capabilities.get("recommended_max_bitrate_bps") or 2_000_000),
+            )
         except Exception:
             pass
-        return 15, 70
+        return 15, 1024, 768, 2_000_000
 
     async def _sleep_until_next_tick(self, sleep_time: float):
         """按帧间隔休眠，但收到键鼠输入时立即唤醒（消除输入反馈的节拍等待）。"""
@@ -3283,12 +3285,17 @@ class RemoteDesktopSession:
             or self.h264_encoder.height != height
             or getattr(self, "_h264_encoder_crf", None) != effective_crf
             or getattr(self, "_h264_encoder_fps", None) != effective_fps
+            or getattr(self, "_h264_encoder_max_bitrate_bps", None) != getattr(self, "_h264_max_bitrate_bps", 0)
         ):
             self._close_h264_encoder()
             from Codec.h264_encoder import H264StreamEncoder
-            self.h264_encoder = H264StreamEncoder(width, height, fps=effective_fps, crf=effective_crf)
+            self.h264_encoder = H264StreamEncoder(
+                width, height, fps=effective_fps, crf=effective_crf,
+                max_bitrate_bps=getattr(self, "_h264_max_bitrate_bps", 0),
+            )
             self._h264_encoder_crf = effective_crf
             self._h264_encoder_fps = effective_fps
+            self._h264_encoder_max_bitrate_bps = getattr(self, "_h264_max_bitrate_bps", 0)
         return self.h264_encoder.encode(pil_image, keyframe=keyframe)
 
     def _h264_results_from(self, packets, width: int, height: int) -> list[dict[str, Any]]:
@@ -4022,7 +4029,14 @@ class RemoteDesktopSession:
             requested_capture_backend = 'auto'
         capture_backend_changed = requested_capture_backend != self.capture_backend_preference
 
-        max_fps, max_scale_percent = self._media_performance_limits()
+        max_fps, max_width, max_height, max_bitrate_bps = self._media_performance_limits()
+        current_desktop = self._get_current_desktop_mode()
+        desktop_width_for_cap = max(1, int(current_desktop.get('width') or 1))
+        desktop_height_for_cap = max(1, int(current_desktop.get('height') or 1))
+        max_scale_percent = max(40, min(
+            100,
+            int(100 * min(max_width / desktop_width_for_cap, max_height / desktop_height_for_cap)),
+        ))
         if fps > max_fps:
             self._log_session_event(
                 "settings_cap",
@@ -4044,6 +4058,7 @@ class RemoteDesktopSession:
         self.mouse_sensitivity = mouse_sensitivity
         self.color_preset = preset
         self.capture_backend_preference = requested_capture_backend
+        self._h264_max_bitrate_bps = max_bitrate_bps
         # The native session binds resolution, bitrate, fps and capture backend
         # at creation. Re-open it on settings updates to keep it aligned with
         # the negotiated profile.
@@ -4072,7 +4087,8 @@ class RemoteDesktopSession:
             f"applied preset={preset} quality={self.quality} fps={self.fps} "
             f"scale={self.scale:.2f} crf_override={self._h264_crf_override} "
             f"scale_override={self._h264_scale_override} capture_backend={self.capture_backend_preference} "
-            f"h264_active={self.h264_active} max_fps={max_fps} max_scale={max_scale_percent}",
+            f"h264_active={self.h264_active} max_fps={max_fps} max_resolution={max_width}x{max_height} "
+            f"max_scale={max_scale_percent} max_bitrate_bps={max_bitrate_bps}",
         )
         self.capture_pressure = 0.0
         self.last_frame_profile_key = None

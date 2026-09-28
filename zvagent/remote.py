@@ -94,13 +94,32 @@ class RemoteDesktopServer:
         except Exception:
             pass
 
+        active_sessions = set()
+        session_lock = asyncio.Lock()
+
+        def max_concurrent_sessions() -> int:
+            try:
+                from Codec.h264_encoder import get_h264_capabilities
+                return max(1, int(get_h264_capabilities().get("max_concurrent_sessions") or 1))
+            except Exception:
+                return 1
+
         async def handler(websocket, path=None):
             self._log(f"客户端连接: {websocket.remote_address}")
+            session_marker = object()
+            admitted = False
             try:
                 if not self._is_authorized(websocket):
                     self._log(f"拒绝未授权远程桌面连接: {websocket.remote_address}")
                     await websocket.close(code=4401, reason="unauthorized")
                     return
+                async with session_lock:
+                    if len(active_sessions) >= max_concurrent_sessions():
+                        self._log("拒绝远控连接：终端并发会话已达自动档位上限")
+                        await websocket.close(code=4429, reason="remote_session_capacity_reached")
+                        return
+                    active_sessions.add(session_marker)
+                    admitted = True
                 session = self._create_session(StarletteWebSocketAdapter(websocket))
                 await session.start()
             except Exception as exc:
@@ -108,6 +127,9 @@ class RemoteDesktopServer:
                 self._log(f"会话错误: {type(exc).__name__}: {exc}")
                 self._log("traceback: " + traceback.format_exc()[-800:])
             finally:
+                if admitted:
+                    async with session_lock:
+                        active_sessions.discard(session_marker)
                 self._log(f"客户端断开: {websocket.remote_address}")
 
         try:
