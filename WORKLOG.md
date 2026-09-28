@@ -3822,4 +3822,4 @@
 ## [2026-09-28] 远控建会话 500 热修复
 
 - **根因**：平台读取已上报媒体能力详情时调用 `json.loads`，但 `remote_desktop_api.py` 漏导入 `json`；有能力上报记录的终端创建远控会话会返回 500。
-- **修复与验证**：补齐导入，并修复周期合规调度释放数据库锁时未消费 `RELEASE_LOCK` 结果集导致的 `Unread result found`。重启平台后，以管理员权限对 Juno 创建并关闭会话实测成功（session 471，协商档位 `software_8g`、30 FPS）。
+- **修复与验证**：补齐导入，并修复周期合规调度释放数据库锁时未消费 `RELEASE_LOCK` 结果集导致的 `Unread result found`。重启平台后，以管理员权限对在线的 `DESKTOP-JEGI046`（asset 2213）创建并关闭会话实测成功（session 471，协商档位 `software_8g`、30 FPS）。Juno（asset 2245）当时离线，未执行连接测试。
