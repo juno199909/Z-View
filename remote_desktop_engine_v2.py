@@ -2109,6 +2109,16 @@ class RemoteDesktopSession:
         clipboard_available = bool(getattr(self.clipboard_manager, "available", False))
         file_transfer_enabled = not isinstance(self.file_transfer_manager, DisabledRemoteFileTransferManager)
         self._refresh_runtime_stack(refresh_service=True)
+        try:
+            from Codec.h264_encoder import get_h264_capabilities
+            media_capabilities = get_h264_capabilities()
+        except Exception:
+            media_capabilities = {
+                "h264_available": False,
+                "encoder_backend": None,
+                "hardware_encoder": False,
+                "recommended_max_fps": 15,
+            }
         await self._send_json({
             'type': 'remote_capabilities',
             'clipboard_text': clipboard_available,
@@ -2123,7 +2133,21 @@ class RemoteDesktopSession:
             'desktop_resolution_control': bool(desktop_resolutions),
             'desktop_resolutions': desktop_resolutions,
             'runtime_stack': self.runtime_stack,
+            'media_capabilities': media_capabilities,
         })
+
+    def _media_performance_limits(self) -> tuple[int, int]:
+        """Keep CPU-only office endpoints out of unsustainable 1080p60 streams."""
+        try:
+            from Codec.h264_encoder import get_h264_capabilities
+            capabilities = get_h264_capabilities()
+            if capabilities.get("hardware_encoder"):
+                return 60, 100
+            if capabilities.get("h264_available"):
+                return 30, 75
+        except Exception:
+            pass
+        return 15, 70
 
     async def _sleep_until_next_tick(self, sleep_time: float):
         """按帧间隔休眠，但收到键鼠输入时立即唤醒（消除输入反馈的节拍等待）。"""
@@ -3998,6 +4022,20 @@ class RemoteDesktopSession:
             requested_capture_backend = 'auto'
         capture_backend_changed = requested_capture_backend != self.capture_backend_preference
 
+        max_fps, max_scale_percent = self._media_performance_limits()
+        if fps > max_fps:
+            self._log_session_event(
+                "settings_cap",
+                f"requested_fps={fps} capped_fps={max_fps} reason=encoder_capability",
+            )
+            fps = max_fps
+        if scale_percent > max_scale_percent:
+            self._log_session_event(
+                "settings_cap",
+                f"requested_scale={scale_percent} capped_scale={max_scale_percent} reason=encoder_capability",
+            )
+            scale_percent = max_scale_percent
+
         self.quality = quality
         self.fps = fps
         self.scale = scale_percent / 100.0
@@ -4034,7 +4072,7 @@ class RemoteDesktopSession:
             f"applied preset={preset} quality={self.quality} fps={self.fps} "
             f"scale={self.scale:.2f} crf_override={self._h264_crf_override} "
             f"scale_override={self._h264_scale_override} capture_backend={self.capture_backend_preference} "
-            f"h264_active={self.h264_active}",
+            f"h264_active={self.h264_active} max_fps={max_fps} max_scale={max_scale_percent}",
         )
         self.capture_pressure = 0.0
         self.last_frame_profile_key = None

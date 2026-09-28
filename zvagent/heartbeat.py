@@ -48,6 +48,28 @@ from zvagent.upgrade import (
 
 print = safe_console_print
 
+_REMOTE_MEDIA_CAPABILITIES: dict | None = None
+
+
+def _get_remote_media_capabilities() -> dict:
+    """Probe once per Agent process; FFmpeg probing must not run on every heartbeat."""
+    global _REMOTE_MEDIA_CAPABILITIES
+    if _REMOTE_MEDIA_CAPABILITIES is not None:
+        return dict(_REMOTE_MEDIA_CAPABILITIES)
+    try:
+        from Codec.h264_encoder import get_h264_capabilities
+        capabilities = get_h264_capabilities()
+    except Exception as exc:
+        capabilities = {
+            "h264_available": False,
+            "encoder_backend": None,
+            "hardware_encoder": False,
+            "recommended_max_fps": 15,
+            "probe_error": str(exc)[:200],
+        }
+    _REMOTE_MEDIA_CAPABILITIES = capabilities
+    return dict(capabilities)
+
 
 def _persist_agent_token(token: str) -> None:
     """V1.9.51 根因补链：把刷新后的 Agent 令牌持久化到 config.local.json。
@@ -201,6 +223,7 @@ def _heartbeat_loop():
                 "logged_users": os.getlogin() if hasattr(os, "getlogin") else "",
                 "status": "online",
                 "agent_version": AGENT_VERSION,
+                "remote_media_capabilities": _get_remote_media_capabilities(),
             }
             # P0-06 + V1.7.0：升级状态随心跳上报 —— 进行中报实时阶段，空闲报最近终态
             last_upgrade_state = None  # 防止 in_progress 分支跳过赋值后下方引用 NameError
@@ -556,6 +579,7 @@ def trigger_immediate_report(payload: dict | None = None) -> dict:
         "bios_vendor": hardware.get("bios_vendor") or "",
         "bios_version": hardware.get("bios_version") or "",
         "bios_date": hardware.get("bios_date") or "",
+        "remote_media_capabilities": _get_remote_media_capabilities(),
     }
 
     try:

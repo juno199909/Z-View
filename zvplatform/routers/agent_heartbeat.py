@@ -529,6 +529,40 @@ def agent_heartbeat(data: dict, request: Request):
         )
 
         # 根据report_type处理不同类型的数据
+        remote_media_capabilities = data.get("remote_media_capabilities")
+        if isinstance(remote_media_capabilities, dict):
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS agent_remote_capabilities (
+                    asset_id BIGINT UNSIGNED PRIMARY KEY,
+                    h264_available TINYINT(1) NOT NULL DEFAULT 0,
+                    encoder_backend VARCHAR(64) NULL,
+                    hardware_encoder TINYINT(1) NOT NULL DEFAULT 0,
+                    recommended_max_fps INT NOT NULL DEFAULT 15,
+                    details JSON NULL,
+                    reported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cursor.execute("""
+                INSERT INTO agent_remote_capabilities (
+                    asset_id, h264_available, encoder_backend, hardware_encoder,
+                    recommended_max_fps, details, reported_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    h264_available = VALUES(h264_available),
+                    encoder_backend = VALUES(encoder_backend),
+                    hardware_encoder = VALUES(hardware_encoder),
+                    recommended_max_fps = VALUES(recommended_max_fps),
+                    details = VALUES(details), reported_at = NOW()
+            """, (
+                asset_id,
+                bool(remote_media_capabilities.get("h264_available")),
+                str(remote_media_capabilities.get("encoder_backend") or "")[:64] or None,
+                bool(remote_media_capabilities.get("hardware_encoder")),
+                max(4, min(60, int(remote_media_capabilities.get("recommended_max_fps") or 15))),
+                json.dumps(remote_media_capabilities, ensure_ascii=False),
+            ))
+
         if report_type in ['heartbeat', 'system_status']:
             # Keep older Agents that still send *_percent fields compatible
             # with the current agent_heartbeat table column names.

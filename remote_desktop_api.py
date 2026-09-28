@@ -70,6 +70,36 @@ def ensure_remote_sessions_table(conn):
     cur.close()
 
 
+def ensure_agent_remote_capabilities_table(conn):
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS agent_remote_capabilities (
+                asset_id BIGINT UNSIGNED PRIMARY KEY,
+                h264_available TINYINT(1) NOT NULL DEFAULT 0,
+                encoder_backend VARCHAR(64) NULL,
+                hardware_encoder TINYINT(1) NOT NULL DEFAULT 0,
+                recommended_max_fps INT NOT NULL DEFAULT 15,
+                details JSON NULL,
+                reported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.commit()
+    finally:
+        cur.close()
+
+
+def resolve_remote_fps_limit(requested_fps: int, capability: Optional[dict]) -> tuple[int, str]:
+    """Use a conservative default until an upgraded Agent proves media capability."""
+    if not capability:
+        return min(requested_fps, 30), "legacy_or_unreported"
+    reported_limit = max(4, min(60, int(capability.get("recommended_max_fps") or 15)))
+    if capability.get("hardware_encoder"):
+        return min(requested_fps, reported_limit), "hardware_encoder"
+    return min(requested_fps, reported_limit, 30), "software_encoder"
+
+
 class CreateSessionRequest(BaseModel):
     asset_id: int
     fps_limit: int = Field(default=60, ge=1, le=60)
@@ -99,7 +129,15 @@ def create_session(payload: CreateSessionRequest, request: Request):
     cur = conn.cursor(dictionary=True)
     try:
         ensure_remote_sessions_table(conn)
-        cur.execute("SELECT id, hostname, ip_address, agent_install_status, group_id FROM assets WHERE id=%s AND deleted_at IS NULL", (payload.asset_id,))
+        ensure_agent_remote_capabilities_table(conn)
+        cur.execute("""
+            SELECT a.id, a.hostname, a.ip_address, a.agent_install_status, a.group_id,
+                   c.h264_available, c.encoder_backend, c.hardware_encoder,
+                   c.recommended_max_fps, c.reported_at
+            FROM assets a
+            LEFT JOIN agent_remote_capabilities c ON c.asset_id = a.id
+            WHERE a.id=%s AND a.deleted_at IS NULL
+        """, (payload.asset_id,))
         asset = cur.fetchone()
         if not asset:
             raise HTTPException(status_code=404, detail="Asset not found")
@@ -109,6 +147,17 @@ def create_session(payload: CreateSessionRequest, request: Request):
             raise HTTPException(status_code=400, detail="Asset has no IP address")
         # Scoped RBAC：受限用户只能对自己分组范围内的终端发起远控
         _require_session_scope(auth_user, asset.get("group_id"))
+        capability = (
+            {
+                "h264_available": bool(asset.get("h264_available")),
+                "encoder_backend": asset.get("encoder_backend"),
+                "hardware_encoder": bool(asset.get("hardware_encoder")),
+                "recommended_max_fps": asset.get("recommended_max_fps"),
+                "reported_at": fmt_dt(asset.get("reported_at")),
+            }
+            if asset.get("reported_at") else None
+        )
+        effective_fps, performance_tier = resolve_remote_fps_limit(payload.fps_limit, capability)
 
         operator = get_request_username(request, fallback="console")
         token = secrets.token_urlsafe(32)
@@ -118,7 +167,7 @@ def create_session(payload: CreateSessionRequest, request: Request):
             INSERT INTO remote_sessions (session_token, asset_id, admin_user, agent_id, client_ip, max_duration_sec, fps_limit, transport_type, status)
             VALUES (%s,%s,%s,%s,%s,%s,%s,'ws-tcp','created')
         """, (token_hash, payload.asset_id, operator, asset.get("hostname"),
-              request.client.host if request.client else "", payload.max_duration_sec, payload.fps_limit))
+              request.client.host if request.client else "", payload.max_duration_sec, effective_fps))
         session_id = cur.lastrowid
         conn.commit()
         # 审计
@@ -157,6 +206,13 @@ def create_session(payload: CreateSessionRequest, request: Request):
             "session_token": token,
             "asset_id": payload.asset_id,
             "hostname": asset.get("hostname"),
+            "fps_limit": effective_fps,
+            "media_profile": {
+                "tier": performance_tier,
+                "requested_fps": payload.fps_limit,
+                "effective_fps": effective_fps,
+                "capability": capability,
+            },
             "ws_url": f"/api/v1/remote/sessions/{session_id}/ws?token={token}",
             "direct_ws_url": direct_ws_url,
             **wt_fields,

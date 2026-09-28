@@ -1341,6 +1341,11 @@ const connect = async () => {
     // 新流程：先创建会话拿 session_token + ws_url
     const sessionInfo = await createRemoteSession({ asset_id: props.assetId, fps_limit: sessionSettings.value.fps || 60 })
     currentSessionId = sessionInfo.session_id
+    const effectiveFps = Number(sessionInfo.fps_limit || sessionInfo.media_profile?.effective_fps || 0)
+    if (effectiveFps > 0 && effectiveFps < sessionSettings.value.fps) {
+      sessionSettings.value = { ...sessionSettings.value, fps: effectiveFps }
+      ElMessage.info(`该终端当前编码能力限制为 ${effectiveFps} FPS，已自动采用稳定档位`)
+    }
     const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const relayUrl = `${wsProtocol}://${window.location.host}${sessionInfo.ws_url}`
     // 传输候选：WebTransport (UDP/QUIC) 优先，失败/超时自适应回落 WebSocket (TCP)。

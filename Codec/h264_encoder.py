@@ -86,6 +86,19 @@ def h264_available() -> bool:
     return bool(get_h264_backend_name())
 
 
+def get_h264_capabilities() -> dict[str, Any]:
+    """Return a small, cache-backed capability report safe for Agent heartbeats."""
+    backend = get_h264_backend_name()
+    hardware = bool(backend and backend != "libx264")
+    return {
+        "h264_available": bool(backend),
+        "encoder_backend": backend or None,
+        "hardware_encoder": hardware,
+        # CPU encoding is intentionally capped by the Agent session engine.
+        "recommended_max_fps": 60 if hardware else (30 if backend else 15),
+    }
+
+
 def _hardware_bitrate_for_crf(crf: int) -> int:
     """Map the shared quality scale to hardware-encoder bitrates.
 

@@ -28,3 +28,15 @@ CREATE TABLE IF NOT EXISTS remote_sessions (
     INDEX idx_admin (admin_user),
     FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='远程桌面会话';
+
+-- Agent 最近一次媒体编码能力。用于远控会话限档，不保存任何机器敏感原始探测日志。
+CREATE TABLE IF NOT EXISTS agent_remote_capabilities (
+    asset_id BIGINT UNSIGNED PRIMARY KEY,
+    h264_available TINYINT(1) NOT NULL DEFAULT 0,
+    encoder_backend VARCHAR(64) NULL,
+    hardware_encoder TINYINT(1) NOT NULL DEFAULT 0,
+    recommended_max_fps INT NOT NULL DEFAULT 15,
+    details JSON NULL,
+    reported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent远控媒体能力';
