@@ -24,7 +24,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from cmdb_agent_core import AGENT_VERSION  # noqa: E402
+# Do not import cmdb_agent_core here: its module initialization restores cached
+# Agent policies and can mutate workstation settings during a release build.
+from zvagent import __version__ as AGENT_VERSION  # noqa: E402
 
 DIST_ONEDIR = Path(os.environ.get("ZVIEW_AGENT_DIST_DIR", PROJECT_ROOT / "dist_agent" / "Z-View"))
 DIST_UPDATER = PROJECT_ROOT / "dist_updater" / "ZViewUpdater.exe"
