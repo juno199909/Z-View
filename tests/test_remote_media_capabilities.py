@@ -58,3 +58,12 @@ def test_media_profile_exposes_resolution_bitrate_and_session_limits():
         "max_bitrate_bps": 8_000_000,
         "max_concurrent_sessions": 1,
     }
+
+
+def test_media_profile_module_supports_json_capability_details():
+    import json
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "remote_desktop_api.py").read_text(encoding="utf-8")
+    assert "import json" in source
+    assert json.loads('{"recommended_max_width": 1280}')["recommended_max_width"] == 1280

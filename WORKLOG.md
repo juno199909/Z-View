@@ -3818,3 +3818,8 @@
 - **内容**：发布包含按内存和编码能力限制分辨率、码率、帧率与并发会话数的 Agent 版本；平台侧会话协商响应同步返回该档位。
 - **发布前校验**：构建后必须验证 Agent 主程序 Authenticode 签名、发行 ZIP SHA-256 与升级清单一致，再全网下发。
 - **发布结果**：`Z-View-1.9.74-onedir.zip` 已完成签名和打包（93.2 MiB），主程序签名 `CN=Z-View Enterprise` 有效；已发布到 `agent_upgrade/1.9.74/agent-onedir.zip`，SHA-256 为 `1425d68f92d907d46dd896732820a65080e2bef908550f8610ddb7ab394f3560`。清单目标列表为空，在线 Agent 将在下一次心跳接收升级指令。
+
+## [2026-09-28] 远控建会话 500 热修复
+
+- **根因**：平台读取已上报媒体能力详情时调用 `json.loads`，但 `remote_desktop_api.py` 漏导入 `json`；有能力上报记录的终端创建远控会话会返回 500。
+- **修复与验证**：补齐导入，并修复周期合规调度释放数据库锁时未消费 `RELEASE_LOCK` 结果集导致的 `Unread result found`。重启平台后，以管理员权限对 Juno 创建并关闭会话实测成功（session 471，协商档位 `software_8g`、30 FPS）。

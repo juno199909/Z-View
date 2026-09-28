@@ -7,6 +7,7 @@ Z-View 远程桌面会话 API（第一阶段）
 
 import secrets
 import hashlib
+import json
 from typing import Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request

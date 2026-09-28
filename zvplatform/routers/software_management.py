@@ -3472,6 +3472,7 @@ def _release_compliance_scheduler_lock(conn, held: bool) -> None:
             cursor = conn.cursor()
             try:
                 cursor.execute("SELECT RELEASE_LOCK('zview_compliance_scheduler')")
+                cursor.fetchone()
             finally:
                 cursor.close()
     finally:
